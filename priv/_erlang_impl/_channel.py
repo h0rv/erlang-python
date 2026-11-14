@@ -51,11 +51,15 @@ Usage:
     reply(pid, {"status": "ok", "data": result})
 """
 
-__all__ = ['Channel', 'reply', 'ChannelClosed']
+__all__ = ["Channel", "reply", "ChannelClosed"]
+
+# A valid native wait result may contain None; only this identity means retry.
+_RETRY_RECEIVE = object()
 
 
 class ChannelClosed(Exception):
     """Raised when attempting to receive from a closed channel."""
+
     pass
 
 
@@ -69,7 +73,7 @@ class Channel:
         _ref: The underlying Erlang channel reference.
     """
 
-    __slots__ = ('_ref',)
+    __slots__ = ("_ref",)
 
     def __init__(self, channel_ref):
         """Initialize a channel wrapper.
@@ -144,25 +148,41 @@ class Channel:
     # Async methods (asyncio compatible)
     # ========================================================================
 
-    async def async_receive(self):
+    async def async_receive(self, *, native_only: bool = False):
         """Async receive - yields to other coroutines while waiting.
 
         This method uses event-driven notification when running on ErlangEventLoop.
         When data arrives, the channel notifies the event loop via timer dispatch,
         avoiding polling overhead.
 
-        Falls back to polling on non-Erlang event loops.
+        Falls back to polling on non-Erlang event loops or after an empty
+        notification, unless native_only is True.
+
+        Delivery is advisory, not durable. Cancellation after a ready callback
+        has consumed a message may discard that delivery; cancelling a receive
+        does not requeue it or establish an acknowledgment/replay protocol.
+
+        Args:
+            native_only: Require native dispatch, even when data is already
+                queued. Empty notifications re-register the native waiter
+                instead of falling back to polling. Defaults to False.
 
         Returns:
             The received Erlang term, converted to Python.
 
         Raises:
             ChannelClosed: If the channel has been closed.
+            RuntimeError: If native_only is True and the loop lacks native dispatch.
 
         Example:
-            msg = await channel.async_receive()
+            msg = await channel.async_receive(native_only=True)
         """
         import asyncio
+
+        loop = asyncio.get_running_loop()
+        native_dispatch = hasattr(loop, "_loop_capsule") and hasattr(loop, "_timers")
+        if native_only and not native_dispatch:
+            raise RuntimeError("native_only=True requires an ErlangEventLoop")
 
         # Try non-blocking first (direct NIF - fast)
         result = self.try_receive()
@@ -173,12 +193,15 @@ class Channel:
         if self._is_closed():
             raise ChannelClosed("Channel has been closed")
 
-        # Get the running event loop
-        loop = asyncio.get_running_loop()
-
-        # Check if this is an ErlangEventLoop with native dispatch support
-        if hasattr(loop, '_loop_capsule') and hasattr(loop, '_timers'):
-            return await self._async_receive_event_driven(loop)
+        if native_dispatch:
+            while True:
+                result = await self._async_receive_event_driven(loop)
+                if result is not _RETRY_RECEIVE:
+                    return result
+                # Another consumer may have drained the notification's data.
+                if not native_only:
+                    return await self._async_receive_polling()
+                # Strict native receive registers a fresh waiter on every retry.
         else:
             # Fallback for non-Erlang event loops: use polling
             return await self._async_receive_polling()
@@ -187,10 +210,13 @@ class Channel:
         """Event-driven async receive using channel waiter mechanism.
 
         Registers with the channel and waits for EVENT_TYPE_TIMER dispatch
-        when data arrives. No polling required.
+        when data arrives. Returns _RETRY_RECEIVE after an empty notification
+        so the caller can retry with native dispatch or the compatibility
+        fallback. None from an immediate ('ok', None) result is valid data.
         """
         import asyncio
-        from asyncio import events
+        import asyncio.events
+
         import erlang
 
         future = loop.create_future()
@@ -207,14 +233,14 @@ class Channel:
                 elif self._is_closed():
                     future.set_exception(ChannelClosed("Channel closed"))
                 else:
-                    # Data consumed by race - set None to signal retry
-                    future.set_result(None)
+                    # Data consumed by race - use an out-of-band retry token.
+                    future.set_result(_RETRY_RECEIVE)
             except Exception as e:
                 future.set_exception(e)
 
         # Create handle and register in timer dispatch system
         # Only use _timers dict - don't touch _handle_to_callback_id (for timer cancellation only)
-        handle = events.Handle(on_channel_ready, (), loop)
+        handle = asyncio.events.Handle(on_channel_ready, (), loop)
         loop._timers[callback_id] = handle
 
         try:
@@ -222,24 +248,19 @@ class Channel:
             result = erlang._channel_wait(self._ref, callback_id, loop._loop_capsule)
 
             if isinstance(result, tuple):
-                if result[0] == 'ok':
+                if result[0] == "ok":
                     # Data already available - clean up and return
                     loop._timers.pop(callback_id, None)
                     return result[1]
-                elif result[0] == 'error':
+                elif result[0] == "error":
                     loop._timers.pop(callback_id, None)
-                    if result[1] == 'closed':
+                    if result[1] == "closed":
                         raise ChannelClosed("Channel closed")
-                    raise RuntimeError(f"Channel wait failed: {result[1]}")
+                    raise RuntimeError("Channel wait failed: {}".format(result[1]))
 
             # Waiter registered - await notification
             try:
-                data = await future
-                # Handle race condition (data was None)
-                if data is None:
-                    # Retry with polling fallback for this edge case
-                    return await self._async_receive_polling()
-                return data
+                return await future
             except asyncio.CancelledError:
                 erlang._channel_cancel_wait(self._ref, callback_id)
                 raise
@@ -253,6 +274,7 @@ class Channel:
         avoiding busy-polling while still releasing the event loop.
         """
         import asyncio
+
         import erlang
 
         loop = asyncio.get_running_loop()
@@ -263,7 +285,7 @@ class Channel:
             try:
                 result = await loop.run_in_executor(
                     None,
-                    lambda: erlang._channel_receive(self._ref, 100)  # 100ms timeout
+                    lambda: erlang._channel_receive(self._ref, 100),  # 100ms timeout
                 )
                 return result
             except TimeoutError:
@@ -298,6 +320,7 @@ class Channel:
     def _is_closed(self):
         """Check if the channel is closed."""
         import erlang
+
         try:
             return erlang._channel_is_closed(self._ref)
         except Exception:
@@ -313,6 +336,7 @@ class Channel:
             channel.close()  # Signal no more data
         """
         import erlang
+
         try:
             erlang._channel_close(self._ref)
         except Exception:
@@ -328,7 +352,7 @@ class Channel:
         return False
 
     def __repr__(self):
-        return f"<Channel ref={self._ref!r}>"
+        return "<Channel ref={!r}>".format(self._ref)
 
 
 def reply(pid, term):
@@ -360,9 +384,9 @@ def reply(pid, term):
     # This directly calls enif_send without requiring callback handling
     result = erlang.send(pid, term)
 
-    if result == 'ok' or result is True:
+    if result == "ok" or result is True:
         return True
-    elif isinstance(result, tuple) and result[0] == 'error':
-        raise RuntimeError(f"Reply failed: {result[1]}")
+    elif isinstance(result, tuple) and result[0] == "error":
+        raise RuntimeError("Reply failed: {}".format(result[1]))
     else:
         return True
