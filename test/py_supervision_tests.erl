@@ -29,12 +29,15 @@ terminate(_, {stubborn, _}) -> receive never -> ok end;
 terminate(_, _) -> ok.
 
 sup(Strategy, Budget) ->
-    {ok, S} = py_supervision:start_link(#{strategy => Strategy, intensity => Budget, period => 30}),
+    {ok, S} = py_supervision:start_link(#{strategy => Strategy, intensity => Budget, period => 30,
+                                            mailbox => unbounded, max_children => unbounded}),
     unlink(S), S.
 
 start(S, Id, Restart, Mode, Deadline) ->
-    py_supervision:callback([<<"start">>, S, Id, <<"py_supervision_tests">>,
-                            <<"start_link">>, [Mode], Restart, Deadline]).
+    control([<<"start">>, S, Id, <<"py_supervision_tests">>,
+             <<"start_link">>, [Mode], Restart, Deadline, <<"unbounded">>, <<"unbounded">>]).
+control(Args) ->
+    py_supervision:callback([<<"unbounded">>, <<"unbounded">>, <<"unbounded">> | Args]).
 children(S) -> supervisor:which_children(S).
 stop(S) -> gen_server:stop(S, shutdown, 2000).
 wait(F) -> wait(F, erlang:monotonic_time(millisecond) + 2000).
@@ -47,6 +50,24 @@ wait(F, Deadline) ->
                 false -> error(deadline)
             end
     end.
+
+admission_fail_closed_test() ->
+    S = sup(one_for_one, 3),
+    try
+        Request = [<<"start">>, S, <<"blocked">>, <<"py_supervision_tests">>,
+                   <<"start_link">>, [normal], <<"permanent">>, 20,
+                   <<"unbounded">>, <<"unbounded">>],
+        ?assertError({capability_unavailable, supervision_admission},
+                     py_supervision:callback([128, 65536, <<"unbounded">> | Request])),
+        ?assertError({capability_unavailable, supervision_admission},
+                     py_supervision:callback(Request)),
+        ?assertError({capability_unavailable, supervision_admission},
+                     control([<<"start">>, S, <<"blocked-child">>, <<"py_supervision_tests">>,
+                              <<"start_link">>, [normal], <<"permanent">>, 20, 128, 65536])),
+        ?assertEqual([], children(S)),
+        ?assertMatch({error, {capability_unavailable, supervision_admission}},
+                     py_supervision:start_link(#{strategy => one_for_one, intensity => 3, period => 5}))
+    after stop(S) end.
 
 restart_contract_test_() ->
     [{atom_to_list(Strategy) ++ "/" ++ binary_to_list(Restart) ++ "/" ++ atom_to_list(Reason),
@@ -121,7 +142,8 @@ temporary_sibling(Strategy) ->
     after stop(S) end.
 
 budget_window_test() ->
-    {ok, S} = py_supervision:start_link(#{strategy => one_for_one, intensity => 1, period => 1}),
+    {ok, S} = py_supervision:start_link(#{strategy => one_for_one, intensity => 1, period => 1,
+                                            mailbox => unbounded, max_children => unbounded}),
     unlink(S),
     try
         {<<"ok">>, P} = start(S, <<"worker">>, <<"permanent">>, normal, 20),
@@ -147,13 +169,13 @@ shutdown_case(Mode, Reason) ->
         {<<"ok">>, P} = start(S, <<"worker">>, <<"permanent">>, Mode, 30),
         Ref = monitor(process, P),
         Start = erlang:monotonic_time(millisecond),
-        ?assertEqual({<<"ok">>, undefined}, py_supervision:callback([<<"stop">>, S, <<"worker">>])),
+        ?assertEqual({<<"ok">>, undefined}, control([<<"stop">>, S, <<"worker">>])),
         ?assert(erlang:monotonic_time(millisecond) - Start < 1000),
         receive {'DOWN', Ref, process, P, Reason} -> ok after 1000 -> error(no_cleanup) end,
         ?assertEqual([{<<"worker">>, undefined, worker, [py_supervision_tests]}], children(S)),
-        {<<"ok">>, New} = py_supervision:callback([<<"restart">>, S, <<"worker">>]),
+        {<<"ok">>, New} = control([<<"restart">>, S, <<"worker">>]),
         ?assertNotEqual(P, New),
-        ?assertMatch({<<"error">>, running}, py_supervision:callback([<<"delete">>, S, <<"worker">>]))
+        ?assertMatch({<<"error">>, running}, control([<<"delete">>, S, <<"worker">>]))
     after stop(S) end.
 
 start_failure_test() ->
@@ -172,8 +194,9 @@ start_failure_test() ->
 parent_lifecycle_test() ->
     %% A real OTP parent is used, not a transient callback process.
     Parent = sup(one_for_one, 3),
-    {<<"ok">>, ChildSup} = py_supervision:callback(
-        [<<"start_supervisor">>, Parent, <<"subtree">>, <<"one_for_one">>, 3, 5]),
+    {<<"ok">>, ChildSup} = control(
+        [<<"start_supervisor">>, Parent, <<"subtree">>, <<"one_for_one">>, 3, 5,
+         <<"unbounded">>, <<"unbounded">>, <<"unbounded">>]),
     {<<"ok">>, Worker} = start(ChildSup, <<"worker">>, <<"permanent">>, normal, 20),
     Ref = monitor(process, Worker),
     stop(Parent),
