@@ -138,6 +138,60 @@ async def control(channel_ref):
 ok = py_channel:send(Ch, {adopt, Dup}).
 ```
 
+## Owned Python service tasks
+
+`erlang_services.ServiceSlot(capacity=1)` admits one module-level async
+function on an already running `ErlangEventLoop`. Capacity is required and
+currently must be one. There is no silently unbounded option. Its `start(fn, *args, **kwargs)` method
+returns a typed `ServiceRef`. It uses the existing loop's task scheduling.
+It does not create a context, another executor, or a supervisor. The caller
+must keep the slot and reference alive and limit the number of slots.
+
+The entry point must be an importable async function returning `None`.
+Closures, lambdas, and bound methods are rejected. Arguments remain local
+Python objects. These references cannot be sent to another interpreter or
+used as remote process identities.
+
+`await ref.wait(timeout=...)` observes completion or raises the original
+failure. A wait timeout or a cancelled waiter does not cancel the service.
+`ref.state` reports `running`, `completed`, `failed`, or `cancelled`.
+`running` includes scheduled tasks and tasks still performing cancellation
+cleanup. Starting a task does not acknowledge service readiness.
+A finished slot can explicitly start a new invocation. Old references retain
+their old outcomes. There is no automatic restart or state recovery.
+
+`await ref.stop(timeout=...)` requests cancellation once and waits for task
+cleanup. It returns only after the task is done, or raises its original
+failure, including a cleanup failure. A timeout leaves the task live and the
+slot occupied. Repeating stop does not interrupt a running cleanup block with
+another cancellation. `await slot.stop(timeout=...)` stops its current task.
+These deadlines need a responsive loop. They cannot bound a native call or
+force a coroutine that ignores cancellation to release resources.
+
+Services must explicitly acquire and release their own resources. A task
+cancelled before its first step does not run its `finally` block. Keep
+ownership of preexisting resources outside the service until the function
+acknowledges taking them. Finished references can retain exception tracebacks
+until the references are released.
+
+Stop and acknowledge service tasks before `stop_loop`. The existing loop
+shutdown closes the loop without awaiting pending service cleanup. An
+unexpected loop exit, owner death, or context death is therefore not an
+acknowledgement of service cleanup. The external owner must monitor the
+context and collect `py_loop_exit` separately. A native crash can kill the VM.
+Shared worker mode does not create an interpreter per service.
+
+No channels or extra mailboxes are created by this API. Admission is one live
+task per slot. A second start raises `ServiceBusyError` before task creation
+rather than entering a waiting queue. This is local task admission, not a hard Erlang mailbox bound.
+Existing native channels still need explicit positive byte bounds and closure by their
+owner. Unrelated Erlang submissions and mailboxes remain unbounded.
+
+The Erlang process calling `submit` owns the task result message. Keep that
+process alive to collect it. A later RPC caller cannot await another process's
+result. `submit_await` performs both steps in the same caller. Its wait timeout
+does not cancel the Python entry point or its services.
+
 ## Stop, restart, supervise
 
 ```erlang
