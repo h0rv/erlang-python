@@ -28,24 +28,30 @@ Architecture:
 
 import asyncio
 import contextvars
-import errno
 import os
 import socket
-import ssl
 import sys
 import threading
 import time
-from asyncio import events, futures, tasks, transports
+from asyncio import events, futures, tasks
 from collections import deque
 from collections.abc import AsyncGenerator, Generator
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, Callable, Never, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Never
 from weakref import WeakSet
 
 if TYPE_CHECKING:
     from _erlang_impl._lifecycle import ShutdownObserver
 
-from ._mode import detect_mode, ExecutionMode
+from _erlang_impl._fd import (
+    FdCallback,
+    FdPublication,
+    FdPublicationPhase,
+    FdRetirement,
+    FdRetirementError,
+    parse_fd_retirement,
+)
+from _erlang_impl._mode import detect_mode
 
 __all__ = ['ErlangEventLoop', '_run_and_send']
 
@@ -88,7 +94,8 @@ class ErlangEventLoop(asyncio.AbstractEventLoop):
         '_pel', '_loop_capsule', '_uses_global_capsule', '_owns_capsule',
         '_readers', '_writers',
         '_callbacks_by_cid',  # callback_id -> (callback, args, event_type) for O(1) dispatch
-        '_fd_resources',  # fd -> fd_key (shared fd_resource_t per fd)
+        '_fd_resources',  # logical fd -> owned native poll lease key
+        '_fd_retirement_failed', '_closing_sockets', '_fd_publications',
         '_timers', '_timer_refs', '_handle_to_callback_id',
         '_ready',
         '_handle_pool', '_handle_pool_max', '_running', '_stopping', '_closed',
@@ -167,8 +174,11 @@ class ErlangEventLoop(asyncio.AbstractEventLoop):
         # Callback management
         self._readers = {}  # fd -> (callback, args, callback_id)
         self._writers = {}  # fd -> (callback, args, callback_id)
-        self._callbacks_by_cid = {}  # callback_id -> (callback, args) for O(1) dispatch
-        self._fd_resources = {}  # fd -> fd_key (shared fd_resource_t per fd)
+        self._callbacks_by_cid: dict[int, FdCallback] = {}
+        self._fd_resources: dict[int, int] = {}
+        self._fd_publications: dict[int, FdPublication] = {}
+        self._fd_retirement_failed: set[int] = set()
+        self._closing_sockets: dict[int, socket.socket] = {}
         self._timers = {}   # callback_id -> handle
         self._timer_refs = {}  # callback_id -> timer_ref (for cancellation)
         # Note: No timer heap - Erlang handles timer expiry via send_after
@@ -401,8 +411,6 @@ class ErlangEventLoop(asyncio.AbstractEventLoop):
             self._close_owned()
 
     def _close_owned(self):
-        self._closed = True
-
         # Cancel all timers
         for callback_id, handle in list(self._timers.items()):
             handle.cancel()
@@ -416,18 +424,14 @@ class ErlangEventLoop(asyncio.AbstractEventLoop):
         self._timer_refs.clear()
         self._handle_to_callback_id.clear()
 
-        # Remove all readers/writers, then release fd resources kept alive by
-        # _stop_reading/_stop_writing for transports that were never closed
-        for fd in list(self._readers.keys()):
-            self.remove_reader(fd)
-        for fd in list(self._writers.keys()):
-            self.remove_writer(fd)
+        # Pending publications own keys even when no logical map was published.
+        while self._fd_publications:
+            publication = next(iter(self._fd_publications.values()))
+            self._retire_fd_publication(publication)
+        # A failed lease retirement leaves this owner open and retryable.
         for fd, fd_key in list(self._fd_resources.items()):
-            try:
-                self._pel._release_fd_resource(fd_key)
-            except Exception:
-                pass
-        self._fd_resources.clear()
+            self._retire_fd(fd, fd_key)
+        self._closed = True
 
         # Clear signal handlers
         self._signal_handlers.clear()
@@ -614,179 +618,191 @@ class ErlangEventLoop(asyncio.AbstractEventLoop):
         """Register a reader callback for a file descriptor."""
         self._check_closed()
 
-        # Remove old callback (but not the fd_resource)
-        if fd in self._readers:
-            old_entry = self._readers[fd]
-            old_cid = old_entry[2]
-            self._callbacks_by_cid.pop(old_cid, None)
-
-        callback_id = self._next_id()
-
-        try:
-            if fd in self._fd_resources:
-                # Reuse existing fd_resource, just update read callback
-                fd_key = self._fd_resources[fd]
-                self._pel._update_fd_read(fd_key, callback_id)
-            else:
-                # Create new fd_resource
-                fd_key = self._pel._add_reader_for(self._loop_capsule, fd, callback_id)
-                self._fd_resources[fd] = fd_key
-
-            self._readers[fd] = (callback, args, callback_id)
-            self._callbacks_by_cid[callback_id] = (callback, args)
-        except Exception as e:
-            raise RuntimeError(f"Failed to add reader: {e}")
+        self._add_fd_callback(fd, callback, args, reading=True)
 
     def remove_reader(self, fd):
         """Unregister a reader callback for a file descriptor."""
-        if fd not in self._readers:
-            return False
-
-        entry = self._readers.pop(fd)
-        callback_id = entry[2]
-        self._callbacks_by_cid.pop(callback_id, None)
-
-        if fd in self._fd_resources:
-            fd_key = self._fd_resources[fd]
-            # Clear read monitoring but keep resource if writer active
-            try:
-                self._pel._clear_fd_read(fd_key)
-            except Exception:
-                pass
-
-            # Only release resource if no writer either
-            if fd not in self._writers:
-                try:
-                    self._pel._release_fd_resource(fd_key)
-                except Exception:
-                    pass
-                del self._fd_resources[fd]
-
-        return True
+        return self._remove_fd_callback(fd, reading=True, release=True)
 
     def add_writer(self, fd, callback, *args):
         """Register a writer callback for a file descriptor."""
         self._check_closed()
 
-        # Remove old callback (but not the fd_resource)
-        if fd in self._writers:
-            old_entry = self._writers[fd]
-            old_cid = old_entry[2]
-            self._callbacks_by_cid.pop(old_cid, None)
-
-        callback_id = self._next_id()
-
-        try:
-            if fd in self._fd_resources:
-                # Reuse existing fd_resource, just update write callback
-                fd_key = self._fd_resources[fd]
-                self._pel._update_fd_write(fd_key, callback_id)
-            else:
-                # Create new fd_resource
-                fd_key = self._pel._add_writer_for(self._loop_capsule, fd, callback_id)
-                self._fd_resources[fd] = fd_key
-
-            self._writers[fd] = (callback, args, callback_id)
-            self._callbacks_by_cid[callback_id] = (callback, args)
-        except Exception as e:
-            raise RuntimeError(f"Failed to add writer: {e}")
+        self._add_fd_callback(fd, callback, args, reading=False)
 
     def remove_writer(self, fd):
         """Unregister a writer callback for a file descriptor."""
-        if fd not in self._writers:
-            return False
+        return self._remove_fd_callback(fd, reading=False, release=True)
 
-        entry = self._writers.pop(fd)
-        callback_id = entry[2]
-        self._callbacks_by_cid.pop(callback_id, None)
-
-        if fd in self._fd_resources:
-            fd_key = self._fd_resources[fd]
-            # Clear write monitoring but keep resource if reader active
-            try:
-                self._pel._clear_fd_write(fd_key)
-            except Exception:
-                pass
-
-            # Only release resource if no reader either
-            if fd not in self._readers:
-                try:
-                    self._pel._release_fd_resource(fd_key)
-                except Exception:
-                    pass
-                del self._fd_resources[fd]
-
-        return True
-
-    # ------------------------------------------------------------------------
-    # Transport helpers: stop reading/writing without giving up the fd
-    # resource, and hand the socket to the NIF for closing.
-    #
-    # remove_reader/remove_writer release the fd resource as soon as neither
-    # side is active, which issues ERL_NIF_SELECT_STOP. If the socket is then
-    # closed from Python before the stop completes, the fd sits in the poll
-    # set while its number gets reused. Transports therefore only clear the
-    # callbacks here and let _close_socket transfer the fd to the NIF, which
-    # closes it from the stop callback.
-    # ------------------------------------------------------------------------
-
-    def _stop_reading(self, fd):
-        entry = self._readers.pop(fd, None)
-        if entry is None:
-            return False
-        self._callbacks_by_cid.pop(entry[2], None)
-        fd_key = self._fd_resources.get(fd)
-        if fd_key is not None:
-            try:
-                self._pel._clear_fd_read(fd_key)
-            except Exception:
-                pass
-        return True
-
-    def _stop_writing(self, fd):
-        entry = self._writers.pop(fd, None)
-        if entry is None:
-            return False
-        self._callbacks_by_cid.pop(entry[2], None)
-        fd_key = self._fd_resources.get(fd)
-        if fd_key is not None:
-            try:
-                self._pel._clear_fd_write(fd_key)
-            except Exception:
-                pass
-        return True
-
-    def _close_socket(self, sock):
-        """Close a socket that may still be registered with enif_select.
-
-        Clears any reader/writer, detaches the fd from the socket object and
-        lets the NIF close it once the select stop has completed. Sockets the
-        loop never registered are closed directly.
-        """
+    def _add_fd_callback(
+        self, fd: int, callback: Callable[..., object], args: tuple[object, ...],
+        *, reading: bool,
+    ) -> None:
+        pending = self._fd_publications.get(fd)
+        if pending is not None:
+            raise FdRetirementError(pending.key)
+        key = self._fd_resources.get(fd)
+        if key is not None and key in self._fd_retirement_failed:
+            raise FdRetirementError(key)
+        registrations = self._readers if reading else self._writers
+        callback_id = self._pel._new_fd_callback_id()
+        publication = FdPublication(
+            fd, reading, (callback, args, callback_id), registrations.get(fd),
+            shared=key is not None, key=0 if key is None else key,
+        )
+        # This insertion and the slot allocation precede every native effect.
+        # STORE_ATTR into the existing slot needs no fallback allocation.
+        self._fd_publications[fd] = publication
         try:
-            fd = sock.fileno()
-        except (OSError, ValueError):
+            if not publication.shared:
+                if reading:
+                    publication.key = self._pel._add_reader_for(
+                        self._loop_capsule, fd, callback_id,
+                    )
+                else:
+                    publication.key = self._pel._add_writer_for(
+                        self._loop_capsule, fd, callback_id,
+                    )
+                publication.phase = FdPublicationPhase.NATIVE_OWNED
+                self._fd_resources[fd] = publication.key
+            self._callbacks_by_cid[callback_id] = FdCallback(
+                callback, args, publication.key, fd,
+            )
+            registrations[fd] = publication.entry
+            if publication.shared:
+                # Publish all fallible Python records before changing an
+                # existing lease. A publication failure cannot stop its writer.
+                publication.phase = FdPublicationPhase.UPDATING
+                if reading:
+                    self._pel._update_fd_read(publication.key, callback_id)
+                else:
+                    self._pel._update_fd_write(publication.key, callback_id)
+            if publication.old_entry is not None:
+                self._callbacks_by_cid.pop(publication.old_entry[2], None)
+            del self._fd_publications[fd]
+        except Exception as error:
+            if publication.phase == FdPublicationPhase.UPDATING:
+                publication.phase = FdPublicationPhase.UPDATE_FAILED
+                # Native update may have taken effect. Keep the shared owner
+                # and quarantine callbacks until explicit whole-lease cleanup.
+                raise FdRetirementError(publication.key) from error
+            publication.phase = FdPublicationPhase.PUBLICATION_FAILED
+            if publication.shared:
+                self._restore_fd_publication(publication)
+                del self._fd_publications[fd]
+            else:
+                self._retire_fd_publication(publication)
+            raise RuntimeError("FD callback publication failed") from error
+
+    def _restore_fd_publication(self, publication: FdPublication) -> None:
+        registrations = self._readers if publication.reading else self._writers
+        entry = registrations.get(publication.fd)
+        if entry is not None and entry[2] == publication.entry[2]:
+            if publication.old_entry is None:
+                del registrations[publication.fd]
+            else:
+                registrations[publication.fd] = publication.old_entry
+        self._callbacks_by_cid.pop(publication.entry[2], None)
+
+    def _retire_fd_publication(self, publication: FdPublication) -> None:
+        try:
+            if publication.key != 0:
+                parse_fd_retirement(self._pel._release_fd_resource(publication.key))
+        except Exception as error:
+            # No dict/set insertion here: the loop owned this slot before the
+            # native call, including its key, callback and optional socket.
+            publication.phase = FdPublicationPhase.ROLLBACK_FAILED
+            raise FdRetirementError(publication.key) from error
+        publication.phase = FdPublicationPhase.RETIRED
+        self._finish_fd_retirement(publication.fd, publication.key)
+        registrations = self._readers if publication.reading else self._writers
+        entry = registrations.get(publication.fd)
+        if entry is not None and entry[2] == publication.entry[2]:
+            del registrations[publication.fd]
+        self._callbacks_by_cid.pop(publication.entry[2], None)
+        if publication.old_entry is not None:
+            self._callbacks_by_cid.pop(publication.old_entry[2], None)
+        if publication.closing_socket is not None:
+            publication.closing_socket.close()
+        del self._fd_publications[publication.fd]
+
+    def _retire_fd(self, fd: int, key: int) -> FdRetirement:
+        try:
+            outcome = parse_fd_retirement(self._pel._release_fd_resource(key))
+        except Exception as error:
+            self._fd_retirement_failed.add(key)
+            raise FdRetirementError(key) from error
+        # All three outcomes permit releasing the logical owner. POLL_PENDING
+        # means the private duplicate is still owned by ERTS, not closed.
+        self._finish_fd_retirement(fd, key)
+        return outcome
+
+    def _finish_fd_retirement(self, fd: int, key: int) -> None:
+        if self._fd_resources.get(fd) == key:
+            del self._fd_resources[fd]
+            for registrations in (self._readers, self._writers):
+                entry = registrations.pop(fd, None)
+                if entry is not None:
+                    self._callbacks_by_cid.pop(entry[2], None)
+        self._fd_retirement_failed.discard(key)
+        closing_socket = self._closing_sockets.pop(key, None)
+        if closing_socket is not None:
+            closing_socket.close()
+
+    def _remove_fd_callback(self, fd: int, *, reading: bool, release: bool) -> bool:
+        registrations = self._readers if reading else self._writers
+        others = self._writers if reading else self._readers
+        publication = self._fd_publications.get(fd)
+        if publication is not None and (
+            publication.reading == reading or fd in registrations
+        ):
+            self._retire_fd_publication(publication)
+            return True
+        entry = registrations.get(fd)
+        if entry is None:
+            return False
+        key = self._fd_resources[fd]
+        if key in self._fd_retirement_failed or (release and fd not in others):
+            self._retire_fd(fd, key)
+            return True
+        try:
+            if reading:
+                self._pel._clear_fd_read(key)
+            else:
+                self._pel._clear_fd_write(key)
+        except Exception as error:
+            self._fd_retirement_failed.add(key)
+            raise FdRetirementError(key) from error
+        del registrations[fd]
+        self._callbacks_by_cid.pop(entry[2], None)
+        return True
+
+    def _stop_reading(self, fd: int) -> bool:
+        return self._remove_fd_callback(fd, reading=True, release=False)
+
+    def _stop_writing(self, fd: int) -> bool:
+        return self._remove_fd_callback(fd, reading=False, release=False)
+
+    def _close_socket(self, sock: socket.socket) -> None:
+        """Close the logical socket only after its poll lease was released.
+
+        Failure retains this socket, its mappings and retry key. Retrying
+        closes the same owner; no detach or raw-close fallback is allowed.
+        """
+        fd = sock.fileno()
+        if fd < 0:
             return
-        if fd is None or fd < 0:
+        publication = self._fd_publications.get(fd)
+        if publication is not None:
+            publication.closing_socket = sock
+            self._retire_fd_publication(publication)
             return
-        self._stop_reading(fd)
-        self._stop_writing(fd)
-        fd_key = self._fd_resources.pop(fd, None)
-        if fd_key is None:
+        key = self._fd_resources.get(fd)
+        if key is None:
             sock.close()
             return
-        try:
-            sock.detach()
-        except OSError:
-            pass
-        try:
-            self._pel._release_fd_resource(fd_key, True)
-        except Exception:
-            # NIF unavailable (mock module or shutdown): close it ourselves
-            try:
-                os.close(fd)
-            except OSError:
-                pass
+        self._closing_sockets[key] = sock
+        self._retire_fd(fd, key)
 
     # ========================================================================
     # Socket operations
@@ -797,14 +813,26 @@ class ErlangEventLoop(asyncio.AbstractEventLoop):
         fut = self.create_future()
 
         def _recv():
+            if fut.done():
+                return
             try:
                 data = sock.recv(nbytes)
-                self.call_soon(fut.set_result, data)
             except (BlockingIOError, InterruptedError):
                 return
-            except Exception as e:
-                self.call_soon(fut.set_exception, e)
-            self.remove_reader(sock.fileno())
+            except Exception as error:
+                try:
+                    self.remove_reader(sock.fileno())
+                except FdRetirementError as cleanup_error:
+                    fut.set_exception(cleanup_error)
+                else:
+                    fut.set_exception(error)
+                return
+            try:
+                self.remove_reader(sock.fileno())
+            except FdRetirementError as error:
+                fut.set_exception(error)
+            else:
+                fut.set_result(data)
 
         self.add_reader(sock.fileno(), _recv)
         return await fut
@@ -814,14 +842,26 @@ class ErlangEventLoop(asyncio.AbstractEventLoop):
         fut = self.create_future()
 
         def _recv_into():
+            if fut.done():
+                return
             try:
                 nbytes = sock.recv_into(buf)
-                self.call_soon(fut.set_result, nbytes)
             except (BlockingIOError, InterruptedError):
                 return
-            except Exception as e:
-                self.call_soon(fut.set_exception, e)
-            self.remove_reader(sock.fileno())
+            except Exception as error:
+                try:
+                    self.remove_reader(sock.fileno())
+                except FdRetirementError as cleanup_error:
+                    fut.set_exception(cleanup_error)
+                else:
+                    fut.set_exception(error)
+                return
+            try:
+                self.remove_reader(sock.fileno())
+            except FdRetirementError as error:
+                fut.set_exception(error)
+            else:
+                fut.set_result(nbytes)
 
         self.add_reader(sock.fileno(), _recv_into)
         return await fut
@@ -833,17 +873,25 @@ class ErlangEventLoop(asyncio.AbstractEventLoop):
         offset = [0]
 
         def _send():
+            if fut.done():
+                return
             try:
                 n = sock.send(data[offset[0]:])
                 offset[0] += n
                 if offset[0] >= len(data):
                     self.remove_writer(sock.fileno())
-                    self.call_soon(fut.set_result, None)
+                    fut.set_result(None)
             except (BlockingIOError, InterruptedError):
                 return
-            except Exception as e:
-                self.remove_writer(sock.fileno())
-                self.call_soon(fut.set_exception, e)
+            except FdRetirementError as error:
+                fut.set_exception(error)
+            except Exception as error:
+                try:
+                    self.remove_writer(sock.fileno())
+                except FdRetirementError as cleanup_error:
+                    fut.set_exception(cleanup_error)
+                else:
+                    fut.set_exception(error)
 
         self.add_writer(sock.fileno(), _send)
         return await fut
@@ -860,14 +908,26 @@ class ErlangEventLoop(asyncio.AbstractEventLoop):
             pass
 
         def _connect():
+            if fut.done():
+                return
             try:
                 err = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
                 if err != 0:
-                    raise OSError(err, f'Connect call failed {address}')
-                self.call_soon(fut.set_result, None)
-            except Exception as e:
-                self.call_soon(fut.set_exception, e)
-            self.remove_writer(sock.fileno())
+                    raise OSError(err, "Connect call failed", address)
+            except Exception as error:
+                try:
+                    self.remove_writer(sock.fileno())
+                except FdRetirementError as cleanup_error:
+                    fut.set_exception(cleanup_error)
+                else:
+                    fut.set_exception(error)
+                return
+            try:
+                self.remove_writer(sock.fileno())
+            except FdRetirementError as error:
+                fut.set_exception(error)
+            else:
+                fut.set_result(None)
 
         self.add_writer(sock.fileno(), _connect)
         return await fut
@@ -877,15 +937,28 @@ class ErlangEventLoop(asyncio.AbstractEventLoop):
         fut = self.create_future()
 
         def _accept():
+            if fut.done():
+                return
             try:
                 conn, address = sock.accept()
                 conn.setblocking(False)
-                self.call_soon(fut.set_result, (conn, address))
             except (BlockingIOError, InterruptedError):
                 return
-            except Exception as e:
-                self.call_soon(fut.set_exception, e)
-            self.remove_reader(sock.fileno())
+            except Exception as error:
+                try:
+                    self.remove_reader(sock.fileno())
+                except FdRetirementError as cleanup_error:
+                    fut.set_exception(cleanup_error)
+                else:
+                    fut.set_exception(error)
+                return
+            try:
+                self.remove_reader(sock.fileno())
+            except FdRetirementError as error:
+                conn.close()
+                fut.set_exception(error)
+            else:
+                fut.set_result((conn, address))
 
         self.add_reader(sock.fileno(), _accept)
         return await fut
@@ -1282,7 +1355,7 @@ class ErlangEventLoop(asyncio.AbstractEventLoop):
             # O(1) direct lookup by callback_id
             entry = self._callbacks_by_cid.get(callback_id)
             if entry is not None:
-                self._ready_append(self._get_handle(entry[0], entry[1]))
+                self._ready_append(self._get_handle(self._run_fd_callback, (callback_id,)))
         elif event_type == EVENT_TYPE_TIMER:
             handle = self._timers.pop(callback_id, None)
             if handle is not None:
@@ -1290,6 +1363,17 @@ class ErlangEventLoop(asyncio.AbstractEventLoop):
                 self._handle_to_callback_id.pop(id(handle), None)
                 if not handle._cancelled:
                     self._ready_append(handle)
+
+    def _run_fd_callback(self, callback_id: int) -> None:
+        entry = self._callbacks_by_cid.get(callback_id)
+        if entry is None:
+            return
+        if (
+            entry.key in self._fd_retirement_failed
+            or entry.fd in self._fd_publications
+        ):
+            return
+        entry.callback(*entry.args)
 
     def _get_ready_count(self):
         """Return the number of ready callbacks.
@@ -1434,6 +1518,11 @@ class _MockNifModule:
 
     def __init__(self):
         self._fd_by_key = {}
+        self._fd_callback_sequence = 0
+
+    def _new_fd_callback_id(self) -> int:
+        self._fd_callback_sequence += 1
+        return (1 << 62) | self._fd_callback_sequence
 
     def _is_initialized(self):
         return True
@@ -1483,7 +1572,7 @@ class _MockNifModule:
     def _wakeup_for(self, capsule):
         pass
 
-    def _add_reader_for(self, capsule, fd, callback_id):
+    def _add_reader_for(self, capsule: _MockLoopCapsule, fd: int, callback_id: int) -> int:
         capsule._counter += 1
         capsule.readers[fd] = (callback_id, capsule._counter)
         self._fd_by_key[capsule._counter] = fd
@@ -1495,7 +1584,7 @@ class _MockNifModule:
                 del capsule.readers[fd]
                 break
 
-    def _add_writer_for(self, capsule, fd, callback_id):
+    def _add_writer_for(self, capsule: _MockLoopCapsule, fd: int, callback_id: int) -> int:
         capsule._counter += 1
         capsule.writers[fd] = (callback_id, capsule._counter)
         self._fd_by_key[capsule._counter] = fd
@@ -1523,16 +1612,9 @@ class _MockNifModule:
         """Clear write monitoring on fd_resource."""
         pass
 
-    def _release_fd_resource(self, fd_key, take_ownership=False):
-        """Release fd_resource. With take_ownership the fd is closed here,
-        since there is no NIF to close it from a select stop callback."""
-        if take_ownership:
-            fd = self._fd_by_key.pop(fd_key, None)
-            if fd is not None:
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
+    def _release_fd_resource(self, fd_key: int, take_ownership: bool = False) -> str:
+        fd = self._fd_by_key.pop(fd_key, None)
+        return "absent" if fd is None else "poll_closed"
 
     def _schedule_timer_for(self, capsule, delay_ms, callback_id):
         return callback_id

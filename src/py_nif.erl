@@ -125,6 +125,8 @@
     dup_fd/1,
     os_kill/2,
     %% Test helpers for fd monitoring (using pipes)
+    fd_lifecycle_info/1,
+    create_test_fd_resource/1,
     create_test_pipe/0,
     close_test_fd/1,
     write_test_fd/2,
@@ -889,6 +891,9 @@ close_fd(_FdRef) ->
 -spec create_test_pipe() -> {ok, {integer(), integer()}} | {error, term()}.
 create_test_pipe() ->
     ?NIF_STUB.
+
+fd_lifecycle_info(_Resource) -> ?NIF_STUB.
+create_test_fd_resource(_Fd) -> ?NIF_STUB.
 
 %% @doc Duplicate a file descriptor.
 %% Creates an independent copy of the fd.
