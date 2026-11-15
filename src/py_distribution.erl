@@ -18,6 +18,9 @@ start() ->
             ok = net_kernel:allow(maps:values(Aliases)),
             {ok, _} = gen_server:start({local, ?MODULE}, ?MODULE, [Config, Aliases], []),
             ok = py_callback:register(pybeam_dist_local, fun([Data]) -> local_request(Data) end),
+            ok = py_callback:register(pybeam_dist_bind, fun([Inc, Token, Group]) ->
+                gen_server:call(?MODULE, {bind, Inc, Token, Group}, 1500)
+            end),
             ok = py_callback:register(pybeam_dist_started, fun([Inc, Token, Pid]) ->
                 gen_server:call(?MODULE, {started, Inc, Token, Pid}, 1500)
             end),
@@ -40,12 +43,13 @@ start() ->
     end.
 
 request(Data) when is_binary(Data), byte_size(Data) =< 8192 ->
-    try gen_server:call(?MODULE, {remote, json:decode(Data)}, 1500)
+    try intake(remote, json:decode(Data))
     catch _:_ -> encode(#{status => uncertain}) end;
 request(_) -> encode(#{status => oversized}).
 
 init([Config, Aliases]) ->
     ok = net_kernel:monitor_nodes(true, [nodedown_reason]),
+    ?MODULE = ets:new(?MODULE, [named_table, public, set, {write_concurrency, true}]),
     {ok, #{inc => binary:encode_hex(crypto:strong_rand_bytes(16)),
            capacity => maps:get(<<"capacity">>, Config),
            max_bytes => maps:get(<<"max_bytes">>, Config),
@@ -58,21 +62,113 @@ identity(S) -> #{node => atom_to_binary(node()), pid => list_to_binary(pid_to_li
                  incarnation => maps:get(inc, S)}.
 expire(S) ->
     Now = erlang:monotonic_time(millisecond),
-    Jobs = maps:filter(fun(_, J) ->
-        maps:get(phase, J) =/= reserved orelse maps:get(deadline, J) > Now
+    Jobs = maps:filter(fun(T, J) ->
+        case {maps:get(phase, J), ets:lookup(?MODULE, T)} of
+            {reserved, [Row = {T, _, _, _, Deadline, reserved}]} when Deadline =< Now ->
+                %% Expiry and ingress compete on the SAME immutable row.
+                ets:select_delete(?MODULE, [{Row, [], [true]}]) =:= 0;
+            {reserved, []} -> false;
+            _ -> true
+        end
     end, maps:get(jobs, S)),
     S#{jobs := Jobs}.
 
 local_request(Data) when is_binary(Data), byte_size(Data) =< 8192 ->
-    gen_server:call(?MODULE, {local, json:decode(Data)}, 1500).
+    intake(local, json:decode(Data)).
 
+%% Credits include encoded requests in the local handoff signal/application mailbox.
+%% Network decoding and transient RPC caller buffers are not an aggregate RSS budget.
+intake(_, #{<<"op">> := <<"submit">>, <<"incarnation">> := Inc,
+            <<"token">> := Token, <<"payload">> := Payload}) when is_binary(Payload) ->
+    case ets:lookup(?MODULE, Token) of
+        [{Token, Inc, Size, Digest, Deadline, reserved} = Row] ->
+            case {erlang:monotonic_time(millisecond) < Deadline,
+                  byte_size(Payload) =:= Size andalso
+                  binary:encode_hex(crypto:hash(sha256, Payload), lowercase) =:= Digest} of
+                {false, _} -> encode(#{status => unknown_token});
+                {true, false} -> encode(#{status => conflict});
+                {true, true} ->
+                    Claimed = setelement(6, Row, claimed),
+                    case ets:select_replace(?MODULE, [{Row, [], [{const, Claimed}]}]) of
+                        1 ->
+                            %% If this caller dies before handoff, ownership is UNKNOWN.
+                            %% Never undo the claim: a send may already have occurred.
+                            gen_server:call(?MODULE, {ingress, Inc, Token, Payload}, 1500);
+                        0 -> encode(#{status => invalid_phase})
+                    end
+            end;
+        [{Token, Other, _, _, _, _}] when Other =/= Inc -> encode(#{status => stale});
+        [_] -> encode(#{status => invalid_phase});
+        [] -> encode(#{status => unknown_token})
+    end;
+intake(_, #{<<"op">> := <<"submit">>}) -> encode(#{status => conflict});
+intake(remote, Request) -> remote_metadata(Request);
+intake(local, Request) when is_map(Request) ->
+    gen_server:call(?MODULE, {local, maps:remove(<<"payload">>, Request)}, 1500);
+intake(_, _) -> encode(#{status => unknown_operation}).
+
+%% A remote control carries only its bounded metadata, never extra application data.
+remote_metadata(#{<<"op">> := <<"snapshot">>}) ->
+    control(#{<<"op">> => <<"snapshot">>});
+remote_metadata(#{<<"op">> := <<"receipt">>, <<"id">> := Id, <<"ack_alias">> := Alias})
+  when is_binary(Id), byte_size(Id) =< 64, is_binary(Alias), byte_size(Alias) =:= 1 ->
+    control(#{<<"op">> => <<"receipt">>, <<"id">> => Id, <<"ack_alias">> => Alias});
+remote_metadata(#{<<"op">> := <<"ack_receipt">>, <<"id">> := Id})
+  when is_binary(Id), byte_size(Id) =< 64 ->
+    control(#{<<"op">> => <<"ack_receipt">>, <<"id">> => Id});
+remote_metadata(#{<<"op">> := <<"reserve">>, <<"incarnation">> := Inc,
+                  <<"id">> := Id, <<"definition">> := <<"double">>,
+                  <<"size">> := Size, <<"digest">> := Digest} = R)
+  when is_binary(Inc), byte_size(Inc) =:= 32, is_binary(Id),
+       byte_size(Id) > 0, byte_size(Id) =< 64, is_integer(Size), Size > 0, Size =< 4096,
+       is_binary(Digest), byte_size(Digest) =:= 64 ->
+    control(maps:with([<<"op">>, <<"incarnation">>, <<"id">>, <<"definition">>,
+                       <<"size">>, <<"digest">>], R));
+remote_metadata(#{<<"op">> := Op, <<"incarnation">> := Inc, <<"token">> := Token})
+  when (Op =:= <<"result">> orelse Op =:= <<"ack">> orelse Op =:= <<"cancel">>),
+       is_binary(Inc), byte_size(Inc) =< 32, is_binary(Token), byte_size(Token) =< 32 ->
+    control(#{<<"op">> => Op, <<"incarnation">> => Inc, <<"token">> => Token});
+remote_metadata(_) -> encode(#{status => unknown_operation}).
+control(Request) -> gen_server:call(?MODULE, {remote, Request}, 1500).
+
+handle_call({bind, Inc, Token, Group}, _, S)
+  when is_pid(Group), node(Group) =:= node() ->
+    case {Inc =:= maps:get(inc, S), maps:find(Token, maps:get(jobs, S)),
+          lists:any(fun(J) -> maps:get(group, J, none) =:= Group end,
+                    maps:values(maps:get(jobs, S))),
+          proc_lib:translate_initial_call(Group)} of
+        {true, {ok, #{phase := running} = J}, false, {py_task_group, init, 1}}
+          when not is_map_key(group, J) ->
+            case group_info(Group) of
+                #{jobs := 0, children := [], contexts := [],
+                  gate := #{capacity := 1, count := 0, bytes := 0, unsettled := 0, closed := false}} ->
+                    reply(#{status => ok}, put_job(Token, J#{group => Group}, S));
+                _ -> reply(#{status => uncertain}, S)
+            end;
+        _ -> reply(#{status => uncertain}, S)
+    end;
+handle_call({ingress, Inc, Token, Payload}, _, S) ->
+    case {Inc =:= maps:get(inc, S), maps:find(Token, maps:get(jobs, S)),
+          ets:lookup(?MODULE, Token)} of
+        {true, {ok, #{phase := reserved} = J}, [{Token, Inc, _, _, _, claimed}]} ->
+            reply(#{status => ok}, put_job(Token, J#{phase := queued, payload => Payload}, S));
+        _ -> reply(#{status => uncertain}, S)
+    end;
 handle_call({started, Inc, Token, Pid}, _From, S)
   when is_pid(Pid), node(Pid) =:= node() ->
     case {Inc =:= maps:get(inc, S), maps:find(Token, maps:get(jobs, S)),
           is_process_alive(Pid), proc_lib:translate_initial_call(Pid)} of
-        {true, {ok, #{phase := running} = J}, true, {py_task, init, 1}} ->
-            PidText = list_to_binary(pid_to_list(Pid)),
-            reply(#{status => ok, worker => PidText}, put_job(Token, J#{worker => PidText, worker_pid => Pid}, S));
+        {true, {ok, #{phase := running, group := Group} = J}, true, {py_task, init, 1}}
+          when not is_map_key(worker_pid, J) ->
+            %% The request owns a distinct capacity-one native group, bound while empty.
+            %% An unrelated local py_task is not completion evidence for this request.
+            case group_info(Group) of
+                #{jobs := 1, children := [{_, Pid, worker, _}]} ->
+                    PidText = list_to_binary(pid_to_list(Pid)),
+                    reply(#{status => ok, worker => PidText},
+                          put_job(Token, J#{worker => PidText, worker_pid => Pid}, S));
+                _ -> reply(#{status => uncertain}, S)
+            end;
         _ -> reply(#{status => uncertain}, S)
     end;
 handle_call({remote, #{<<"op">> := Op} = Request}, _From, Original)
@@ -127,7 +223,10 @@ dispatch(#{<<"op">> := <<"ack_receipt">>, <<"id">> := Id}, S)
     reply(#{status => ok, receipt => (identity(S))#{message_id => Id}}, S);
 dispatch(#{<<"op">> := <<"register">>, <<"definition">> := <<"double">>}, S) ->
     reply(#{status => ok}, S#{definitions := [<<"double">>]});
-dispatch(#{<<"op">> := <<"close_admission">>}, S) -> reply(#{status => ok}, S#{definitions := []});
+dispatch(#{<<"op">> := <<"close_admission">>}, S) ->
+    %% Claims already won remain charged; only unclaimed rights can be revoked.
+    ets:select_delete(?MODULE, [{{'_', '_', '_', '_', '_', reserved}, [], [true]}]),
+    reply(#{status => ok}, expire(S#{definitions := []}));
 dispatch(#{<<"op">> := <<"reserve">>, <<"incarnation">> := Inc,
            <<"id">> := Id, <<"definition">> := <<"double">>, <<"size">> := Size,
            <<"digest">> := Digest}, S)
@@ -147,6 +246,8 @@ dispatch(#{<<"op">> := <<"reserve">>, <<"incarnation">> := Inc,
             Token = binary:encode_hex(crypto:strong_rand_bytes(16)),
             J = #{id => Id, size => Size, digest => Digest, phase => reserved,
                   cancel => false, deadline => erlang:monotonic_time(millisecond) + 1000},
+            true = ets:insert_new(?MODULE, {Token, Inc, Size, Digest,
+                                           maps:get(deadline, J), reserved}),
             reply(#{status => ok, token => Token},
                   S#{jobs := Jobs#{Token => J}, ids := Ids#{Id => Digest}});
         _ -> reply(#{status => overloaded}, S)
@@ -167,14 +268,6 @@ dispatch(#{<<"op">> := <<"next">>}, S) ->
 dispatch(_, S) -> reply(#{status => unknown_operation}, S).
 
 put_job(Token, Job, S) -> S#{jobs := (maps:get(jobs, S))#{Token => Job}}.
-job(<<"submit">>, T, #{phase := reserved} = J, #{<<"payload">> := P}, S)
-  when is_binary(P) ->
-    case {maps:get(definitions, S) =/= [], byte_size(P) =:= maps:get(size, J) andalso
-         binary:encode_hex(crypto:hash(sha256, P), lowercase) =:= maps:get(digest, J)} of
-        {true, true} -> reply(#{status => ok}, put_job(T, J#{phase := queued, payload => P}, S));
-        {false, _} -> reply(#{status => admission_closed}, S);
-        {true, false} -> reply(#{status => conflict}, S)
-    end;
 job(<<"result">>, _T, #{phase := done, result := R, id := Id, size := Size} = J, _, S) ->
     Proof = case maps:find(worker, J) of
         {ok, Pid} -> #{worker => Pid, worker_dead => true, worker_kind => temporary_otp_task};
@@ -184,8 +277,14 @@ job(<<"result">>, _T, #{phase := done, result := R, id := Id, size := Size} = J,
                       payload => maps:get(payload, J), identity => identity(S)}, Proof), S);
 job(<<"result">>, _, #{phase := running, worker := Pid}, _, S) ->
     reply(#{status => pending, worker => Pid, worker_kind => temporary_otp_task}, S);
+job(<<"result">>, T, #{phase := reserved}, _, S) ->
+    case ets:lookup(?MODULE, T) of
+        [{T, _, _, _, _, claimed}] -> reply(#{status => uncertain}, S);
+        _ -> reply(#{status => pending}, S)
+    end;
 job(<<"result">>, _, _, _, S) -> reply(#{status => pending}, S);
 job(<<"ack">>, T, #{phase := done}, _, S) ->
+    true = ets:delete(?MODULE, T),
     reply(#{status => ok}, S#{jobs := maps:remove(T, maps:get(jobs, S))});
 job(<<"cancel">>, T, J, _, S) -> reply(#{status => pending}, put_job(T, J#{cancel := true}, S));
 job(<<"cancelled">>, _, J, _, S) -> reply(#{status => ok, cancel => maps:get(cancel, J)}, S);
@@ -200,6 +299,10 @@ job(<<"complete">>, T, #{phase := running, worker_pid := Pid} = J,
         true -> reply(#{status => uncertain}, S)
     end;
 job(_, _, _, _, S) -> reply(#{status => invalid_phase}, S).
+
+group_info(Group) ->
+    try gen_server:call(Group, info, 500)
+    catch exit:_ -> uncertain end.
 
 handle_cast(_, S) -> {noreply, S}.
 handle_info({Kind, N, _}, S) when Kind =:= nodeup; Kind =:= nodedown ->
