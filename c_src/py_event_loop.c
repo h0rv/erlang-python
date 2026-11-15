@@ -3071,7 +3071,7 @@ ERL_NIF_TERM nif_event_loop_release_python_loop(ErlNifEnv *env, int argc,
         return make_error(env, "interpreter_gone");
     }
     pthread_mutex_lock(&loop->mutex);
-    if (atomic_load(&loop->py_running)) {
+    if (atomic_load(&loop->py_running) || atomic_load(&loop->py_driver_claimed)) {
         pthread_mutex_unlock(&loop->mutex);
         loop_gil_release(loop, &gil);
         return make_error(env, "loop_running");
@@ -3270,7 +3270,7 @@ ERL_NIF_TERM nif_process_ready_tasks(ErlNifEnv *env, int argc,
      * Exception: a loop driven by run_forever on its own thread consumes
      * pending events itself. With no tasks to schedule there is nothing for
      * us to do under its GIL; wake it and leave. */
-    if (num_tasks == 0 && atomic_load(&loop->py_running)) {
+    if (num_tasks == 0 && (atomic_load(&loop->py_running) || atomic_load(&loop->py_driver_claimed))) {
         if (!loop->shutdown) {
             pthread_mutex_lock(&loop->mutex);
             pthread_cond_broadcast(&loop->event_cond);
@@ -3722,7 +3722,7 @@ ERL_NIF_TERM nif_process_ready_tasks(ErlNifEnv *env, int argc,
     if (is_running != NULL) {
         int running = PyObject_IsTrue(is_running);
         Py_DECREF(is_running);
-        if (running) {
+        if (running || atomic_load(&loop->py_driver_claimed)) {
             /* Loop is already running (run_forever on another thread): the
              * coroutines were scheduled on its ready queue, wake it so they
              * start now instead of at the next poll timeout. Same broadcast
@@ -7742,7 +7742,8 @@ static int claim_python_loop(erlang_event_loop_t *loop, PyObject *owner) {
     Py_INCREF(owner);
     pthread_mutex_lock(&loop->mutex);
     bool stopped = loop->shutdown;
-    bool conflict = loop->py_loop != NULL && loop->py_loop != owner;
+    bool conflict = (loop->py_loop != NULL && loop->py_loop != owner) ||
+        (loop->py_driver_session != NULL && loop->py_loop != owner);
     bool claimed = !stopped && !conflict && loop->py_loop == NULL;
     if (claimed) {
         loop->py_loop = owner;
@@ -7828,7 +7829,8 @@ static PyObject *py_clear_loop_ref(PyObject *self, PyObject *args) {
     }
     pthread_mutex_lock(&loop->mutex);
     bool conflict = loop->py_loop != owner && (loop->py_loop != NULL || dispose);
-    bool running = atomic_load(&loop->py_running);
+    bool running = atomic_load(&loop->py_running) ||
+        (loop->py_driver_session != NULL && loop->py_driver_thread != PyThread_get_thread_ident());
     PyObject *released = NULL;
     if (!conflict && !running) {
         released = loop->py_loop;
@@ -7849,6 +7851,77 @@ static PyObject *py_clear_loop_ref(PyObject *self, PyObject *args) {
     bool had_owner = released != NULL;
     Py_XDECREF(released);
     return PyBool_FromLong(had_owner);
+}
+
+/* Claim a driver session before publishing callbacks or thread-local policy
+ * state. Only run_forever/run_until_complete may join the current thread's
+ * existing session; managed startup always requests a fresh exclusive claim. */
+static PyObject *py_claim_driver_session(PyObject *self, PyObject *args) {
+    (void)self;
+    PyObject *capsule, *owner;
+    int allow_current = 0;
+    if (!PyArg_ParseTuple(args, "OO|p", &capsule, &owner, &allow_current)) return NULL;
+    erlang_event_loop_t *loop = loop_from_capsule(capsule);
+    if (loop == NULL) return NULL;
+    if (PyInterpreterState_GetID(PyInterpreterState_Get()) != loop->interp_id) {
+        PyErr_SetString(PyExc_RuntimeError, "Native loop belongs to another interpreter");
+        return NULL;
+    }
+    PyObject *fresh = PyObject_CallNoArgs((PyObject *)&PyBaseObject_Type);
+    if (fresh == NULL) return NULL;
+    unsigned long thread = PyThread_get_thread_ident();
+    pthread_mutex_lock(&loop->mutex);
+    bool current = allow_current && loop->py_driver_session != NULL &&
+        loop->py_driver_thread == thread && loop->py_driver_generation == loop->py_owner_generation;
+    bool valid = !loop->shutdown && loop->py_loop == owner &&
+        (current || (loop->py_driver_session == NULL && !atomic_load(&loop->py_running)));
+    bool acquired = valid && !current;
+    if (acquired) {
+        loop->py_driver_session = Py_NewRef(fresh);
+        atomic_store(&loop->py_driver_claimed, true);
+        loop->py_driver_thread = thread;
+        loop->py_driver_generation = loop->py_owner_generation;
+    }
+    PyObject *token = valid ? Py_NewRef(loop->py_driver_session) : NULL;
+    pthread_mutex_unlock(&loop->mutex);
+    Py_DECREF(fresh);
+    if (!valid) {
+        PyErr_SetString(PyExc_RuntimeError, "Native loop driver session is already claimed or unavailable");
+        return NULL;
+    }
+    PyObject *result = PyTuple_Pack(2, token, acquired ? Py_True : Py_False);
+    Py_DECREF(token);
+    return result;
+}
+
+static PyObject *py_release_driver_session(PyObject *self, PyObject *args) {
+    (void)self;
+    PyObject *capsule, *owner, *token;
+    if (!PyArg_ParseTuple(args, "OOO", &capsule, &owner, &token)) return NULL;
+    erlang_event_loop_t *loop = loop_from_capsule(capsule);
+    if (loop == NULL) return NULL;
+    if (PyInterpreterState_GetID(PyInterpreterState_Get()) != loop->interp_id) {
+        PyErr_SetString(PyExc_RuntimeError, "Native loop belongs to another interpreter");
+        return NULL;
+    }
+    pthread_mutex_lock(&loop->mutex);
+    bool valid = loop->py_driver_session == token &&
+        loop->py_driver_thread == PyThread_get_thread_ident() &&
+        loop->py_driver_generation == loop->py_owner_generation &&
+        (loop->py_loop == owner || loop->py_loop == NULL) && !atomic_load(&loop->py_running);
+    if (valid) {
+        loop->py_driver_session = NULL;
+        loop->py_driver_thread = 0;
+        atomic_store(&loop->py_driver_claimed, false);
+    }
+    pthread_mutex_unlock(&loop->mutex);
+    if (!valid) {
+        PyErr_SetString(PyExc_RuntimeError, "Driver session release requires its stopped exact owner");
+        return NULL;
+    }
+    Py_DECREF(token); /* resource's reference; the argument still owns its token */
+    wake_python_loop(loop);
+    Py_RETURN_NONE;
 }
 
 /* Internal driver lookup. Observe the exact resource owner without releasing
@@ -8660,6 +8733,8 @@ static PyMethodDef PyEventLoopMethods[] = {
     {"_get_global_loop_capsule", py_get_global_loop_capsule, METH_NOARGS, "Get capsule for global event loop"},
     {"_has_loop_ref", py_has_loop_ref, METH_VARARGS, "Check if loop capsule has Python loop reference"},
     {"_get_loop_ref", py_get_loop_ref, METH_VARARGS, "Get the exact native resource owner for an internal driver transition"},
+    {"_claim_driver_session", py_claim_driver_session, METH_VARARGS, "Claim exclusive driver startup and cleanup ownership"},
+    {"_release_driver_session", py_release_driver_session, METH_VARARGS, "Release only the matching stopped driver session"},
     {"_clear_loop_ref", py_clear_loop_ref, METH_VARARGS, "Clear Python loop reference from C struct"},
     {"_loop_destroy", py_loop_destroy, METH_VARARGS, "Destroy an event loop"},
     {"_set_loop_ref", py_set_loop_ref, METH_VARARGS, "Store Python loop reference in C struct"},

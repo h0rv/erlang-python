@@ -428,6 +428,13 @@ typedef struct erlang_event_loop {
      * retain this number, not a Python owner reference. */
     uint64_t py_owner_generation;
 
+    /* Driver execution is distinct from the retained wrapper claim. The
+     * session covers startup publication through finalization and rollback. */
+    PyObject *py_driver_session;
+    _Atomic bool py_driver_claimed;
+    unsigned long py_driver_thread;
+    uint64_t py_driver_generation;
+
     /** @brief Whether py_loop has been set */
     bool py_loop_valid;
 

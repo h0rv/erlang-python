@@ -191,37 +191,45 @@ def _run_loop_forever(notify_pid: object | None = None, capsule: object | None =
         loop = ErlangEventLoop(capsule)
     if not isinstance(loop, ErlangEventLoop) or loop.is_closed():
         raise RuntimeError("Native resource has no usable ErlangEventLoop owner")
-    if loop.is_running():
-        raise RuntimeError("Native resource driver is already running")
-    asyncio.set_event_loop(loop)
-    if notify_pid is not None:
-        import erlang as _erlang
+    # Claim before publishing a startup callback or changing thread policy.
+    # A stopped wrapper is reusable, but its driver session is exclusive.
+    with loop._driver_session():
+        from _erlang_impl._lifecycle import begin_managed_shutdown, shutdown_managed_loop
+
+        started = False
 
         def _started():
-            try:
+            nonlocal started
+            started = True
+            if notify_pid is not None:
+                import erlang as _erlang
                 _erlang.send(notify_pid, (atom('py_loop_started'),))
-            except Exception:
-                pass
-        loop.call_soon(_started)
-    from _erlang_impl._lifecycle import begin_managed_shutdown, shutdown_managed_loop
 
-    try:
-        loop.run_forever()
-    finally:
-        loop._managed_shutdown_requested = True
-        observer = begin_managed_shutdown(loop)
-        cleanup_failed = False
+        startup = None
         try:
-            while True:
-                errors = loop.run_until_complete(shutdown_managed_loop(loop))
-                cleanup_failed = cleanup_failed or bool(errors)
-                if not observer.pending() and not loop._ready and not loop._asyncgens:
-                    break
-            loop.close()
-            if cleanup_failed or observer.failed:
-                raise RuntimeError("Managed loop cleanup failed") from None
+            asyncio.set_event_loop(loop)
+            startup = loop.call_soon(_started)
+            loop.run_forever()
         finally:
-            asyncio.set_event_loop(None)
+            if startup is not None:
+                startup.cancel()
+            try:
+                # A failed startup never ran this driver's acknowledgement.
+                # Leave its retained wrapper and callbacks intact for retry.
+                if started:
+                    loop._managed_shutdown_requested = True
+                    observer = begin_managed_shutdown(loop)
+                    cleanup_failed = False
+                    while True:
+                        errors = loop.run_until_complete(shutdown_managed_loop(loop))
+                        cleanup_failed = cleanup_failed or bool(errors)
+                        if not observer.pending() and not loop._ready and not loop._asyncgens:
+                            break
+                    loop.close()
+                    if cleanup_failed or observer.failed:
+                        raise RuntimeError("Managed loop cleanup failed") from None
+            finally:
+                asyncio.set_event_loop(None)
     return 'stopped'
 
 

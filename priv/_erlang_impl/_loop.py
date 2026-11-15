@@ -37,7 +37,8 @@ import threading
 import time
 from asyncio import events, futures, tasks, transports
 from collections import deque
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Generator
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Callable, Never, Optional, Tuple
 from weakref import WeakSet
 
@@ -274,8 +275,22 @@ class ErlangEventLoop(asyncio.AbstractEventLoop):
     # Running and stopping the event loop
     # ========================================================================
 
+    @contextmanager
+    def _driver_session(self, *, allow_current: bool = False) -> Generator[None]:
+        capsule = self._loop_capsule
+        token, acquired = self._pel._claim_driver_session(capsule, self, allow_current)
+        try:
+            yield
+        finally:
+            if acquired:
+                self._pel._release_driver_session(capsule, self, token)
+
     def run_forever(self):
         """Run the event loop until stop() is called."""
+        with self._driver_session(allow_current=True):
+            return self._run_forever_owned()
+
+    def _run_forever_owned(self):
         self._check_closed()
         self._check_running()
         self._set_coroutine_origin_tracking(self._debug)
@@ -318,6 +333,10 @@ class ErlangEventLoop(asyncio.AbstractEventLoop):
 
     def run_until_complete(self, future):
         """Run the event loop until a future is done."""
+        with self._driver_session(allow_current=True):
+            return self._run_until_complete_owned(future)
+
+    def _run_until_complete_owned(self, future):
         self._check_closed()
         self._check_running()
 
@@ -374,7 +393,14 @@ class ErlangEventLoop(asyncio.AbstractEventLoop):
             raise RuntimeError("Cannot close a running event loop")
         if self._closed:
             return
+        if self._pel._has_loop_ref(self._loop_capsule):
+            with self._driver_session(allow_current=True):
+                self._close_owned()
+        else:
+            # Explicit native disposal may already have released this wrapper.
+            self._close_owned()
 
+    def _close_owned(self):
         self._closed = True
 
         # Cancel all timers
@@ -1397,6 +1423,9 @@ class _MockLoopCapsule:
         self.writers = {}
         self.pending = []
         self._counter = 0
+        self.driver_lock = threading.Lock()
+        self.driver_token: object | None = None
+        self.driver_thread = 0
         self._fd_resources = {}  # fd_key -> {fd, read_active, write_active, read_cid, write_cid}
 
 
@@ -1408,6 +1437,27 @@ class _MockNifModule:
 
     def _is_initialized(self):
         return True
+
+    def _has_loop_ref(self, capsule):
+        return True
+
+    def _claim_driver_session(self, capsule, owner, allow_current=False):
+        thread = threading.get_ident()
+        with capsule.driver_lock:
+            if capsule.driver_token is not None:
+                if allow_current and capsule.driver_thread == thread:
+                    return capsule.driver_token, False
+                raise RuntimeError("Native loop driver session is already claimed or unavailable")
+            capsule.driver_token = object()
+            capsule.driver_thread = thread
+            return capsule.driver_token, True
+
+    def _release_driver_session(self, capsule, owner, token):
+        with capsule.driver_lock:
+            if capsule.driver_token is not token or capsule.driver_thread != threading.get_ident():
+                raise RuntimeError("Driver session release requires its stopped exact owner")
+            capsule.driver_token = None
+            capsule.driver_thread = 0
 
     def _loop_new(self):
         return _MockLoopCapsule()
