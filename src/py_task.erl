@@ -6,7 +6,7 @@ start_link(Group, Factory, Ticket, Payload) ->
     gen_server:start_link(?MODULE, {Group, Factory, Ticket, Payload}, []).
 
 init({Group, Factory, Ticket, Payload}) ->
-    {ok, Ctx} = py_context:new(#{mode => worker, context_owner => self()}),
+    {ok, Ctx} = py_context:new(#{mode => worker, managed_loop => dedicated, context_owner => self()}),
     Native = py_context:get_nif_ref(Ctx),
     {ok, Env} = py_context:create_local_env(Ctx),
     {ok, Empty} = py_context:eval_ref(Ctx, <<"()">>, #{}, Env),
@@ -25,7 +25,26 @@ handle_cast(_, State) -> {noreply, State}.
 
 %% The group captures ownership and installs its monitor before sending run.
 %% Cancellation goes through its separate control context, never this busy turn.
-handle_info(run, #{ctx := Ctx, env := Env, object := Object, dispatch := Dispatch,
+handle_info(run, #{ctx := Ctx, object := Object, group := Group,
+                   ticket := Ticket, payload := Payload} = State) ->
+    case py_context:call(Ctx, '_erlang_impl._tasks', dedicated, [Object]) of
+        {ok, true} ->
+            ok = py_context:start_loop(Ctx),
+            Result = case py_context:submit_await(Ctx, '_erlang_impl._tasks', execute_owned,
+                          [Object, Ticket, {bytes, Payload}], #{}, infinity) of
+                {ok, {<<"ok">>, Bytes}} -> {ok, {bytes, Bytes}};
+                {ok, {<<"python_error">>, Error}} -> {python_error, Error};
+                Error -> Error
+            end,
+            Group ! {work_result, self(), Result},
+            {stop, normal, State};
+        {ok, false} -> run_shared(State)
+    end;
+handle_info({'DOWN', Mon, process, _, Reason}, #{mon := Mon} = State) ->
+    {stop, {context_died, Reason}, State};
+handle_info(_, State) -> {noreply, State}.
+
+run_shared(#{ctx := Ctx, env := Env, object := Object, dispatch := Dispatch,
                    kwargs := Kwargs, group := Group, ticket := Ticket, payload := Payload} = State) ->
     Result = try
         {ok, Args} = py_context:call(Ctx, '_erlang_impl._actor_data', arguments,
@@ -40,9 +59,6 @@ handle_info(run, #{ctx := Ctx, env := Env, object := Object, dispatch := Dispatc
         end
     catch Class:Reason -> {error, {Class, Reason}} end,
     Group ! {work_result, self(), Result},
-    {stop, normal, State};
-handle_info({'DOWN', Mon, process, _, Reason}, #{mon := Mon} = State) ->
-    {stop, {context_died, Reason}, State};
-handle_info(_, State) -> {noreply, State}.
+    {stop, normal, State}.
 
 terminate(_, #{ctx := Ctx}) -> py_context:destroy(Ctx).

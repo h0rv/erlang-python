@@ -19,8 +19,11 @@ class _Running:
 
 @final
 class Body:
-    def __init__(self, invoke: Callable[[bytes], Awaitable[bytes]]) -> None:
+    def __init__(
+        self, invoke: Callable[[bytes], Awaitable[bytes]], *, dedicated_loop: bool = False
+    ) -> None:
         self._invoke = invoke
+        self.dedicated_loop = dedicated_loop
         self._lock = threading.Lock()
         self._cancelled = False
         self._state: Literal["ready", "sealed", "finished"] | _Running = "ready"
@@ -74,6 +77,25 @@ async def execute(body: Body, ticket: object, payload: bytes) -> bytes:
         return await body.run(payload)
     finally:
         erlang._actor_complete(ticket)
+
+
+def dedicated(reference: object) -> bool:
+    body = erlang._actor_unwrap(reference)
+    if not isinstance(body, Body):
+        raise TypeError("Invalid task body")
+    return body.dedicated_loop
+
+
+async def execute_owned(reference: object, ticket: object, payload: bytes) -> tuple[str, object]:
+    body = erlang._actor_unwrap(reference)
+    # A traceback must not retain the local-object capsule and its context/env.
+    reference = None
+    if not isinstance(body, Body):
+        raise TypeError("Invalid task body")
+    try:
+        return "ok", await execute(body, ticket, payload)
+    except BaseException as error:
+        return "python_error", erlang._actor_retain(error)
 
 
 def request_cancel(reference: object) -> None:

@@ -120,7 +120,7 @@ killed_before_execution(_) ->
     after gen_server:stop(Group, normal, infinity), py_context:destroy(Source) end.
 
 retained_exception_lifecycle(_) ->
-    {ok, Ctx} = py_context:new(#{mode => worker}),
+    {ok, Ctx} = py_context:new(#{mode => worker, managed_loop => dedicated}),
     Dir = filename:dirname(code:which(?MODULE)),
     ok = py_context:exec(Ctx, iolist_to_binary(io_lib:format(
         "import sys; sys.path.insert(0, ~p)", [Dir]))),
