@@ -7,7 +7,8 @@ all() -> [owned_cleanup, original_failure, foreign_loop_rejected].
 
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(erlang_python),
-    ok = py:exec(<<"
+    {ok, Ctx} = py_context:new(#{mode => worker}),
+    ok = py:exec(Ctx, <<"
 import sys
 import types
 service_probe = types.ModuleType('_service_integration_probe')
@@ -104,16 +105,19 @@ def foreign_loop_rejected() -> bool:
 ''', service_probe.__dict__)
 sys.modules[service_probe.__name__] = service_probe
 ">>),
-    Config.
+    [{context, Ctx} | Config].
 
-end_per_suite(_Config) ->
-    ok = py:exec(<<"import sys; del sys.modules['_service_integration_probe']">>),
+end_per_suite(Config) ->
+    Ctx = proplists:get_value(context, Config),
+    ok = py:exec(Ctx, <<"import sys; del sys.modules['_service_integration_probe']">>),
+    py_context:stop(Ctx),
     ok = application:stop(erlang_python).
 
 owned_cleanup(_Config) -> check(owned_cleanup).
 original_failure(_Config) -> check(original_failure).
-foreign_loop_rejected(_Config) ->
-    {ok, true} = py:call('_service_integration_probe', foreign_loop_rejected, []),
+foreign_loop_rejected(Config) ->
+    Ctx = proplists:get_value(context, Config),
+    {ok, true} = py:call(Ctx, '_service_integration_probe', foreign_loop_rejected, []),
     ok.
 
 check(Function) ->
