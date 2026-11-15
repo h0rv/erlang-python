@@ -98,6 +98,7 @@ static const char *EVENT_LOOP_CAPSULE_NAME = "erlang_python.event_loop";
 /* Capsule over a loop resource for ErlangEventLoop (defined with the
  * capsule helpers below). */
 static PyObject *make_loop_capsule(erlang_event_loop_t *loop);
+static int claim_python_loop(erlang_event_loop_t *loop, PyObject *owner);
 
 static void close_loop_work_admission(erlang_event_loop_t *loop) {
     if (!loop->task_queue_initialized) return;
@@ -3062,20 +3063,27 @@ ERL_NIF_TERM nif_event_loop_release_python_loop(ErlNifEnv *env, int argc,
                            (void **)&loop)) {
         return make_error(env, "invalid_loop");
     }
-    close_loop_work_admission(loop);
-    if (loop->py_loop == NULL) {
-        return ATOM_OK;
-    }
     if (!runtime_is_running()) {
         return make_error(env, "python_not_running");
     }
-
     loop_gil_t gil;
     if (!loop_gil_acquire(loop, &gil)) {
         return make_error(env, "interpreter_gone");
     }
-    Py_CLEAR(loop->py_loop);
+    pthread_mutex_lock(&loop->mutex);
+    if (atomic_load(&loop->py_running)) {
+        pthread_mutex_unlock(&loop->mutex);
+        loop_gil_release(loop, &gil);
+        return make_error(env, "loop_running");
+    }
+    /* Administrative destruction is not a transferable release token. */
+    loop->shutdown = true;
+    PyObject *released = loop->py_loop;
+    loop->py_loop = NULL;
     loop->py_loop_valid = false;
+    pthread_mutex_unlock(&loop->mutex);
+    close_loop_work_admission(loop);
+    Py_XDECREF(released);
     loop_gil_release(loop, &gil);
     return ATOM_OK;
 }
@@ -3423,18 +3431,17 @@ ERL_NIF_TERM nif_process_ready_tasks(ErlNifEnv *env, int argc,
         PyObject *set_result = PyObject_CallMethod(asyncio, "set_event_loop", "O", new_loop);
         Py_XDECREF(set_result);
 
-        /* ErlangEventLoop.__init__ should have called _set_global_loop_ref,
-         * which sets loop->py_loop and loop->py_loop_valid = true */
-        if (!loop->py_loop_valid || loop->py_loop == NULL) {
-            /* Fallback: manually set the loop reference */
-            if (loop->py_loop != NULL) {
-                Py_DECREF(loop->py_loop);
-            }
-            loop->py_loop = new_loop;  /* Transfer ownership */
-            loop->py_loop_valid = true;
-        } else {
+        /* Construction and this native entry point use the same exclusive claim. */
+        if (claim_python_loop(loop, new_loop) < 0) {
             Py_DECREF(new_loop);
+            PyErr_Clear();
+            for (int i = 0; i < num_tasks; i++) {
+                return_pooled_env(loop, tasks[i].term_env);
+            }
+            loop_gil_release(loop, &gil);
+            return make_error(env, "loop_owner_conflict");
         }
+        Py_DECREF(new_loop);
     }
 
     /* ========================================================================
@@ -7725,6 +7732,32 @@ static PyObject *py_loop_destroy(PyObject *self, PyObject *args) {
     Py_RETURN_NONE;
 }
 
+/* GIL held. The resource, not a capsule alias, owns one strong identity token.
+ * Never decref under mutex: object destruction can re-enter native helpers. */
+static int claim_python_loop(erlang_event_loop_t *loop, PyObject *owner) {
+    if (PyInterpreterState_GetID(PyInterpreterState_Get()) != loop->interp_id) {
+        PyErr_SetString(PyExc_RuntimeError, "Native loop belongs to another interpreter");
+        return -1;
+    }
+    Py_INCREF(owner);
+    pthread_mutex_lock(&loop->mutex);
+    bool stopped = loop->shutdown;
+    bool conflict = loop->py_loop != NULL && loop->py_loop != owner;
+    bool claimed = !stopped && !conflict && loop->py_loop == NULL;
+    if (claimed) {
+        loop->py_loop = owner;
+        loop->py_loop_valid = true;
+    }
+    pthread_mutex_unlock(&loop->mutex);
+    if (!claimed) Py_DECREF(owner);
+    if (stopped || conflict) {
+        PyErr_SetString(PyExc_RuntimeError, stopped ? "Native event loop is shut down"
+            : "Native event loop already has a Python owner");
+        return -1;
+    }
+    return 0;
+}
+
 /* Python function: _set_loop_ref(capsule, py_loop) -> None
  *
  * Store a reference to the Python ErlangEventLoop in the C struct.
@@ -7745,16 +7778,7 @@ static PyObject *py_set_loop_ref(PyObject *self, PyObject *args) {
         return NULL;
     }
 
-    /* Release old reference if any */
-    if (loop->py_loop_valid && loop->py_loop != NULL) {
-        Py_DECREF(loop->py_loop);
-    }
-
-    /* Store new reference */
-    Py_INCREF(py_loop);
-    loop->py_loop = py_loop;
-    loop->py_loop_valid = true;
-
+    if (claim_python_loop(loop, py_loop) < 0) return NULL;
     Py_RETURN_NONE;
 }
 
@@ -7779,21 +7803,12 @@ static PyObject *py_set_global_loop_ref(PyObject *self, PyObject *args) {
         return NULL;
     }
 
-    /* Release old reference if any */
-    if (loop->py_loop_valid && loop->py_loop != NULL) {
-        Py_DECREF(loop->py_loop);
-    }
-
-    /* Store new reference */
-    Py_INCREF(py_loop);
-    loop->py_loop = py_loop;
-    loop->py_loop_valid = true;
-
+    if (claim_python_loop(loop, py_loop) < 0) return NULL;
     Py_RETURN_NONE;
 }
 
 /**
- * Python function: _clear_loop_ref(capsule)
+ * Python function: _clear_loop_ref(capsule, owner, dispose=False)
  *
  * Clear the Python loop reference from an event loop capsule.
  * Should be called when the Python loop is closed to allow
@@ -7801,25 +7816,38 @@ static PyObject *py_set_global_loop_ref(PyObject *self, PyObject *args) {
  */
 static PyObject *py_clear_loop_ref(PyObject *self, PyObject *args) {
     (void)self;
-    PyObject *capsule;
-
-    if (!PyArg_ParseTuple(args, "O", &capsule)) {
-        return NULL;
-    }
-
+    PyObject *capsule, *owner;
+    int dispose = 0;
+    if (!PyArg_ParseTuple(args, "OO|p", &capsule, &owner, &dispose)) return NULL;
     erlang_event_loop_t *loop = loop_from_capsule(capsule);
-    if (loop == NULL) {
+    if (loop == NULL) return NULL;
+    if (PyInterpreterState_GetID(PyInterpreterState_Get()) != loop->interp_id) {
+        PyErr_SetString(PyExc_RuntimeError, "Native loop belongs to another interpreter");
         return NULL;
     }
-
-    /* Clear the Python loop reference */
-    if (loop->py_loop != NULL) {
-        Py_DECREF(loop->py_loop);
+    pthread_mutex_lock(&loop->mutex);
+    bool conflict = loop->py_loop != owner && (loop->py_loop != NULL || dispose);
+    bool running = atomic_load(&loop->py_running);
+    PyObject *released = NULL;
+    if (!conflict && !running) {
+        released = loop->py_loop;
         loop->py_loop = NULL;
+        loop->py_loop_valid = false;
+        if (dispose) {
+            loop->shutdown = true;
+            pthread_cond_broadcast(&loop->event_cond);
+        }
     }
-    loop->py_loop_valid = false;
-
-    Py_RETURN_NONE;
+    pthread_mutex_unlock(&loop->mutex);
+    if (conflict || running) {
+        PyErr_SetString(PyExc_RuntimeError, conflict ? "Native loop release requires its exact owner"
+            : "Cannot release a running native event loop");
+        return NULL;
+    }
+    if (dispose) close_loop_work_admission(loop);
+    bool had_owner = released != NULL;
+    Py_XDECREF(released);
+    return PyBool_FromLong(had_owner);
 }
 
 /* Python function: _get_global_loop_capsule() -> capsule
@@ -7846,14 +7874,9 @@ static PyObject *py_get_global_loop_capsule(PyObject *self, PyObject *args) {
 /**
  * Python function: _has_loop_ref(capsule) -> bool
  *
- * Check if a loop capsule has an ACTIVE Python loop reference.
- * Returns True only if there's a valid loop that is currently RUNNING.
- * This prevents multiple concurrent loops while allowing sequential
- * loop replacement (e.g., between test cases).
- *
- * The key insight is that the event confusion bug occurs when multiple
- * loops are running simultaneously. A non-running loop (even if not
- * explicitly closed) can be safely replaced.
+ * Observe the resource's exclusive claim without mutating it or calling
+ * Python methods. A stopped but unclosed wrapper still owns its callbacks.
+ * Only exact-owner release permits another constructor to bind.
  */
 static PyObject *py_has_loop_ref(PyObject *self, PyObject *args) {
     (void)self;
@@ -7868,39 +7891,10 @@ static PyObject *py_has_loop_ref(PyObject *self, PyObject *args) {
         return NULL;
     }
 
-    if (loop->py_loop_valid && loop->py_loop != NULL) {
-        /* Check if the existing loop is running - only block if running */
-        PyObject *is_running = PyObject_CallMethod(loop->py_loop, "is_running", NULL);
-        if (is_running != NULL) {
-            int running = PyObject_IsTrue(is_running);
-            Py_DECREF(is_running);
-            if (running) {
-                /* Loop is still running - prevent concurrent loop creation */
-                Py_RETURN_TRUE;
-            }
-        } else {
-            /* Error calling is_running - clear error and check is_closed as fallback */
-            PyErr_Clear();
-        }
-
-        /* Loop exists but is not running - check if closed for cleanup */
-        PyObject *is_closed = PyObject_CallMethod(loop->py_loop, "is_closed", NULL);
-        if (is_closed != NULL) {
-            int closed = PyObject_IsTrue(is_closed);
-            Py_DECREF(is_closed);
-            if (closed) {
-                /* Loop is closed, clean up reference */
-                Py_DECREF(loop->py_loop);
-                loop->py_loop = NULL;
-                loop->py_loop_valid = false;
-            }
-        } else {
-            PyErr_Clear();
-        }
-        /* Not running, allow replacement */
-        Py_RETURN_FALSE;
-    }
-    Py_RETURN_FALSE;
+    pthread_mutex_lock(&loop->mutex);
+    bool claimed = loop->py_loop != NULL;
+    pthread_mutex_unlock(&loop->mutex);
+    return PyBool_FromLong(claimed);
 }
 
 /* Python function: _run_once_native_for(capsule, timeout_ms) -> [(callback_id, event_type), ...] */

@@ -38,7 +38,7 @@ import time
 from asyncio import events, futures, tasks, transports
 from collections import deque
 from collections.abc import AsyncGenerator
-from typing import TYPE_CHECKING, Any, Callable, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Never, Optional, Tuple
 from weakref import WeakSet
 
 if TYPE_CHECKING:
@@ -102,7 +102,7 @@ class ErlangEventLoop(asyncio.AbstractEventLoop):
         '_asyncgens', '_managed_shutdown_requested', '_shutdown_observer',
     )
 
-    def __init__(self, capsule=None):
+    def __init__(self, capsule: object | None = None) -> None:
         """Initialize the Erlang event loop.
 
         The event loop is backed by Erlang's scheduler via the py_event_loop
@@ -145,12 +145,11 @@ class ErlangEventLoop(asyncio.AbstractEventLoop):
             try:
                 self._loop_capsule = self._pel._get_global_loop_capsule()
                 self._uses_global_capsule = True
-                # Check if another loop already owns this capsule.
-                # Only one ErlangEventLoop per interpreter is supported.
+                # A shared resource stays owned between driver turns.
                 if hasattr(self._pel, '_has_loop_ref') and self._pel._has_loop_ref(self._loop_capsule):
                     raise RuntimeError(
-                        "An ErlangEventLoop already exists for this interpreter. "
-                        "Only one loop per interpreter is supported."
+                        "An ErlangEventLoop already exists for this native resource. "
+                        "Close its owner before constructing another wrapper."
                     )
             except RuntimeError as e:
                 # Re-raise our "already exists" error
@@ -163,21 +162,6 @@ class ErlangEventLoop(asyncio.AbstractEventLoop):
         else:
             self._loop_capsule = self._pel._loop_new()
             self._owns_capsule = True
-
-        # Store reference to this Python loop in the C struct
-        # This enables process_ready_tasks to access the loop directly
-        # without thread-local lookup issues from dirty schedulers
-        if hasattr(self._pel, '_set_loop_ref'):
-            self._pel._set_loop_ref(self._loop_capsule, self)
-
-        # Also set reference on the global interpreter loop
-        # This is needed for py_nif:submit_task which uses the global loop
-        if self._uses_global_capsule and hasattr(self._pel, '_set_global_loop_ref'):
-            try:
-                self._pel._set_global_loop_ref(self)
-            except RuntimeError:
-                # Global loop not yet initialized, ignore
-                pass
 
         # Callback management
         self._readers = {}  # fd -> (callback, args, callback_id)
@@ -232,6 +216,24 @@ class ErlangEventLoop(asyncio.AbstractEventLoop):
         self._asyncgens: WeakSet[AsyncGenerator[object]] = WeakSet()
         self._managed_shutdown_requested = False
         self._shutdown_observer: ShutdownObserver | None = None
+
+        # Publish only fully initialized objects. Native claim rejects capsule
+        # aliases on every constructor path, including explicit capsules.
+        if hasattr(self._pel, '_set_loop_ref'):
+            self._pel._set_loop_ref(self._loop_capsule, self)
+
+    async def _unsupported_io(self, *args: object, **kwargs: object) -> Never:
+        raise NotImplementedError("This asyncio I/O operation is not supported by ErlangEventLoop")
+
+    # These inherited operations already raise NotImplementedError. Declare that
+    # unsupported surface explicitly instead of appearing abstract to type checkers.
+    start_tls = _unsupported_io
+    sendfile = _unsupported_io
+    connect_read_pipe = _unsupported_io
+    connect_write_pipe = _unsupported_io
+    sock_recvfrom = _unsupported_io
+    sock_recvfrom_into = _unsupported_io
+    sock_sendto = _unsupported_io
 
     def _next_id(self):
         """Generate a unique callback ID for this loop."""
@@ -384,18 +386,7 @@ class ErlangEventLoop(asyncio.AbstractEventLoop):
         # This is important for the global capsule case where the capsule
         # persists but a new Python loop may be created.
         if self._loop_capsule is not None and hasattr(self._pel, '_clear_loop_ref'):
-            try:
-                self._pel._clear_loop_ref(self._loop_capsule)
-            except Exception:
-                pass
-
-        # Destroy loop capsule (not a shared one: the global capsule or a
-        # pool loop's, both owned by Erlang)
-        if getattr(self, '_owns_capsule', not self._uses_global_capsule):
-            try:
-                self._pel._loop_destroy(self._loop_capsule)
-            except Exception:
-                pass
+            self._pel._clear_loop_ref(self._loop_capsule, self, self._owns_capsule)
         self._loop_capsule = None
 
     def _asyncgen_firstiter_hook(self, generator: AsyncGenerator[object]) -> None:

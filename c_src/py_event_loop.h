@@ -296,8 +296,10 @@ typedef struct {
  *   GIL first, then namespaces_mutex; the Python dicts in a namespace are
  *   touched only under the GIL.
  *
- * - py_loop, cached_* and callable_cache are Python objects owned by the
- *   loop thread and used only under its GIL. msg_env is allocated with the
+ * - py_loop is a strong, exclusive owner identity, not a replaceable callback
+ *   pointer. Claim and exact-owner release hold the interpreter GIL and mutex;
+ *   decrefs run after mutex release. cached_* and callable_cache are Python
+ *   objects used only under the interpreter GIL. msg_env is allocated with the
  *   loop and freed in the destructor; the notification paths do not use
  *   it (each builds a local env per message so they need no lock).
  *

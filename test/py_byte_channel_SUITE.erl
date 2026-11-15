@@ -540,6 +540,8 @@ close_drain_bytes_python_async_test(_Config) ->
 import erlang
 from erlang import ByteChannel, ByteChannelClosed
 
+import asyncio
+
 async def async_drain_byte_channel(ch_ref):
     '''Async drain all chunks from byte channel, return as list.'''
     ch = ByteChannel(ch_ref)
@@ -549,8 +551,12 @@ async def async_drain_byte_channel(ch_ref):
     return chunks
 ">>),
 
+    %% Own this runner's resource rather than replacing create_task's cached owner.
+    {ok, DrainLoop} = py_nif:event_loop_new(),
     {ok, [<<"part1">>, <<"part2">>, <<"part3">>]} =
-        py:eval(Ctx, <<"erlang.run(async_drain_byte_channel(ch))">>, #{<<"ch">> => Ch}),
+        py:eval(Ctx, <<"asyncio.run(async_drain_byte_channel(ch), loop_factory=lambda loop=loop: erlang.ErlangEventLoop(loop))">>,
+                #{<<"ch">> => Ch, <<"loop">> => DrainLoop}),
+    ok = py_nif:event_loop_destroy(DrainLoop),
 
     ct:pal("Python async byte channel close+drain test passed").
 
