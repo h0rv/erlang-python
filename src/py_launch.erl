@@ -18,9 +18,12 @@ start() ->
         ok = gen_event:add_handler(erl_signal_server, ?MODULE, self()),
         ok = os:set_signal(sigterm, handle),
         Shutdown = os:getenv("PYBEAM_SHUTDOWN"),
+        Budget = list_to_integer(os:getenv("PYBEAM_SHUTDOWN_TIMEOUT_MS")),
+        true = Budget > 0,
         ok = py_context:start_loop(Ctx),
         {ok, Task} = py_context:submit(Ctx, 'pybeam.runtime.loader', invoke, []),
-        finish(Ctx, wait(Ctx, Task, Shutdown))
+        {Status, Deadline} = wait(Ctx, Task, Shutdown, Budget),
+        finish(Ctx, Status, Deadline)
     catch
         Class:Reason:Stack ->
             io:format(standard_error, "PyBeam runtime failed: ~p:~p~n~p~n",
@@ -28,47 +31,69 @@ start() ->
             halt(1)
     end.
 
-wait(Ctx, Task, Shutdown) ->
+wait(Ctx, Task, Shutdown, Budget) ->
     receive
-        {async_result, Task, {ok, Status}} when is_integer(Status) -> Status;
+        {async_result, Task, {ok, Status}} when is_integer(Status) ->
+            {Status, deadline(Budget)};
         {async_result, Task, Error} ->
             io:format(standard_error, "PyBeam entrypoint failed: ~p~n", [Error]),
-            1;
+            {1, deadline(Budget)};
         {notify, Signal} when Signal =:= sigterm; Signal =:= sigint ->
-            interrupted(Ctx, Task, case Signal of sigint -> 130; sigterm -> 143 end);
+            {case Signal of sigint -> 130; sigterm -> 143 end, deadline(Budget)};
         {py_loop_exit, Ctx, Error} ->
             io:format(standard_error, "PyBeam event loop exited: ~p~n", [Error]),
-            1
+            {1, deadline(Budget)}
     after 25 ->
         %% ERTS reserves SIGINT for its break handler. The host also records the
         %% signal so +Bi can suppress that handler without losing cancellation.
         case file:read_file(Shutdown) of
-            {ok, <<"2">>} -> interrupted(Ctx, Task, 130);
-            {ok, <<"15">>} -> interrupted(Ctx, Task, 143);
-            _ -> wait(Ctx, Task, Shutdown)
+            {ok, <<"2">>} -> {130, deadline(Budget)};
+            {ok, <<"15">>} -> {143, deadline(Budget)};
+            _ -> wait(Ctx, Task, Shutdown, Budget)
         end
     end.
 
-interrupted(Ctx, Task, Status) ->
-    _ = py_context:submit(Ctx, 'pybeam.runtime.loader', cancel, []),
-    receive {async_result, Task, _} -> ok after 1000 -> ok end,
-    Status.
+deadline(Budget) -> erlang:monotonic_time(millisecond) + Budget.
 
-finish(Ctx, Status) ->
+remaining(Deadline) ->
+    case Deadline - erlang:monotonic_time(millisecond) of
+        Milliseconds when Milliseconds > 0 -> Milliseconds;
+        _ -> error(shutdown_deadline_exceeded)
+    end.
+
+%% Bound even APIs whose internal control calls have their own longer waits.
+bounded(Operation, Deadline) ->
+    Timeout = remaining(Deadline),
+    {Pid, Monitor} = spawn_monitor(fun() -> exit({cleanup_result, Operation()}) end),
+    receive
+        {'DOWN', Monitor, process, Pid, {cleanup_result, Result}} ->
+            _ = remaining(Deadline),
+            Result;
+        {'DOWN', Monitor, process, Pid, Reason} -> error({cleanup_step_failed, Reason})
+    after Timeout ->
+        exit(Pid, kill),
+        error(shutdown_deadline_exceeded)
+    end.
+
+finish(Ctx, Status, Deadline) ->
     try
         ok = marker("PYBEAM_COMPLETION", integer_to_binary(Status)),
         %% Python None is converted to the atom none by py_convert.c.
-        {ok, none} = py_context:submit_await(
-            Ctx, 'pybeam.runtime.loader', shutdown, [], #{}, 1000),
-        ok = py_context:stop_loop(Ctx, 1000),
+        {ok, none} = bounded(fun() ->
+            Left = remaining(Deadline),
+            py_context:submit_await(Ctx, 'pybeam.runtime.loader', shutdown, [Left], #{}, Left)
+        end, Deadline),
+        ok = bounded(fun() -> py_context:stop_loop(Ctx, remaining(Deadline)) end, Deadline),
         %% stop_loop replies ok even after an interrupted driver exit. Require
         %% the driver's actual normal result, not just the control reply.
+        DriverTimeout = remaining(Deadline),
         receive
             {py_loop_exit, Ctx, {ok, <<"stopped">>}} -> ok;
             {py_loop_exit, Ctx, LoopError} -> error({driver_shutdown_failed, LoopError})
-        after 1000 -> error(driver_shutdown_unacknowledged)
+        after DriverTimeout -> error(driver_shutdown_unacknowledged)
         end,
-        ok = application:stop(erlang_python),
+        ok = bounded(fun() -> application:stop(erlang_python) end, Deadline),
+        _ = remaining(Deadline),
         ok = marker("PYBEAM_CLEANUP", <<"clean">>),
         halt(Status)
     catch
