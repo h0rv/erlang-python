@@ -109,7 +109,10 @@ class ServiceSlot:
         Lambdas, closures, bound methods, and callable objects are unsupported.
         This local API passes Python arguments directly, without serialization.
         """
-        from _erlang_impl._loop import ErlangEventLoop
+        try:
+            from erlang import ErlangEventLoop
+        except ImportError as error:
+            raise RuntimeError("services require a running ErlangEventLoop") from error
 
         loop = asyncio.get_running_loop()
         if not isinstance(loop, ErlangEventLoop):
