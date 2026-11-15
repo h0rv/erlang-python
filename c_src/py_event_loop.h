@@ -38,6 +38,7 @@
 #include <stdint.h>
 #include <stdatomic.h>
 #include <pthread.h>
+#include "py_work_admission.h"
 
 /* Forward declarations for Python objects (avoids including Python.h in header) */
 typedef struct _object PyObject;
@@ -278,9 +279,13 @@ typedef struct {
  *
  * - task_queue_mutex guards task_queue (an ErlNifIOQueue of serialized
  *   task tuples). Producers are scheduler threads in the submit NIFs; the
- *   consumer is process_ready_tasks on the loop thread, which holds the
- *   GIL while decoding. task_count and task_wake_pending are atomics used
- *   to coalesce wakeups.
+ *   consumer is process_ready_tasks, which decodes and transfers queued
+ *   ownership before acquiring the GIL. task_count and task_wake_pending are
+ *   atomics used to coalesce wakeups. It also guards admission configuration, its closed
+ *   tombstone, ticket ids, and queued-ticket ownership. The independent gate
+ *   mutex guards both budgets together. Lock order is task_queue_mutex then
+ *   gate mutex; no gate path acquires a GIL. Running tickets belong to native
+ *   processing or Python Task completion, never to the submitter.
  *
  * - env_pool_mutex guards env_pool and env_pool_count only.
  *
@@ -416,6 +421,13 @@ typedef struct erlang_event_loop {
 
     /** @brief Thread-safe task queue for async task submission */
     ErlNifIOQueue *task_queue;
+
+    /* Configured once per native destination; task_queue_mutex protects these.
+     * Queued tickets transfer to native batches, then to Task completion. */
+    work_admission_t *work_admission;
+    work_ticket_t *queued_work_tickets;
+    uint64_t next_work_ticket;
+    bool work_admission_closed;
 
     /** @brief Mutex protecting task_queue operations */
     pthread_mutex_t task_queue_mutex;
