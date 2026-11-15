@@ -9,7 +9,11 @@ import erlang
 from ._actor_common import _owned_wait, _result
 from ._actor_data import ActorAdmissionClosed as ActorAdmissionClosed
 from ._actor_data import ActorGenerationChanged as ActorGenerationChanged
+from ._actor_data import ActorInfo as ActorInfo
 from ._actor_data import ActorOverloaded as ActorOverloaded
+from ._actor_data import ActorRestarting as ActorRestarting
+from ._actor_data import ContextCounts as ContextCounts
+from ._actor_data import context_counts as context_counts
 from ._actor_data import DataActorGroup as DataActorGroup
 from ._actor_data import DataActorRef as DataActorRef
 from ._actor_data import DataDispatcher as DataDispatcher

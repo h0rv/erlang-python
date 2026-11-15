@@ -1,5 +1,6 @@
 import asyncio
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Literal, Protocol, Self
 
 import erlang
@@ -17,6 +18,54 @@ class ActorOverloaded(RuntimeError):
 
 class ActorAdmissionClosed(RuntimeError):
     pass
+
+
+class ActorRestarting(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class ActorInfo:
+    pid: str
+    generation: int
+    admitted_count: int
+    admitted_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class ContextCounts:
+    created: int
+    destroyed: int
+
+    @property
+    def live(self) -> int:
+        return self.created - self.destroyed
+
+
+async def context_counts() -> ContextCounts:
+    result = _result(await erlang.async_call("_actor_context_counts"))
+    if not isinstance(result, tuple) or len(result) != 2:
+        raise RuntimeError("Invalid native context counters", result)
+    created, destroyed = result
+    if type(created) is not int or type(destroyed) is not int:
+        raise RuntimeError("Invalid native context counters", result)
+    return ContextCounts(created, destroyed)
+
+
+def checked(reply: object) -> object:
+    if isinstance(reply, tuple) and len(reply) == 2 and reply[0] == "error":
+        value = reply[1]
+        if value == "restarting":
+            raise ActorRestarting("Actor is restarting")
+        if (
+            isinstance(value, tuple)
+            and len(value) == 3
+            and value[0] == "generation_changed"
+        ):
+            _, expected, current = value
+            if type(expected) is int and type(current) is int:
+                raise ActorGenerationChanged(expected, current)
+    return _result(reply)
 
 
 class ActorGenerationChanged(RuntimeError):
@@ -108,9 +157,43 @@ class DataActorRef:
 
     async def rejoin(self) -> Self:
         pid, generation, gate = _resolved(
-            await erlang.async_call("_actor_group_resolve", self._group, self.child_id)
+            (
+                "ok",
+                checked(
+                    await erlang.async_call(
+                        "_actor_group_resolve", self._group, self.child_id
+                    )
+                ),
+            )
         )
         return type(self)(self._group, self.child_id, pid, generation, gate)
+
+    async def info(self) -> ActorInfo:
+        result = checked(
+            await erlang.async_call(
+                "_actor_group_info", self._group, self.child_id, self.generation
+            )
+        )
+        if not isinstance(result, tuple) or len(result) != 4:
+            raise RuntimeError("Invalid native actor information", result)
+        pid, generation, count, size = result
+        if (
+            not isinstance(pid, bytes)
+            or type(generation) is not int
+            or type(count) is not int
+            or type(size) is not int
+        ):
+            raise RuntimeError("Invalid native actor information", result)
+        return ActorInfo(pid.decode("ascii"), generation, count, size)
+
+    async def crash(self) -> None:
+        """Kill exactly this generation and wait for its owned context and body to drain."""
+        pending = asyncio.create_task(
+            erlang.async_call(
+                "_actor_group_crash", self._group, self.child_id, self.generation
+            )
+        )
+        checked(await _owned_wait(pending))
 
     async def call(self, payload: bytes, /) -> bytes:
         current = await self.rejoin()

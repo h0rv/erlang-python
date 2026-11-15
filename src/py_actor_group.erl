@@ -23,6 +23,18 @@ register_callbacks() ->
     py_callback:register('_actor_group_resolve', fun([Group, Id]) when is_pid(Group), node(Group) =:= node() ->
         gen_server:call(Group, {resolve, Id}, infinity)
     end),
+    py_callback:register('_actor_group_info', fun([Group, Id, Generation])
+      when is_pid(Group), node(Group) =:= node(), is_integer(Generation) ->
+        gen_server:call(Group, {info, Id, Generation}, infinity)
+    end),
+    py_callback:register('_actor_group_crash', fun([Group, Id, Generation])
+      when is_pid(Group), node(Group) =:= node(), is_integer(Generation) ->
+        gen_server:call(Group, {crash, Id, Generation}, infinity)
+    end),
+    py_callback:register('_actor_context_counts', fun([]) ->
+        #{ctx_created := Created, ctx_destroyed := Destroyed} = py_nif:get_debug_counters(),
+        {ok, {Created, Destroyed}}
+    end),
     py_callback:register('_actor_group_close', fun([Group]) when is_pid(Group), node(Group) =:= node() ->
         try gen_server:stop(Group, normal, infinity) catch exit:{noproc, _} -> ok end
     end),
@@ -79,6 +91,29 @@ handle_request({stop, Id}, _From, #{sup := Sup} = State) ->
     end;
 handle_request({resolve, Id}, _From, State) ->
     {reply, resolve(self(), Id), State};
+handle_request({info, Id, Generation}, _From, State) ->
+    Reply = case guarded(Id, Generation) of
+        {ok, {Pid, Gate, _Ctx}} ->
+            #{count := Count, bytes := Bytes} = py_nif:actor_gate_info(Gate),
+            {ok, {{bytes, list_to_binary(pid_to_list(Pid))}, Generation, Count, Bytes}};
+        Error -> Error
+    end,
+    {reply, Reply, State};
+handle_request({crash, Id, Generation}, _From, #{temporary := Temporary} = State) ->
+    Reply = case guarded(Id, Generation) of
+        {ok, {Pid, Gate, Ctx}} ->
+            Mon = monitor(process, Pid),
+            exit(Pid, kill),
+            receive {'DOWN', Mon, process, Pid, _} -> ok end,
+            wait_context(Ctx),
+            wait_completion(Gate),
+            case maps:is_key(Id, Temporary) of
+                true -> {ok, killed};
+                false -> await_replacement(Id, Generation, erlang:monotonic_time(millisecond) + 5000)
+            end;
+        Error -> Error
+    end,
+    {reply, Reply, State};
 handle_request(_, _From, State) -> {reply, {error, invalid_request}, State}.
 
 track_temporary(Id, Pid, temporary, #{temporary := Temporary} = State) ->
@@ -136,6 +171,27 @@ reap_later(Id, Generation, #{temporary := Temporary} = State) ->
             end,
             {noreply, Next};
         _ -> {noreply, State}
+    end.
+
+await_replacement(Id, Old, Deadline) ->
+    case resolve(self(), Id) of
+        {ok, {_, New, _}} when New =/= Old -> {ok, killed};
+        _ ->
+            case erlang:monotonic_time(millisecond) < Deadline of
+                true -> receive after 1 -> await_replacement(Id, Old, Deadline) end;
+                false -> {error, restart_timeout}
+            end
+    end.
+
+guarded(Id, Generation) ->
+    case ets:lookup(py_actor_generations, {self(), Id}) of
+        [{_, Pid, Generation, Gate, Ctx}] ->
+            case is_process_alive(Pid) of
+                true -> {ok, {Pid, Gate, Ctx}};
+                false -> {error, restarting}
+            end;
+        [{_, _, Current, _, _}] -> {error, {generation_changed, Generation, Current}};
+        [] -> {error, unknown_child}
     end.
 
 resolve(Group, Id) ->
