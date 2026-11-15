@@ -7869,6 +7869,13 @@ static PyObject *py_claim_driver_session(PyObject *self, PyObject *args) {
     }
     PyObject *fresh = PyObject_CallNoArgs((PyObject *)&PyBaseObject_Type);
     if (fresh == NULL) return NULL;
+    /* Prepare every fallible result allocation before publishing a claim.
+     * The caller cannot release a session whose return value was never built. */
+    PyObject *result = PyTuple_New(2);
+    if (result == NULL) {
+        Py_DECREF(fresh);
+        return NULL;
+    }
     unsigned long thread = PyThread_get_thread_ident();
     pthread_mutex_lock(&loop->mutex);
     bool current = allow_current && loop->py_driver_session != NULL &&
@@ -7876,21 +7883,24 @@ static PyObject *py_claim_driver_session(PyObject *self, PyObject *args) {
     bool valid = !loop->shutdown && loop->py_loop == owner &&
         (current || (loop->py_driver_session == NULL && !atomic_load(&loop->py_running)));
     bool acquired = valid && !current;
+    if (valid) {
+        PyObject *token = acquired ? fresh : loop->py_driver_session;
+        PyTuple_SET_ITEM(result, 0, Py_NewRef(token));
+        PyTuple_SET_ITEM(result, 1, Py_NewRef(acquired ? Py_True : Py_False));
+    }
     if (acquired) {
         loop->py_driver_session = Py_NewRef(fresh);
         atomic_store(&loop->py_driver_claimed, true);
         loop->py_driver_thread = thread;
         loop->py_driver_generation = loop->py_owner_generation;
     }
-    PyObject *token = valid ? Py_NewRef(loop->py_driver_session) : NULL;
     pthread_mutex_unlock(&loop->mutex);
     Py_DECREF(fresh);
     if (!valid) {
+        Py_DECREF(result);
         PyErr_SetString(PyExc_RuntimeError, "Native loop driver session is already claimed or unavailable");
         return NULL;
     }
-    PyObject *result = PyTuple_Pack(2, token, acquired ? Py_True : Py_False);
-    Py_DECREF(token);
     return result;
 }
 
