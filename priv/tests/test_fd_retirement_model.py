@@ -2,7 +2,6 @@ from collections import deque
 from dataclasses import dataclass, replace
 from typing import Literal, assert_never
 
-
 type Phase = Literal["open", "issuing", "scheduled", "failed", "closed"]
 
 
@@ -20,8 +19,10 @@ class State:
 def transitions(state: State) -> tuple[State, ...]:
     match state.phase:
         case "open":
-            close = replace(state, phase="issuing", active=False) if state.selected else replace(
-                state, phase="closed", active=False, closes=1
+            close = (
+                replace(state, phase="issuing", active=False)
+                if state.selected
+                else replace(state, phase="closed", active=False, closes=1)
             )
             return (replace(state, active=not state.active), close)
         case "issuing":

@@ -7187,7 +7187,15 @@ static fd_resource_t *fd_reg_take(uint64_t id) {
 static PyObject *fd_python_retire(uint64_t key, bool own) {
     fd_resource_t *res = fd_reg_get(key);
     if (res == NULL) Py_RETURN_NONE;
-    int result = fd_retire(NULL, res, own);
+    /* Unlike monitor APIs, enif_select requires a non-NULL environment even
+     * for STOP. Use a per-call independent env on this Python worker thread. */
+    ErlNifEnv *env = enif_alloc_env();
+    if (env == NULL) {
+        enif_release_resource(res);
+        return PyErr_NoMemory();
+    }
+    int result = fd_retire(env, res, own);
+    enif_free_env(env);
     if (result == 0) {
         fd_resource_t *entry = fd_reg_take(key);
         if (entry != NULL) enif_release_resource(entry);
