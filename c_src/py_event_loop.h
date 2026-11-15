@@ -186,6 +186,10 @@ typedef enum {
 typedef struct {
     /** @brief The file descriptor being monitored */
     _Atomic int fd;
+    int logical_fd;             /* Python's original, never selected for a lease. */
+    bool poll_lease;
+    bool lease_counted;
+    uint64_t registry_key;
 
     /** @brief Callback ID for the read handler */
     _Atomic uint64_t read_callback_id;

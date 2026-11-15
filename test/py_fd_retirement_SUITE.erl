@@ -2,11 +2,13 @@
 -export([all/0, init_per_suite/1, end_per_suite/1, retired_for_test/1,
          paused_reader/1, delivered_reader/1, paused_writer/1, delivered_writer/1,
          never_selected/1, owner_down/1, reactor_close/1, reactor_owner_down/1,
-         close_reselect_race/1]).
+         close_reselect_race/1, borrowed_poll_lease/1,
+         socket_recv_completion/1, socket_connect_completion/1]).
 
 all() -> [paused_reader, delivered_reader, paused_writer, delivered_writer,
           never_selected, owner_down, reactor_close, reactor_owner_down,
-          close_reselect_race].
+          close_reselect_race, borrowed_poll_lease,
+          socket_recv_completion, socket_connect_completion].
 init_per_suite(Config) ->
     application:load(erlang_python),
     application:set_env(erlang_python, num_contexts, 1),
@@ -67,6 +69,19 @@ exercise(Type, Delivered) ->
     ok = py_nif:close_fd(R),
     replacement(Fd, R, L),
     ok = py_nif:fd_close(Peer), ok = py_nif:event_loop_destroy(L).
+
+borrowed_poll_lease(_) -> python_lease_case(borrowed).
+socket_recv_completion(_) -> python_lease_case(recv_completion).
+socket_connect_completion(_) -> python_lease_case(connect_completion).
+python_lease_case(Function) ->
+    {ok, C} = py_context:new(#{mode => worker}),
+    Dir = filename:dirname(code:which(?MODULE)),
+    try
+        ok = py_context:exec(C, iolist_to_binary(io_lib:format(
+            "import sys; sys.path.insert(0, ~p)", [Dir]))),
+        {ok, true} = py_context:submit_await(C, py_test_fd_poll_lease,
+                                           Function, [], #{}, 5000)
+    after py_context:stop(C) end.
 
 paused_reader(_) -> exercise(read, false).
 delivered_reader(_) -> exercise(read, true).

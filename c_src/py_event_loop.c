@@ -587,7 +587,31 @@ cleanup_native:
  * Safety net: close the FD if it's still open when the resource is GC'd.
  * This should rarely happen if proper lifecycle management is used.
  */
+static void fd_registry_forget(fd_resource_t *res);
+
+#define FD_POLL_LEASE_LIMIT 4096u
+static atomic_uint g_fd_poll_leases = 0;
+
+static bool fd_poll_lease_reserve(void) {
+    unsigned count = atomic_load(&g_fd_poll_leases);
+    do {
+        if (count >= FD_POLL_LEASE_LIMIT) return false;
+    } while (!atomic_compare_exchange_weak(&g_fd_poll_leases, &count, count + 1));
+    return true;
+}
+
+static void fd_poll_lease_release(fd_resource_t *res) {
+    if (res->lease_counted) {
+        res->lease_counted = false;
+        atomic_fetch_sub(&g_fd_poll_leases, 1);
+    }
+}
+
 static bool fd_resource_initialize(fd_resource_t *res) {
+    res->logical_fd = res->fd;
+    res->poll_lease = false;
+    res->lease_counted = false;
+    res->registry_key = 0;
     res->mutex_initialized = false;
     res->selection = FD_SELECTION_NONE;
     res->reactor_cleanup = false;
@@ -607,6 +631,7 @@ void fd_resource_destructor(ErlNifEnv *env, void *obj) {
     /* ERTS cannot run the destructor while a selection relation exists.
      * Only never-selected or already-retired resources can arrive here. */
     if (res->owns_fd && res->fd >= 0) close(res->fd);
+    fd_poll_lease_release(res);
     if (res->loop != NULL) enif_release_resource(res->loop);
     if (res->mutex_initialized) pthread_mutex_destroy(&res->mutex);
 }
@@ -615,6 +640,7 @@ void fd_resource_destructor(ErlNifEnv *env, void *obj) {
  * no successful select has ever established a relation. No ERTS calls here. */
 static void fd_finish_locked(fd_resource_t *res) {
     if (res->owns_fd && res->fd >= 0) close(res->fd);
+    fd_poll_lease_release(res);
     /* Even a borrowed descriptor must be forgotten: a retained old handle
      * must never acquire ownership of a later descriptor lifetime. */
     res->fd = -1;
@@ -714,6 +740,7 @@ void fd_resource_stop(ErlNifEnv *env, void *obj, ErlNifEvent event,
     }
     pthread_mutex_unlock(&fd_res->mutex);
     fd_demonitor(env, fd_res);
+    fd_registry_forget(fd_res);
 }
 
 /**
@@ -733,8 +760,9 @@ void fd_resource_down(ErlNifEnv *env, void *obj, ErlNifPid *pid,
     pthread_mutex_lock(&fd_res->mutex);
     fd_res->monitor_active = false;
     pthread_mutex_unlock(&fd_res->mutex);
-    if (fd_retire(env, fd_res, true) == -1)
-        fprintf(stderr, "FD ownership retirement failed on owner down\n");
+    int result = fd_retire(env, fd_res, true);
+    if (result == 0) fd_registry_forget(fd_res);
+    else fprintf(stderr, "FD ownership retirement failed on owner down\n");
 }
 
 /* All enif_select sites below operate on fd_resource_t. Keep their scheduler
@@ -7169,30 +7197,171 @@ static fd_resource_t *fd_reg_take(uint64_t id) {
     return res;
 }
 
+static void fd_registry_forget(fd_resource_t *res) {
+    fd_resource_t *entry = fd_reg_take(res->registry_key);
+    if (entry != NULL) enif_release_resource(entry);
+}
+
+/* FD-only identities survive Python wrapper replacement. Native replies use
+ * bit 63; ordinary Python timers use the low domain. No timer policy changes. */
+static atomic_uint_fast64_t g_fd_callback_sequence = 1;
+static PyObject *py_new_fd_callback_id(PyObject *self, PyObject *args) {
+    (void)self;
+    if (!PyArg_ParseTuple(args, "")) return NULL;
+    uint64_t sequence = atomic_fetch_add(&g_fd_callback_sequence, 1);
+    if (sequence >= (UINT64_C(1) << 62)) {
+        PyErr_SetString(PyExc_RuntimeError, "FD callback identity domain exhausted");
+        return NULL;
+    }
+    return PyLong_FromUnsignedLongLong((UINT64_C(1) << 62) | sequence);
+}
+
 static PyObject *fd_python_retire(uint64_t key, bool own) {
+    /* Prepare every fallible result before submitting STOP or dropping a key. */
+    PyObject *closed = PyUnicode_FromString("poll_closed");
+    PyObject *pending = PyUnicode_FromString("poll_pending");
+    PyObject *absent = PyUnicode_FromString("absent");
+    if (closed == NULL || pending == NULL || absent == NULL) {
+        Py_XDECREF(closed);
+        Py_XDECREF(pending);
+        Py_XDECREF(absent);
+        return NULL;
+    }
     fd_resource_t *res = fd_reg_get(key);
-    if (res == NULL) Py_RETURN_NONE;
-    /* Unlike monitor APIs, enif_select requires a non-NULL environment even
-     * for STOP. Use a per-call independent env on this Python worker thread. */
+    if (res == NULL) {
+        Py_DECREF(closed);
+        Py_DECREF(pending);
+        return absent;
+    }
+    Py_DECREF(absent);
     ErlNifEnv *env = enif_alloc_env();
     if (env == NULL) {
         enif_release_resource(res);
+        Py_DECREF(closed);
+        Py_DECREF(pending);
         return PyErr_NoMemory();
     }
     int result = fd_retire(env, res, own);
     enif_free_env(env);
+    bool finished = atomic_load(&res->closing_state) == FD_STATE_CLOSED;
     if (result == 0) {
+        /* Only Python poll leases live here. A pending lease stays owned by
+         * ERTS, isolated from close/reuse of the never-selected logical FD. */
         fd_resource_t *entry = fd_reg_take(key);
         if (entry != NULL) enif_release_resource(entry);
     }
     enif_release_resource(res);
     if (result < 0) {
+        Py_DECREF(closed);
+        Py_DECREF(pending);
         PyErr_SetString(PyExc_RuntimeError, result == -2
             ? "FD selection retirement is pending submission"
             : "FD selection retirement failed");
         return NULL;
     }
-    Py_RETURN_NONE;
+    if (finished) {
+        Py_DECREF(pending);
+        return closed;
+    }
+    Py_DECREF(closed);
+    return pending;
+}
+
+static PyObject *fd_python_add(erlang_event_loop_t *loop, int logical_fd,
+                               uint64_t callback_id, bool reading) {
+    if (!event_loop_ensure_worker(loop)) {
+        PyErr_SetString(PyExc_RuntimeError, "Event loop has no router or worker");
+        return NULL;
+    }
+    fd_resource_t *res = enif_alloc_resource(FD_RESOURCE_TYPE, sizeof(*res));
+    if (res == NULL) return PyErr_NoMemory();
+    memset(res, 0, sizeof(*res));
+    res->fd = -1;
+    res->loop = loop;
+    if (!fd_resource_initialize(res)) {
+        enif_release_resource(res);
+        return PyErr_NoMemory();
+    }
+    if (!fd_poll_lease_reserve()) {
+        enif_release_resource(res);
+        PyErr_SetString(PyExc_RuntimeError, "Native FD poll lease limit reached");
+        return NULL;
+    }
+    res->lease_counted = true;
+    res->poll_lease = true;
+    res->logical_fd = logical_fd;
+    /* A duplicate shares status flags. Never set O_NONBLOCK here: doing so
+     * would also change the Python owner's open file description. */
+    res->fd = fcntl(logical_fd, F_DUPFD_CLOEXEC, 0);
+    res->owns_fd = true;
+    if (res->fd < 0) {
+        PyErr_SetFromErrno(PyExc_OSError);
+        enif_release_resource(res);
+        return NULL;
+    }
+    res->owner_pid = loop->worker_pid;
+    res->read_callback_id = reading ? callback_id : 0;
+    res->write_callback_id = reading ? 0 : callback_id;
+    res->reader_active = reading;
+    res->writer_active = !reading;
+    /* Allocate the table entry and Python key before establishing a relation.
+     * No fallible allocation remains after successful selection. */
+    uint64_t key = fd_reg_add(res);
+    if (key == 0) {
+        enif_release_resource(res);
+        return PyErr_NoMemory();
+    }
+    /* Owner-down and synchronous STOP may remove the registry reference.
+     * The constructor keeps its own reference until it finishes publishing. */
+    enif_keep_resource(res);
+    res->registry_key = key;
+    PyObject *value = PyLong_FromUnsignedLongLong(key);
+    if (value == NULL) {
+        fd_registry_forget(res);
+        enif_release_resource(res);
+        return NULL;
+    }
+    if (enif_monitor_process(loop->msg_env, res, &res->owner_pid,
+                             &res->owner_monitor) != 0) {
+        fd_registry_forget(res);
+        enif_release_resource(res);
+        Py_DECREF(value);
+        PyErr_SetString(PyExc_RuntimeError, "FD poll lease owner is unavailable");
+        return NULL;
+    }
+    res->monitor_active = true;
+    int mode = reading ? ERL_NIF_SELECT_READ : ERL_NIF_SELECT_WRITE;
+    int result = enif_select(loop->msg_env, (ErlNifEvent)res->fd, mode,
+                             res, &loop->worker_pid, ATOM_UNDEFINED);
+    if (result < 0) {
+        fd_registry_forget(res);
+        enif_release_resource(res);
+        Py_DECREF(value);
+        PyErr_SetString(PyExc_RuntimeError, "Failed to register FD poll lease");
+        return NULL;
+    }
+    enif_release_resource(res);
+    return value;
+}
+
+static PyObject *py_fd_poll_lease_info(PyObject *self, PyObject *args) {
+    (void)self;
+    unsigned long long key;
+    if (!PyArg_ParseTuple(args, "K", &key)) return NULL;
+    fd_resource_t *res = fd_reg_get(key);
+    if (res == NULL) {
+        PyErr_SetString(PyExc_KeyError, "Unknown FD poll lease key");
+        return NULL;
+    }
+    pthread_mutex_lock(&res->mutex);
+    int logical = res->logical_fd;
+    int poll = res->fd;
+    int closing = atomic_load(&res->closing_state);
+    int selection = res->selection;
+    pthread_mutex_unlock(&res->mutex);
+    enif_release_resource(res);
+    return Py_BuildValue("(iiiiI)", logical, poll, closing, selection,
+                         atomic_load(&g_fd_poll_leases));
 }
 
 /* Python function: _add_reader(fd, callback_id) -> fd_key */
@@ -7205,59 +7374,12 @@ static PyObject *py_add_reader(PyObject *self, PyObject *args) {
         return NULL;
     }
 
-    /* Use per-interpreter event loop lookup */
     erlang_event_loop_t *loop = get_interpreter_event_loop();
     if (loop == NULL) {
         PyErr_SetString(PyExc_RuntimeError, "Event loop not initialized");
         return NULL;
     }
-
-    /* Create fd resource */
-    fd_resource_t *fd_res = enif_alloc_resource(FD_RESOURCE_TYPE, sizeof(fd_resource_t));
-    if (fd_res == NULL) {
-        PyErr_SetString(PyExc_MemoryError, "Failed to allocate fd resource");
-        return NULL;
-    }
-
-    fd_res->fd = fd;
-    fd_res->loop = loop;
-    fd_res->read_callback_id = callback_id;
-    fd_res->write_callback_id = 0;
-    fd_res->reader_active = true;
-    fd_res->writer_active = false;
-    fd_res->owner_pid = loop->worker_pid;
-    atomic_store(&fd_res->closing_state, FD_STATE_OPEN);
-    fd_res->monitor_active = false;
-    fd_res->owns_fd = false;
-    if (!fd_resource_initialize(fd_res)) {
-        enif_release_resource(fd_res);
-        return PyErr_NoMemory();
-    }
-
-    /* Register with enif_select using the loop's persistent msg_env */
-    /* Use worker_pid when available for scalable I/O */
-    ErlNifPid *target_pid = &loop->worker_pid;
-    int ret = enif_select(loop->msg_env, (ErlNifEvent)fd,
-                          ERL_NIF_SELECT_READ, fd_res, target_pid, ATOM_UNDEFINED);
-
-    if (ret < 0) {
-        enif_release_resource(fd_res);
-        PyErr_SetString(PyExc_RuntimeError, "Failed to register fd for reading");
-        return NULL;
-    }
-
-    /* Return a key that can be used to remove the reader */
-    /* Hand Python an opaque, validated id instead of a raw pointer. The
-     * producer's resource reference is taken over by the registry entry. */
-    uint64_t id = fd_reg_add(fd_res);
-    if (id == 0) {
-        enif_select(loop->msg_env, (ErlNifEvent)fd, ERL_NIF_SELECT_STOP,
-                    fd_res, NULL, ATOM_UNDEFINED);
-        enif_release_resource(fd_res);
-        PyErr_SetString(PyExc_MemoryError, "fd registry full");
-        return NULL;
-    }
-    return PyLong_FromUnsignedLongLong((unsigned long long)id);
+    return fd_python_add(loop, fd, callback_id, true);
 }
 
 /* Python function: _remove_reader(fd_key) -> None */
@@ -7282,59 +7404,12 @@ static PyObject *py_add_writer(PyObject *self, PyObject *args) {
         return NULL;
     }
 
-    /* Use per-interpreter event loop lookup */
     erlang_event_loop_t *loop = get_interpreter_event_loop();
     if (loop == NULL) {
         PyErr_SetString(PyExc_RuntimeError, "Event loop not initialized");
         return NULL;
     }
-
-    /* Create fd resource */
-    fd_resource_t *fd_res = enif_alloc_resource(FD_RESOURCE_TYPE, sizeof(fd_resource_t));
-    if (fd_res == NULL) {
-        PyErr_SetString(PyExc_MemoryError, "Failed to allocate fd resource");
-        return NULL;
-    }
-
-    fd_res->fd = fd;
-    fd_res->loop = loop;
-    fd_res->read_callback_id = 0;
-    fd_res->write_callback_id = callback_id;
-    fd_res->reader_active = false;
-    fd_res->writer_active = true;
-    fd_res->owner_pid = loop->worker_pid;
-    atomic_store(&fd_res->closing_state, FD_STATE_OPEN);
-    fd_res->monitor_active = false;
-    fd_res->owns_fd = false;
-    if (!fd_resource_initialize(fd_res)) {
-        enif_release_resource(fd_res);
-        return PyErr_NoMemory();
-    }
-
-    /* Register with enif_select using the loop's persistent msg_env */
-    /* Use worker_pid when available for scalable I/O */
-    ErlNifPid *target_pid = &loop->worker_pid;
-    int ret = enif_select(loop->msg_env, (ErlNifEvent)fd,
-                          ERL_NIF_SELECT_WRITE, fd_res, target_pid, ATOM_UNDEFINED);
-
-    if (ret < 0) {
-        enif_release_resource(fd_res);
-        PyErr_SetString(PyExc_RuntimeError, "Failed to register fd for writing");
-        return NULL;
-    }
-
-    /* Return a key that can be used to remove the writer */
-    /* Hand Python an opaque, validated id instead of a raw pointer. The
-     * producer's resource reference is taken over by the registry entry. */
-    uint64_t id = fd_reg_add(fd_res);
-    if (id == 0) {
-        enif_select(loop->msg_env, (ErlNifEvent)fd, ERL_NIF_SELECT_STOP,
-                    fd_res, NULL, ATOM_UNDEFINED);
-        enif_release_resource(fd_res);
-        PyErr_SetString(PyExc_MemoryError, "fd registry full");
-        return NULL;
-    }
-    return PyLong_FromUnsignedLongLong((unsigned long long)id);
+    return fd_python_add(loop, fd, callback_id, false);
 }
 
 /* Python function: _remove_writer(fd_key) -> None */
@@ -8147,54 +8222,7 @@ static PyObject *py_add_reader_for(PyObject *self, PyObject *args) {
         return NULL;
     }
 
-    if (!event_loop_ensure_worker(loop)) {
-        PyErr_SetString(PyExc_RuntimeError, "Event loop has no router or worker");
-        return NULL;
-    }
-
-    fd_resource_t *fd_res = enif_alloc_resource(FD_RESOURCE_TYPE, sizeof(fd_resource_t));
-    if (fd_res == NULL) {
-        PyErr_SetString(PyExc_MemoryError, "Failed to allocate fd resource");
-        return NULL;
-    }
-
-    fd_res->fd = fd;
-    fd_res->loop = loop;
-    fd_res->read_callback_id = callback_id;
-    fd_res->write_callback_id = 0;
-    fd_res->reader_active = true;
-    fd_res->writer_active = false;
-    fd_res->owner_pid = loop->worker_pid;
-    atomic_store(&fd_res->closing_state, FD_STATE_OPEN);
-    fd_res->monitor_active = false;
-    fd_res->owns_fd = false;
-    if (!fd_resource_initialize(fd_res)) {
-        enif_release_resource(fd_res);
-        return PyErr_NoMemory();
-    }
-
-    /* Use worker_pid when available for scalable I/O */
-    ErlNifPid *target_pid = &loop->worker_pid;
-    int ret = enif_select(loop->msg_env, (ErlNifEvent)fd,
-                          ERL_NIF_SELECT_READ, fd_res, target_pid, ATOM_UNDEFINED);
-
-    if (ret < 0) {
-        enif_release_resource(fd_res);
-        PyErr_SetString(PyExc_RuntimeError, "Failed to register fd for reading");
-        return NULL;
-    }
-
-    /* Hand Python an opaque, validated id instead of a raw pointer. The
-     * producer's resource reference is taken over by the registry entry. */
-    uint64_t id = fd_reg_add(fd_res);
-    if (id == 0) {
-        enif_select(loop->msg_env, (ErlNifEvent)fd, ERL_NIF_SELECT_STOP,
-                    fd_res, NULL, ATOM_UNDEFINED);
-        enif_release_resource(fd_res);
-        PyErr_SetString(PyExc_MemoryError, "fd registry full");
-        return NULL;
-    }
-    return PyLong_FromUnsignedLongLong((unsigned long long)id);
+    return fd_python_add(loop, fd, callback_id, true);
 }
 
 /* Python function: _remove_reader_for(capsule, fd_key) -> None */
@@ -8223,54 +8251,7 @@ static PyObject *py_add_writer_for(PyObject *self, PyObject *args) {
         return NULL;
     }
 
-    if (!event_loop_ensure_worker(loop)) {
-        PyErr_SetString(PyExc_RuntimeError, "Event loop has no router or worker");
-        return NULL;
-    }
-
-    fd_resource_t *fd_res = enif_alloc_resource(FD_RESOURCE_TYPE, sizeof(fd_resource_t));
-    if (fd_res == NULL) {
-        PyErr_SetString(PyExc_MemoryError, "Failed to allocate fd resource");
-        return NULL;
-    }
-
-    fd_res->fd = fd;
-    fd_res->loop = loop;
-    fd_res->read_callback_id = 0;
-    fd_res->write_callback_id = callback_id;
-    fd_res->reader_active = false;
-    fd_res->writer_active = true;
-    fd_res->owner_pid = loop->worker_pid;
-    atomic_store(&fd_res->closing_state, FD_STATE_OPEN);
-    fd_res->monitor_active = false;
-    fd_res->owns_fd = false;
-    if (!fd_resource_initialize(fd_res)) {
-        enif_release_resource(fd_res);
-        return PyErr_NoMemory();
-    }
-
-    /* Use worker_pid when available for scalable I/O */
-    ErlNifPid *target_pid = &loop->worker_pid;
-    int ret = enif_select(loop->msg_env, (ErlNifEvent)fd,
-                          ERL_NIF_SELECT_WRITE, fd_res, target_pid, ATOM_UNDEFINED);
-
-    if (ret < 0) {
-        enif_release_resource(fd_res);
-        PyErr_SetString(PyExc_RuntimeError, "Failed to register fd for writing");
-        return NULL;
-    }
-
-    /* Hand Python an opaque, validated id instead of a raw pointer. The
-     * producer's resource reference is taken over by the registry entry. */
-    uint64_t id = fd_reg_add(fd_res);
-    if (id == 0) {
-        enif_select(loop->msg_env, (ErlNifEvent)fd, ERL_NIF_SELECT_STOP,
-                    fd_res, NULL, ATOM_UNDEFINED);
-        enif_release_resource(fd_res);
-        PyErr_SetString(PyExc_MemoryError, "fd registry full");
-        return NULL;
-    }
-    return PyLong_FromUnsignedLongLong((unsigned long long)id);
+    return fd_python_add(loop, fd, callback_id, false);
 }
 
 /* Python function: _remove_writer_for(capsule, fd_key) -> None */
@@ -8480,15 +8461,13 @@ static PyObject *py_clear_fd_write(PyObject *self, PyObject *args) {
 
 /**
  * Release fd_resource (stop all monitoring and release).
- * Python function: _release_fd_resource(fd_key, take_ownership=False) -> None
+ * Python function: _release_fd_resource(key, take_ownership=False) -> str
  *
- * With take_ownership the fd is closed by us, from the enif_select stop
- * callback once the poll set has dropped it (or right here when it is not
- * selected). Closing an fd from Python while ERL_NIF_SELECT_STOP is still
- * scheduled leaves a stale entry in the poll set and lets the number be
- * reused by the next accept(): that is the "Bad input fd in erts_poll" /
- * "stealing control of fd" report class. Transports hand their socket over
- * this way (see ErlangEventLoop._close_socket).
+ * Returns poll_closed, poll_pending, or absent. Every registry resource owns
+ * an isolated selected duplicate; the logical original is never closed here,
+ * including when the compatibility take_ownership argument is true. A pending
+ * result releases only the logical registration, not the ERTS relation. Failed
+ * or unsubmitted STOP preserves the table reference and raises an exception.
  */
 static PyObject *py_release_fd_resource(PyObject *self, PyObject *args) {
     (void)self;
@@ -8769,6 +8748,10 @@ static PyMethodDef PyEventLoopMethods[] = {
     {"_update_fd_write", py_update_fd_write, METH_VARARGS, "Update write callback on fd resource"},
     {"_clear_fd_read", py_clear_fd_read, METH_VARARGS, "Clear read monitoring on fd resource"},
     {"_clear_fd_write", py_clear_fd_write, METH_VARARGS, "Clear write monitoring on fd resource"},
+    {"_fd_poll_lease_info", py_fd_poll_lease_info, METH_VARARGS,
+     "Inspect logical FD, poll FD, closing, selection and live lease count."},
+    {"_new_fd_callback_id", py_new_fd_callback_id, METH_VARARGS,
+     "Allocate an FD-only callback identity."},
     {"_release_fd_resource", py_release_fd_resource, METH_VARARGS, "Release fd resource"},
     {"_schedule_timer_for", py_schedule_timer_for, METH_VARARGS, "Schedule timer on specific loop"},
     {"_cancel_timer_for", py_cancel_timer_for, METH_VARARGS, "Cancel timer on specific loop"},
