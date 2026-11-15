@@ -123,6 +123,13 @@ async def start(group: object, gate: object, factory: Callable[[], Body], payloa
 
 async def outcome(group: object, pid: object) -> Outcome:
     reply = await erlang.async_call("_task_wait", group, pid)
+    # TaskRef owns one watcher and caches its Python outcome for all observers.
+    # Transfer before raising: a traceback may retain every reply-watcher frame.
+    if isinstance(reply, tuple) and len(reply) == 2 and reply[0] == "python_error":
+        error = erlang._actor_take_exception(reply[1])
+        if not isinstance(error, BaseException):
+            raise TypeError("Invalid task exception")
+        return False, error
     try:
         value = result(reply)
         if not isinstance(value, bytes):

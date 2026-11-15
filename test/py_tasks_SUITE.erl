@@ -1,7 +1,9 @@
 -module(py_tasks_SUITE).
 -export([all/0, init_per_suite/1, end_per_suite/1, killed_child/1,
-         killed_context/1, killed_group/1, queued_ticket/1, killed_before_execution/1]).
-all() -> [killed_child, killed_context, killed_group, queued_ticket, killed_before_execution].
+         killed_context/1, killed_group/1, queued_ticket/1, killed_before_execution/1,
+         retained_exception_lifecycle/1]).
+all() -> [killed_child, killed_context, killed_group, queued_ticket, killed_before_execution,
+          retained_exception_lifecycle].
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(erlang_python), Config.
 end_per_suite(_) -> application:stop(erlang_python).
@@ -116,6 +118,29 @@ killed_before_execution(_) ->
         #{count := 0, bytes := 0, unsettled := 0} = py_nif:actor_gate_info(Gate),
         #{children := []} = gen_server:call(Group, info)
     after gen_server:stop(Group, normal, infinity), py_context:destroy(Source) end.
+
+retained_exception_lifecycle(_) ->
+    {ok, Ctx} = py_context:new(#{mode => worker}),
+    Dir = filename:dirname(code:which(?MODULE)),
+    ok = py_context:exec(Ctx, iolist_to_binary(io_lib:format(
+        "import sys; sys.path.insert(0, ~p)", [Dir]))),
+    py_callback:register(task_test_collect, fun([]) ->
+        %% Collect this isolated correctness VM's finite BEAM heaps as well as
+        %% Python GC; an unreachable resource term may await BEAM collection.
+        Pids = processes(),
+        true = length(Pids) < 256,
+        [erlang:garbage_collect(Pid) || Pid <- Pids],
+        ok
+    end),
+    try
+        ok = py_context:start_loop(Ctx),
+        {ok, true} = py_context:submit_await(Ctx, py_test_tasks,
+            retained_exception_lifecycle, [], #{}, 10000),
+        ok = py_context:stop_loop(Ctx)
+    after
+        py_callback:unregister(task_test_collect),
+        py_context:destroy(Ctx)
+    end.
 
 wait_ticket(_, 0) -> error(ticket_completion_timeout);
 wait_ticket(Ticket, N) ->
