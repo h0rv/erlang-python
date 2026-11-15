@@ -1,3 +1,4 @@
+import asyncio
 import os
 import socket
 import sys
@@ -228,6 +229,42 @@ def test_close_failure_keeps_loop_owner_retryable() -> None:
         assert loop.is_closed() and not loop._fd_resources
     finally:
         native.failure = Failure.NONE
+        loop.close()
+        native.finish()
+        left.close()
+        right.close()
+
+
+def test_recv_does_not_publish_success_when_retirement_fails() -> None:
+    loop = ErlangEventLoop()
+    native = LeaseBoundary()
+    loop._pel = native
+    left, right = socket.socketpair()
+    left.setblocking(False)
+    right.setblocking(False)
+    native.failure = Failure.STOP
+
+    def readable() -> None:
+        callback = loop._readers[left.fileno()][2]
+        loop._dispatch(callback, EVENT_TYPE_READ)
+
+    async def receive() -> None:
+        task = asyncio.create_task(loop.sock_recv(left, 4))
+        loop.call_soon(readable)
+        await task
+
+    try:
+        assert right.send(b"recv") == 4
+        with pytest.raises(FdRetirementError):
+            loop.run_until_complete(receive())
+        fd = left.fileno()
+        key = loop._fd_resources[fd]
+        assert fd >= 0 and fd in loop._readers
+        assert key in native.leases and key in loop._fd_retirement_failed
+        os.fstat(fd)
+    finally:
+        native.failure = Failure.NONE
+        loop._close_socket(left)
         loop.close()
         native.finish()
         left.close()

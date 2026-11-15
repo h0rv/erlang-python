@@ -7208,11 +7208,13 @@ static atomic_uint_fast64_t g_fd_callback_sequence = 1;
 static PyObject *py_new_fd_callback_id(PyObject *self, PyObject *args) {
     (void)self;
     if (!PyArg_ParseTuple(args, "")) return NULL;
-    uint64_t sequence = atomic_fetch_add(&g_fd_callback_sequence, 1);
-    if (sequence >= (UINT64_C(1) << 62)) {
-        PyErr_SetString(PyExc_RuntimeError, "FD callback identity domain exhausted");
-        return NULL;
-    }
+    uint_fast64_t sequence = atomic_load(&g_fd_callback_sequence);
+    do {
+        if (sequence >= (UINT64_C(1) << 62)) {
+            PyErr_SetString(PyExc_RuntimeError, "FD callback identity domain exhausted");
+            return NULL;
+        }
+    } while (!atomic_compare_exchange_weak(&g_fd_callback_sequence, &sequence, sequence + 1));
     return PyLong_FromUnsignedLongLong((UINT64_C(1) << 62) | sequence);
 }
 
