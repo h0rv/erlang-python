@@ -256,6 +256,11 @@ static int is_inline_schedule_marker(PyObject *obj);
 
 #include "py_util.c"
 #include "py_mem_limit.c"
+static PyObject *python_actor_retain(PyObject *self, PyObject *value);
+static PyObject *python_actor_unwrap(PyObject *self, PyObject *value);
+static ERL_NIF_TERM python_actor_to_term(ErlNifEnv *env, PyObject *value);
+static PyObject *python_actor_from_term(ErlNifEnv *env, ERL_NIF_TERM term);
+
 #include "py_convert.c"
 #include "py_exec.c"
 #include "py_logging.c"

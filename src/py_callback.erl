@@ -151,6 +151,7 @@ terminate(_Reason, _State) ->
 register_callbacks() ->
     ?MODULE:register('_whereis', fun whereis_callback/1),
     py_supervision:register_callbacks(),
+    py_object_actor:register_callbacks(),
     ok.
 
 %% @doc Callback implementation for erlang.whereis().

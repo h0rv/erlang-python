@@ -427,6 +427,9 @@ static ERL_NIF_TERM py_to_term_d(ErlNifEnv *env, PyObject *obj, int depth) {
         PyErr_Clear();
     }
 
+    if (PyCapsule_IsValid(obj, "erlang.local_object"))
+        return python_actor_to_term(env, obj);
+
     /* Handle PyCapsule containing channel reference */
     if (PyCapsule_CheckExact(obj)) {
         void *ptr = PyCapsule_GetPointer(obj, CHANNEL_CAPSULE_NAME);
@@ -719,6 +722,9 @@ static PyObject *term_to_py_d(ErlNifEnv *env, ERL_NIF_TERM term, int depth) {
             return (PyObject *)obj;
         }
     }
+
+    PyObject *local = python_actor_from_term(env, term);
+    if (local != NULL || PyErr_Occurred()) return local;
 
     /* Check for wrapped Python object resource */
     py_object_t *wrapper;

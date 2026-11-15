@@ -495,7 +495,7 @@ thread_worker_signal_ready(_Fd) ->
 %% This is called when an async_callback message is processed.
 %% The response is written in the format:
 %%   callback_id (8 bytes) + response_len (4 bytes) + response_data
--spec async_callback_response(integer(), non_neg_integer(), binary()) ->
+-spec async_callback_response(integer(), non_neg_integer(), binary() | {native, term()}) ->
     ok | {error, term()}.
 async_callback_response(_Fd, _CallbackId, _Response) ->
     ?NIF_STUB.

@@ -808,8 +808,20 @@ static ERL_NIF_TERM nif_async_callback_response(ErlNifEnv *env, int argc,
     if (!enif_get_uint64(env, argv[1], &callback_id)) {
         return make_error(env, "invalid_callback_id");
     }
+    uint64_t native_id = 0;
+    unsigned char native_frame[1 + sizeof(uint64_t)];
     if (!enif_inspect_binary(env, argv[2], &response)) {
-        return make_error(env, "invalid_response");
+        const ERL_NIF_TERM *parts;
+        int arity;
+        if (!enif_get_tuple(env, argv[2], &arity, &parts) || arity != 2 ||
+            !enif_is_identical(parts[0], enif_make_atom(env, "native")))
+            return make_error(env, "invalid_response");
+        native_id = native_reply_save(fd, parts[1]);
+        if (native_id == 0) return make_error(env, "alloc_failed");
+        native_frame[0] = 3;
+        memcpy(native_frame + 1, &native_id, sizeof(native_id));
+        response.data = native_frame;
+        response.size = sizeof(native_frame);
     }
 
     size_t total = sizeof(callback_id) + sizeof(uint32_t) + response.size;
@@ -837,6 +849,8 @@ static ERL_NIF_TERM nif_async_callback_response(ErlNifEnv *env, int argc,
         enif_free(buf);
     }
 
+    if (r != WRITE_OK && native_id != 0)
+        native_reply_free(native_reply_take(native_id));
     switch (r) {
         case WRITE_OK:      return ATOM_OK;
         case WRITE_TIMEOUT: return make_error(env, "write_timeout");

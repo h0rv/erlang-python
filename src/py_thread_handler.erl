@@ -262,6 +262,15 @@ handle_thread_callback(WriteFd, CallbackId, FuncName, Args) ->
 %% Used by async_writer_loop (and indirectly by handle_thread_callback
 %% via the same encoding shape — the sync path keeps its own copy
 %% close to the write call site).
+run_async_callback(<<"_actor_", _/binary>> = FuncName, Args) ->
+    ArgsList = case Args of
+        T when is_tuple(T) -> tuple_to_list(T);
+        L when is_list(L) -> L
+    end,
+    case py_callback:execute(FuncName, ArgsList) of
+        {ok, Result} -> {native, Result};
+        {error, Error} -> <<1, (iolist_to_binary(io_lib:format("~p", [Error])))/binary>>
+    end;
 run_async_callback(FuncName, Args) ->
     ArgsList = case Args of
         T when is_tuple(T) -> tuple_to_list(T);

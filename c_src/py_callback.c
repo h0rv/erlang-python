@@ -852,6 +852,65 @@ static PyObject *convert_etf_strings(PyObject *obj) {
  *   1 = error, payload is an error message
  *   2 = ok, payload is an external-term-format binary (current encoding)
  */
+/* Same-VM callback replies retain the actual term environment until the
+ * Python reader consumes it. ETF alone cannot retain a resource reference. */
+typedef struct native_reply {
+    uint64_t id;
+    int fd;
+    ErlNifEnv *env;
+    ERL_NIF_TERM term;
+    struct native_reply *next;
+} native_reply_t;
+static pthread_mutex_t native_reply_mutex = PTHREAD_MUTEX_INITIALIZER;
+static native_reply_t *native_replies;
+static uint64_t native_reply_id;
+
+static native_reply_t *native_reply_take(uint64_t id) {
+    pthread_mutex_lock(&native_reply_mutex);
+    native_reply_t **slot = &native_replies;
+    while (*slot != NULL && (*slot)->id != id) slot = &(*slot)->next;
+    native_reply_t *reply = *slot;
+    if (reply != NULL) *slot = reply->next;
+    pthread_mutex_unlock(&native_reply_mutex);
+    return reply;
+}
+
+static void native_reply_free(native_reply_t *reply) {
+    if (reply != NULL) {
+        enif_free_env(reply->env);
+        enif_free(reply);
+    }
+}
+
+static uint64_t native_reply_save(int fd, ERL_NIF_TERM term) {
+    native_reply_t *reply = enif_alloc(sizeof(*reply));
+    if (reply == NULL) return 0;
+    reply->env = enif_alloc_env();
+    if (reply->env == NULL) { enif_free(reply); return 0; }
+    reply->term = enif_make_copy(reply->env, term);
+    reply->fd = fd;
+    pthread_mutex_lock(&native_reply_mutex);
+    reply->id = ++native_reply_id;
+    reply->next = native_replies;
+    native_replies = reply;
+    uint64_t id = reply->id;
+    pthread_mutex_unlock(&native_reply_mutex);
+    return id;
+}
+
+static void native_reply_drop_fd(int fd) {
+    for (;;) {
+        pthread_mutex_lock(&native_reply_mutex);
+        native_reply_t **slot = &native_replies;
+        while (*slot != NULL && (*slot)->fd != fd) slot = &(*slot)->next;
+        native_reply_t *reply = *slot;
+        if (reply != NULL) *slot = reply->next;
+        pthread_mutex_unlock(&native_reply_mutex);
+        if (reply == NULL) break;
+        native_reply_free(reply);
+    }
+}
+
 static PyObject *parse_callback_response(unsigned char *response_data, size_t response_len) {
     if (response_len < 1) {
         PyErr_SetString(PyExc_RuntimeError, "Empty callback response");
@@ -873,7 +932,18 @@ static PyObject *parse_callback_response(unsigned char *response_data, size_t re
     size_t result_len = response_len - 1;
 
     PyObject *result = NULL;
-    if (status == 2) {
+    if (status == 3 && result_len == sizeof(uint64_t)) {
+        uint64_t id;
+        memcpy(&id, result_str, sizeof(id));
+        native_reply_t *reply = native_reply_take(id);
+        if (reply == NULL) {
+            PyErr_SetString(PyExc_RuntimeError, "Native callback reply expired");
+            return NULL;
+        }
+        result = term_to_py(reply->env, reply->term);
+        native_reply_free(reply);
+        return result;
+    } else if (status == 2) {
         /* Current encoding: external term format, decoded by the same
          * converter that handles call arguments. */
         result = etf_binary_to_py(result_str, result_len);
@@ -2194,6 +2264,7 @@ static void async_pipe_break_and_fail_pending(erlang_module_state_t *state) {
         return;
     }
 
+    native_reply_drop_fd(state->async_callback_pipe[1]);
     /* Reset frame buffer; any in-flight body is unrecoverable. */
     state->hdr_have = 0;
     if (state->body_buf != NULL) {
@@ -2275,6 +2346,7 @@ static int process_async_callback_response(void) {
             if (n  < 0 && errno == EINTR) continue;
             break;
         }
+        native_reply_drop_fd(state->async_callback_pipe[1]);
         return 0;
     }
 
@@ -2360,18 +2432,17 @@ static int process_async_callback_response(void) {
     Py_XDECREF(key);
     pthread_mutex_unlock(&state->async_futures_mutex);
 
+    /* Decode even an abandoned reply so retained native environments cannot
+     * leak when a caller cancels or its Future has already disappeared. */
+    PyObject *result = blen > 0
+        ? parse_callback_response((unsigned char *)body, blen) : Py_NewRef(Py_None);
     if (future != NULL) {
-        PyObject *result = NULL;
-        if (blen > 0) {
-            result = parse_callback_response((unsigned char *)body, blen);
-        } else {
-            Py_INCREF(Py_None);
-            result = Py_None;
-        }
         resolve_future_with_result(future, result);
-        Py_XDECREF(result);
         Py_DECREF(future);
+    } else if (result == NULL) {
+        PyErr_Clear();
     }
+    Py_XDECREF(result);
 
     if (body != NULL) {
         enif_free(body);
@@ -3311,6 +3382,8 @@ static PyMethodDef ErlangModuleMethods[] = {
      "Check/consume NIF time slice for cooperative scheduling.\n\n"
      "Usage: if erlang.consume_time_slice(percent): return erlang.schedule_py(...)\n"
      "Returns True if time slice exhausted (should yield), False if more time remains."},
+    {"_actor_retain", python_actor_retain, METH_O, "Retain a main-interpreter object."},
+    {"_actor_unwrap", python_actor_unwrap, METH_O, "Recover a retained Python object."},
     {"_get_async_callback_fd", get_async_callback_fd, METH_NOARGS,
      "Get the file descriptor for async callback responses.\n"
      "Used internally by async_call() to register with asyncio."},
@@ -3432,6 +3505,7 @@ static void erlang_module_free(void *module) {
         state->async_callback_pipe[0] = -1;
     }
     if (state->async_callback_pipe[1] >= 0) {
+        native_reply_drop_fd(state->async_callback_pipe[1]);
         close(state->async_callback_pipe[1]);
         state->async_callback_pipe[1] = -1;
     }
