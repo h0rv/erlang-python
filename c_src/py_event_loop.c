@@ -672,6 +672,12 @@ static int fd_retire(ErlNifEnv *env, fd_resource_t *res, bool own) {
     return accepted ? 0 : -1;
 }
 
+static ERL_NIF_TERM fd_retire_reply(ErlNifEnv *env, fd_resource_t *res, bool own) {
+    int result = fd_retire(env, res, own);
+    if (result == 0) return ATOM_OK;
+    return make_error(env, result == -2 ? "retirement_pending" : "select_stop_failed");
+}
+
 /* Caller holds the resource mutex; STOP is exclusively handled above. */
 static int fd_select_locked(ErlNifEnv *env, fd_resource_t *res, int mode,
                             const ErlNifPid *pid, ERL_NIF_TERM ref) {
@@ -741,8 +747,14 @@ static int fd_resource_select(ErlNifEnv *env, ErlNifEvent event,
     if (mode & ERL_NIF_SELECT_STOP) return fd_retire(env, res, false);
     pthread_mutex_lock(&res->mutex);
     int result = -1;
-    if (res->fd == (int)event)
+    if (res->fd == (int)event) {
         result = fd_select_locked(env, res, mode, pid, ref);
+        if (result >= 0) {
+            bool active = !(mode & ERL_NIF_SELECT_CANCEL);
+            if (mode & ERL_NIF_SELECT_READ) res->reader_active = active;
+            if (mode & ERL_NIF_SELECT_WRITE) res->writer_active = active;
+        }
+    }
     pthread_mutex_unlock(&res->mutex);
     return result;
 }
@@ -1487,8 +1499,7 @@ ERL_NIF_TERM nif_remove_reader(ErlNifEnv *env, int argc,
     }
 
     if (fd_res->loop != loop) return make_error(env, "wrong_loop");
-    return fd_retire(env, fd_res, false) < 0
-        ? make_error(env, "select_stop_failed") : ATOM_OK;
+    return fd_retire_reply(env, fd_res, false);
 }
 
 /**
@@ -1587,8 +1598,7 @@ ERL_NIF_TERM nif_remove_writer(ErlNifEnv *env, int argc,
     }
 
     if (fd_res->loop != loop) return make_error(env, "wrong_loop");
-    return fd_retire(env, fd_res, false) < 0
-        ? make_error(env, "select_stop_failed") : ATOM_OK;
+    return fd_retire_reply(env, fd_res, false);
 }
 
 /**
@@ -2065,10 +2075,11 @@ ERL_NIF_TERM nif_handle_fd_event_and_reselect(ErlNifEnv *env, int argc,
      * The ref is ignored by the worker anyway. */
     ErlNifPid *target_pid = &loop->worker_pid;
     int select_flags = is_read ? ERL_NIF_SELECT_READ : ERL_NIF_SELECT_WRITE;
-    enif_select(env, (ErlNifEvent)fd_res->fd, select_flags,
+    int result = enif_select(env, (ErlNifEvent)fd_res->fd, select_flags,
                 fd_res, target_pid, ATOM_UNDEFINED);
 
     pthread_mutex_unlock(&loop->mutex);
+    if (result < 0) return make_error(env, "reselect_failed");
 
     /* Add to pending queue (has duplicate detection; takes loop->mutex itself) */
     event_type_t event_type = is_read ? EVENT_TYPE_READ : EVENT_TYPE_WRITE;
@@ -2108,10 +2119,10 @@ ERL_NIF_TERM nif_fd_arm(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
         return ATOM_OK;  /* Closed or disarmed again in the meantime */
     }
     int select_flags = is_read ? ERL_NIF_SELECT_READ : ERL_NIF_SELECT_WRITE;
-    enif_select(env, (ErlNifEvent)fd_res->fd, select_flags,
+    int result = enif_select(env, (ErlNifEvent)fd_res->fd, select_flags,
                 fd_res, &loop->worker_pid, ATOM_UNDEFINED);
     pthread_mutex_unlock(&loop->mutex);
-    return ATOM_OK;
+    return result < 0 ? make_error(env, "reselect_failed") : ATOM_OK;
 }
 
 /**
@@ -5086,11 +5097,10 @@ ERL_NIF_TERM nif_stop_reader(ErlNifEnv *env, int argc,
     }
 
     /* Cancel read monitoring using ERL_NIF_SELECT_CANCEL */
-    enif_select(env, (ErlNifEvent)fd_res->fd,
+    int result = enif_select(env, (ErlNifEvent)fd_res->fd,
                 ERL_NIF_SELECT_CANCEL | ERL_NIF_SELECT_READ,
                 fd_res, NULL, ATOM_UNDEFINED);
-
-    fd_res->reader_active = false;
+    if (result < 0) return make_error(env, "cancel_failed");
 
     return ATOM_OK;
 }
@@ -5125,14 +5135,7 @@ ERL_NIF_TERM nif_start_reader(ErlNifEnv *env, int argc,
     ErlNifPid *target_pid = &loop->worker_pid;
     int ret = enif_select(env, (ErlNifEvent)fd_res->fd, ERL_NIF_SELECT_READ,
                           fd_res, target_pid, ATOM_UNDEFINED);
-
-    if (ret < 0) {
-        return make_error(env, "select_failed");
-    }
-
-    fd_res->reader_active = true;
-
-    return ATOM_OK;
+    return ret < 0 ? make_error(env, "select_failed") : ATOM_OK;
 }
 
 /**
@@ -5161,11 +5164,10 @@ ERL_NIF_TERM nif_stop_writer(ErlNifEnv *env, int argc,
     }
 
     /* Cancel write monitoring using ERL_NIF_SELECT_CANCEL */
-    enif_select(env, (ErlNifEvent)fd_res->fd,
+    int result = enif_select(env, (ErlNifEvent)fd_res->fd,
                 ERL_NIF_SELECT_CANCEL | ERL_NIF_SELECT_WRITE,
                 fd_res, NULL, ATOM_UNDEFINED);
-
-    fd_res->writer_active = false;
+    if (result < 0) return make_error(env, "cancel_failed");
 
     return ATOM_OK;
 }
@@ -5200,14 +5202,7 @@ ERL_NIF_TERM nif_start_writer(ErlNifEnv *env, int argc,
     ErlNifPid *target_pid = &loop->worker_pid;
     int ret = enif_select(env, (ErlNifEvent)fd_res->fd, ERL_NIF_SELECT_WRITE,
                           fd_res, target_pid, ATOM_UNDEFINED);
-
-    if (ret < 0) {
-        return make_error(env, "select_failed");
-    }
-
-    fd_res->writer_active = true;
-
-    return ATOM_OK;
+    return ret < 0 ? make_error(env, "select_failed") : ATOM_OK;
 }
 
 /* Legacy aliases for backward compatibility */
@@ -5229,8 +5224,7 @@ ERL_NIF_TERM nif_close_fd(ErlNifEnv *env, int argc,
         return make_error(env, "invalid_fd_ref");
     }
 
-    return fd_retire(env, fd_res, true) < 0
-        ? make_error(env, "select_stop_failed") : ATOM_OK;
+    return fd_retire_reply(env, fd_res, true);
 }
 
 /* ============================================================================
@@ -6008,14 +6002,7 @@ ERL_NIF_TERM nif_reactor_reselect_read(ErlNifEnv *env, int argc,
     /* Re-register for read events */
     int ret = enif_select(env, (ErlNifEvent)fd_res->fd, ERL_NIF_SELECT_READ,
                           fd_res, &fd_res->owner_pid, enif_make_ref(env));
-
-    if (ret < 0) {
-        return make_error(env, "select_failed");
-    }
-
-    fd_res->reader_active = true;
-
-    return ATOM_OK;
+    return ret < 0 ? make_error(env, "select_failed") : ATOM_OK;
 }
 
 /**
@@ -6048,9 +6035,7 @@ ERL_NIF_TERM nif_reactor_select_write(ErlNifEnv *env, int argc,
         return make_error(env, "select_failed");
     }
 
-    fd_res->writer_active = true;
     fd_res->reader_active = false;  /* Typically stop reading when writing */
-
     return ATOM_OK;
 }
 
@@ -6367,8 +6352,7 @@ ERL_NIF_TERM nif_reactor_close_fd(ErlNifEnv *env, int argc,
     pthread_mutex_lock(&fd_res->mutex);
     if (atomic_load(&fd_res->closing_state) != FD_STATE_OPEN) {
         pthread_mutex_unlock(&fd_res->mutex);
-        return fd_retire(env, fd_res, true) < 0
-            ? make_error(env, "select_stop_failed") : ATOM_OK;
+        return fd_retire_reply(env, fd_res, true);
     }
     int fd = fd_res->fd;
     atomic_store(&fd_res->closing_state, FD_STATE_CLOSING);
@@ -6398,8 +6382,7 @@ ERL_NIF_TERM nif_reactor_close_fd(ErlNifEnv *env, int argc,
     pthread_mutex_lock(&fd_res->mutex);
     fd_res->reactor_cleanup = false;
     pthread_mutex_unlock(&fd_res->mutex);
-    return fd_retire(env, fd_res, true) < 0
-        ? make_error(env, "select_stop_failed") : ATOM_OK;
+    return fd_retire_reply(env, fd_res, true);
 }
 
 /* ============================================================================
@@ -6533,6 +6516,7 @@ ERL_NIF_TERM nif_fd_select_read(ErlNifEnv *env, int argc,
     int ret = enif_select(env, (ErlNifEvent)fd, ERL_NIF_SELECT_READ,
                           fd_res, &caller_pid, enif_make_ref(env));
     if (ret < 0) {
+        fd_demonitor(env, fd_res);
         enif_release_resource(fd_res);
         return make_error(env, "select_failed");
     }
@@ -6593,6 +6577,7 @@ ERL_NIF_TERM nif_fd_select_write(ErlNifEnv *env, int argc,
     int ret = enif_select(env, (ErlNifEvent)fd, ERL_NIF_SELECT_WRITE,
                           fd_res, &caller_pid, enif_make_ref(env));
     if (ret < 0) {
+        fd_demonitor(env, fd_res);
         enif_release_resource(fd_res);
         return make_error(env, "select_failed");
     }
@@ -7202,7 +7187,9 @@ static PyObject *fd_python_retire(uint64_t key, bool own) {
     }
     enif_release_resource(res);
     if (result < 0) {
-        PyErr_SetString(PyExc_RuntimeError, "FD selection retirement failed");
+        PyErr_SetString(PyExc_RuntimeError, result == -2
+            ? "FD selection retirement is pending submission"
+            : "FD selection retirement failed");
         return NULL;
     }
     Py_RETURN_NONE;
@@ -8327,8 +8314,16 @@ static PyObject *py_update_fd_read(PyObject *self, PyObject *args) {
         return NULL;
     }
 
+    pthread_mutex_lock(&fd_res->mutex);
+    if (atomic_load(&fd_res->closing_state) != FD_STATE_OPEN) {
+        pthread_mutex_unlock(&fd_res->mutex);
+        enif_release_resource(fd_res);
+        PyErr_SetString(PyExc_ValueError, "fd resource is closing");
+        return NULL;
+    }
     fd_res->read_callback_id = callback_id;
     fd_res->reader_active = true;
+    pthread_mutex_unlock(&fd_res->mutex);
 
     /* Re-arm from the worker process, not from this Python thread: see
      * nif_fd_arm for why a READ re-select must run on a scheduler thread. */
@@ -8387,8 +8382,16 @@ static PyObject *py_update_fd_write(PyObject *self, PyObject *args) {
         return NULL;
     }
 
+    pthread_mutex_lock(&fd_res->mutex);
+    if (atomic_load(&fd_res->closing_state) != FD_STATE_OPEN) {
+        pthread_mutex_unlock(&fd_res->mutex);
+        enif_release_resource(fd_res);
+        PyErr_SetString(PyExc_ValueError, "fd resource is closing");
+        return NULL;
+    }
     fd_res->write_callback_id = callback_id;
     fd_res->writer_active = true;
+    pthread_mutex_unlock(&fd_res->mutex);
 
     /* Same target as _add_writer_for: the loop's worker process. */
     ErlNifPid *target_pid = &fd_res->loop->worker_pid;
@@ -8424,9 +8427,14 @@ static PyObject *py_clear_fd_read(PyObject *self, PyObject *args) {
     }
 
     if (fd_res->reader_active) {
-        enif_select(fd_res->loop->msg_env, (ErlNifEvent)fd_res->fd,
+        int result = enif_select(fd_res->loop->msg_env, (ErlNifEvent)fd_res->fd,
                     ERL_NIF_SELECT_CANCEL | ERL_NIF_SELECT_READ,
                     fd_res, NULL, ATOM_UNDEFINED);
+        if (result < 0) {
+            enif_release_resource(fd_res);
+            PyErr_SetString(PyExc_RuntimeError, "FD read cancellation failed");
+            return NULL;
+        }
         fd_res->reader_active = false;
         fd_res->read_callback_id = 0;
     }
@@ -8454,9 +8462,14 @@ static PyObject *py_clear_fd_write(PyObject *self, PyObject *args) {
     }
 
     if (fd_res->writer_active) {
-        enif_select(fd_res->loop->msg_env, (ErlNifEvent)fd_res->fd,
+        int result = enif_select(fd_res->loop->msg_env, (ErlNifEvent)fd_res->fd,
                     ERL_NIF_SELECT_CANCEL | ERL_NIF_SELECT_WRITE,
                     fd_res, NULL, ATOM_UNDEFINED);
+        if (result < 0) {
+            enif_release_resource(fd_res);
+            PyErr_SetString(PyExc_RuntimeError, "FD write cancellation failed");
+            return NULL;
+        }
         fd_res->writer_active = false;
         fd_res->write_callback_id = 0;
     }

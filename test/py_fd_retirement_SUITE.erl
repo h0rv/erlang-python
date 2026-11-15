@@ -138,7 +138,7 @@ close_reselect_race(_) ->
                  ok -> ok;
                  {error, fd_closing} -> ok;
                  {error, select_failed} -> ok;
-                 {error, select_stop_failed} -> ok
+                 {error, retirement_pending} -> ok
              end
          after 1000 -> error(no_result) end || {P, _} <- Workers],
         [receive {'DOWN', M, process, P, normal} -> ok after 1000 -> error(worker_alive) end

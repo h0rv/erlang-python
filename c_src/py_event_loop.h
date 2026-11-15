@@ -205,7 +205,8 @@ typedef struct {
     /** @brief Reference to the parent event loop */
     struct erlang_event_loop *loop;
 
-    /* All FD fields are protected by mutex. Lock order: FD then loop. */
+    /* Selection/retirement transitions share this mutex. Callback/activity
+     * observations use atomics. No loop lock is acquired during STOP. */
     pthread_mutex_t mutex;
     bool mutex_initialized;
     fd_selection_state_t selection;
