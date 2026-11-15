@@ -2296,6 +2296,8 @@ static void ctx_execute_apply_paths(py_context_t *ctx) {
 /**
  * @brief Execute a request based on its type
  */
+static void ctx_execute_local_object(py_context_t *ctx);
+
 static void ctx_execute_request(py_context_t *ctx) {
     switch (ctx->request_type) {
         case CTX_REQ_CALL:
@@ -2333,6 +2335,10 @@ static void ctx_execute_request(py_context_t *ctx) {
             break;
         case CTX_REQ_APPLY_PATHS:
             ctx_execute_apply_paths(ctx);
+            break;
+        case CTX_REQ_LOCAL_EVAL:
+        case CTX_REQ_LOCAL_APPLY:
+            ctx_execute_local_object(ctx);
             break;
         default:
             ctx->response_term = enif_make_tuple2(ctx->shared_env,
@@ -3001,6 +3007,8 @@ static ERL_NIF_TERM ctx_dispatch_async(
         enif_make_atom(env, "enqueued"),
         request_id);
 }
+
+#include "py_local_object.c"
 
 #ifdef HAVE_SUBINTERPRETERS
 /**
@@ -5829,6 +5837,13 @@ static int load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info) {
     (void)priv_data;
     (void)load_info;
 
+    LOCAL_OBJECT_RESOURCE_TYPE = enif_open_resource_type(
+        env, NULL, "py_local_object", local_object_destructor,
+        ERL_NIF_RT_CREATE | ERL_NIF_RT_TAKEOVER, NULL);
+    if (LOCAL_OBJECT_RESOURCE_TYPE == NULL) {
+        return -1;
+    }
+
     /* Create resource types */
     PYOBJ_RESOURCE_TYPE = enif_open_resource_type(
         env, NULL, "py_object", pyobj_destructor,
@@ -6029,6 +6044,7 @@ static ErlNifFunc nif_funcs[] = {
     {"context_eval", 4, nif_context_eval_with_env, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"context_call", 6, nif_context_call_with_env, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"context_call_async", 7, nif_context_call_async, 0},
+    {"local_object_async", 5, nif_local_object_async, 0},
     {"context_eval_async", 5, nif_context_eval_async, 0},
     {"context_exec_async", 4, nif_context_exec_async, 0},
     {"context_call_with_env_async", 8, nif_context_call_with_env_async, 0},

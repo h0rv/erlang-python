@@ -56,6 +56,9 @@
     exec/2,
     exec/3,
     call_method/4,
+    eval_ref/4,
+    apply_ref/5,
+    apply_ref/6,
     to_term/1,
     get_interp_id/1,
     is_subinterp/1,
@@ -97,7 +100,9 @@
 -type context_mode() :: worker | owngil | isolated.
 -type context() :: pid().
 
--export_type([context_mode/0, context/0]).
+-opaque local_ref() :: reference().
+-type local_result() :: {ok, local_ref()} | {python_error, local_ref()} | {error, term()}.
+-export_type([context_mode/0, context/0, local_ref/0, local_result/0]).
 
 
 
@@ -338,6 +343,43 @@ call_method(Ctx, Ref, Method, Args) when is_pid(Ctx), is_reference(Ref) ->
         {'DOWN', MRef, process, Ctx, Reason} ->
             {error, {context_died, Reason}}
     end.
+
+%% @doc Evaluate to a retained local Python reference, without value conversion.
+%% Bindings contain local references only. References can be explicitly shared
+%% within their original worker context. They retain their originating namespace.
+-spec eval_ref(context(), binary(), #{binary() => local_ref()}, reference()) -> local_result().
+eval_ref(Ctx, Code, Bindings, Env) ->
+    local_object(Ctx, {eval, Code, Bindings}, Env).
+
+%% @doc Call a retained callable with retained Python tuple/dict arguments.
+%% Coroutine bodies are awaited on the existing context thread and event loop.
+%% Python exceptions are returned as retained exception objects. This operation
+%% never converts an object or exception to a string. Waiting does not interrupt
+%% execution or retry it. A dead requester can leave its accepted effect running.
+-spec apply_ref(context(), local_ref(), local_ref(), local_ref(), reference()) -> local_result().
+apply_ref(Ctx, Func, Args, Kwargs, Env) ->
+    apply_ref(Ctx, Func, Args, Kwargs, Env, infinity).
+
+-spec apply_ref(context(), local_ref(), local_ref(), local_ref(), reference(), timeout()) ->
+    local_result().
+apply_ref(Ctx, Func, Args, Kwargs, Env, Timeout) ->
+    local_object(Ctx, {apply, Func, Args, Kwargs}, Env, Timeout).
+
+local_object(Ctx, Request, Env) ->
+    local_object(Ctx, Request, Env, infinity).
+
+local_object(Ctx, Request, Env, Timeout) when node(Ctx) =:= node() ->
+    MRef = erlang:monitor(process, Ctx, [{alias, demonitor}]),
+    Ctx ! {local_object, MRef, MRef, Request, Env},
+    receive
+        {MRef, Result} -> erlang:demonitor(MRef, [flush]), Result;
+        {'DOWN', MRef, process, Ctx, Reason} -> {error, {context_died, Reason}}
+    after Timeout ->
+        erlang:demonitor(MRef, [flush]),
+        {error, timeout}
+    end;
+local_object(_Ctx, _Request, _Env, _Timeout) ->
+    {error, local_only}.
 
 %% @doc Convert a Python object reference to an Erlang term.
 -spec to_term(reference()) -> {ok, term()} | {error, term()}.

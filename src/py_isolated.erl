@@ -227,6 +227,9 @@ handle_event(info, {submit, From, MRef, TaskRef, Module, Func, Args, Kwargs}, St
             State, Data);
 handle_event(info, {pass_fd, From, MRef, Fd}, State, Data) ->
     pass_fd(From, MRef, Fd, State, Data);
+handle_event(info, {local_object, From, MRef, _Request, _Env}, _State, _Data) ->
+    From ! {MRef, {error, local_objects_require_worker}},
+    keep_state_and_data;
 handle_event(info, {call_method, From, MRef, _ObjRef, _Method, _Args}, _State, _Data) ->
     From ! {MRef, {error, not_supported_in_isolated}},
     keep_state_and_data;

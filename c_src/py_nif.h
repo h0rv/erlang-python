@@ -436,7 +436,9 @@ typedef enum {
     CTX_REQ_EXEC_WITH_ENV,      /**< Exec with process-local environment */
     CTX_REQ_CREATE_LOCAL_ENV,   /**< Create process-local env dicts */
     CTX_REQ_APPLY_IMPORTS,      /**< Apply imports to module cache */
-    CTX_REQ_APPLY_PATHS         /**< Apply paths to sys.path */
+    CTX_REQ_APPLY_PATHS,        /**< Apply paths to sys.path */
+    CTX_REQ_LOCAL_EVAL,         /**< Evaluate to a retained local object */
+    CTX_REQ_LOCAL_APPLY         /**< Invoke retained objects and await */
 } ctx_request_type_t;
 
 /**
