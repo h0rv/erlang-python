@@ -169,6 +169,13 @@ typedef enum {
 #define FD_STATE_CLOSING 1
 #define FD_STATE_CLOSED  2
 
+typedef enum {
+    FD_SELECTION_NONE,
+    FD_SELECTION_REGISTERED,
+    FD_SELECTION_STOP_PENDING,
+    FD_SELECTION_RETIRED
+} fd_selection_state_t;
+
 /**
  * @struct fd_resource_t
  * @brief Resource for tracking file descriptors registered with enif_select
@@ -178,25 +185,34 @@ typedef enum {
  */
 typedef struct {
     /** @brief The file descriptor being monitored */
-    int fd;
+    _Atomic int fd;
 
     /** @brief Callback ID for the read handler */
-    uint64_t read_callback_id;
+    _Atomic uint64_t read_callback_id;
 
     /** @brief Callback ID for the write handler */
-    uint64_t write_callback_id;
+    _Atomic uint64_t write_callback_id;
 
     /** @brief PID of the owning event loop's router */
     ErlNifPid owner_pid;
 
     /** @brief Whether read monitoring is active */
-    bool reader_active;
+    _Atomic bool reader_active;
 
     /** @brief Whether write monitoring is active */
-    bool writer_active;
+    _Atomic bool writer_active;
 
     /** @brief Reference to the parent event loop */
     struct erlang_event_loop *loop;
+
+    /* All FD fields are protected by mutex. Lock order: FD then loop. */
+    pthread_mutex_t mutex;
+    bool mutex_initialized;
+    fd_selection_state_t selection;
+    bool reactor_cleanup;
+    unsigned stop_callbacks;
+    unsigned direct_stops;
+    int stop_result;
 
     /* Lifecycle management fields */
 
@@ -207,10 +223,10 @@ typedef struct {
     ErlNifMonitor owner_monitor;
 
     /** @brief Whether owner_monitor is valid/active */
-    bool monitor_active;
+    _Atomic bool monitor_active;
 
     /** @brief Whether to close FD on stop (ownership flag) */
-    bool owns_fd;
+    _Atomic bool owns_fd;
 } fd_resource_t;
 
 /* ============================================================================

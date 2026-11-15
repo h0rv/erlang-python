@@ -587,16 +587,99 @@ cleanup_native:
  * Safety net: close the FD if it's still open when the resource is GC'd.
  * This should rarely happen if proper lifecycle management is used.
  */
-void fd_resource_destructor(ErlNifEnv *env, void *obj) {
-    fd_resource_t *fd_res = (fd_resource_t *)obj;
-    (void)env;
+static bool fd_resource_initialize(fd_resource_t *res) {
+    res->mutex_initialized = false;
+    res->selection = FD_SELECTION_NONE;
+    res->reactor_cleanup = false;
+    res->stop_callbacks = 0;
+    res->direct_stops = 0;
+    res->stop_result = 0;
+    memset(&res->owner_monitor, 0, sizeof(res->owner_monitor));
+    if (res->loop != NULL) enif_keep_resource(res->loop);
+    if (pthread_mutex_init(&res->mutex, NULL) != 0) return false;
+    res->mutex_initialized = true;
+    return true;
+}
 
-    /* Safety net: close if still open and we own the FD */
-    int state = atomic_load(&fd_res->closing_state);
-    if (state != FD_STATE_CLOSED && fd_res->owns_fd && fd_res->fd >= 0) {
-        close(fd_res->fd);
-        fd_res->fd = -1;
+void fd_resource_destructor(ErlNifEnv *env, void *obj) {
+    fd_resource_t *res = obj;
+    (void)env;
+    /* ERTS cannot run the destructor while a selection relation exists.
+     * Only never-selected or already-retired resources can arrive here. */
+    if (res->owns_fd && res->fd >= 0) close(res->fd);
+    if (res->loop != NULL) enif_release_resource(res->loop);
+    if (res->mutex_initialized) pthread_mutex_destroy(&res->mutex);
+}
+
+/* Called only with the FD mutex held, after STOP made closure safe or when
+ * no successful select has ever established a relation. No ERTS calls here. */
+static void fd_finish_locked(fd_resource_t *res) {
+    if (res->owns_fd && res->fd >= 0) close(res->fd);
+    /* Even a borrowed descriptor must be forgotten: a retained old handle
+     * must never acquire ownership of a later descriptor lifetime. */
+    res->fd = -1;
+    res->reader_active = false;
+    res->writer_active = false;
+    atomic_store(&res->closing_state, FD_STATE_CLOSED);
+}
+
+static void fd_demonitor(ErlNifEnv *env, fd_resource_t *res) {
+    pthread_mutex_lock(&res->mutex);
+    bool monitored = res->monitor_active;
+    ErlNifMonitor monitor = res->owner_monitor;
+    res->monitor_active = false;
+    pthread_mutex_unlock(&res->mutex);
+    if (monitored) enif_demonitor_process(env, res, &monitor);
+}
+
+/* Close intent is monotonic. READ/WRITE/CANCEL run under the same FD mutex;
+ * STOP never does, because ERTS may call our stop callback synchronously.
+ * A failed STOP leaves the relation and descriptor intact and is retryable. */
+static int fd_retire(ErlNifEnv *env, fd_resource_t *res, bool own) {
+    pthread_mutex_lock(&res->mutex);
+    if (atomic_load(&res->closing_state) == FD_STATE_CLOSED) {
+        pthread_mutex_unlock(&res->mutex);
+        return 0;
     }
+    res->owns_fd |= own;
+    atomic_store(&res->closing_state, FD_STATE_CLOSING);
+    res->reader_active = false;
+    res->writer_active = false;
+    if (res->reactor_cleanup || res->selection == FD_SELECTION_STOP_PENDING) {
+        bool submitted = !res->reactor_cleanup && res->stop_result >= 0;
+        pthread_mutex_unlock(&res->mutex);
+        return submitted ? 0 : -2; /* Not an acknowledgement of an unsubmitted STOP. */
+    }
+    if (res->selection == FD_SELECTION_NONE) {
+        fd_finish_locked(res);
+        pthread_mutex_unlock(&res->mutex);
+        fd_demonitor(env, res);
+        return 0;
+    }
+    int fd = res->fd;
+    res->selection = FD_SELECTION_STOP_PENDING;
+    res->stop_result = -1;
+    pthread_mutex_unlock(&res->mutex);
+    int result = enif_select(env, (ErlNifEvent)fd, ERL_NIF_SELECT_STOP,
+                             res, NULL, ATOM_UNDEFINED);
+    pthread_mutex_lock(&res->mutex);
+    res->stop_result = result;
+    bool accepted = result >= 0 &&
+        (result & (ERL_NIF_SELECT_STOP_CALLED | ERL_NIF_SELECT_STOP_SCHEDULED));
+    if (!accepted && res->selection == FD_SELECTION_STOP_PENDING)
+        res->selection = FD_SELECTION_REGISTERED;
+    pthread_mutex_unlock(&res->mutex);
+    return accepted ? 0 : -1;
+}
+
+/* Caller holds the resource mutex; STOP is exclusively handled above. */
+static int fd_select_locked(ErlNifEnv *env, fd_resource_t *res, int mode,
+                            const ErlNifPid *pid, ERL_NIF_TERM ref) {
+    if (atomic_load(&res->closing_state) != FD_STATE_OPEN) return -1;
+    int result = enif_select(env, (ErlNifEvent)res->fd, mode, res, pid, ref);
+    if (result >= 0 && !(mode & ERL_NIF_SELECT_CANCEL))
+        res->selection = FD_SELECTION_REGISTERED;
+    return result;
 }
 
 /**
@@ -613,33 +696,18 @@ void fd_resource_stop(ErlNifEnv *env, void *obj, ErlNifEvent event,
     (void)event;
     (void)is_direct_call;
 
-    /* Atomically transition to CLOSED state */
-    int expected = FD_STATE_OPEN;
-    if (!atomic_compare_exchange_strong(&fd_res->closing_state,
-                                        &expected, FD_STATE_CLOSED)) {
-        /* Try from CLOSING state */
-        expected = FD_STATE_CLOSING;
-        if (!atomic_compare_exchange_strong(&fd_res->closing_state,
-                                            &expected, FD_STATE_CLOSED)) {
-            /* Already closed, nothing to do */
-            return;
-        }
+    pthread_mutex_lock(&fd_res->mutex);
+    if (fd_res->selection == FD_SELECTION_STOP_PENDING &&
+        fd_res->fd == (int)event) {
+        fd_res->stop_callbacks++;
+        fd_res->direct_stops += is_direct_call != 0;
+        fd_res->stop_result = is_direct_call ? ERL_NIF_SELECT_STOP_CALLED
+                                             : ERL_NIF_SELECT_STOP_SCHEDULED;
+        fd_res->selection = FD_SELECTION_RETIRED;
+        fd_finish_locked(fd_res);
     }
-
-    /* Close FD if we own it */
-    if (fd_res->owns_fd && fd_res->fd >= 0) {
-        close(fd_res->fd);
-        fd_res->fd = -1;
-    }
-
-    /* Demonitor if active */
-    if (fd_res->monitor_active && env != NULL) {
-        enif_demonitor_process(env, fd_res, &fd_res->owner_monitor);
-        fd_res->monitor_active = false;
-    }
-
-    fd_res->reader_active = false;
-    fd_res->writer_active = false;
+    pthread_mutex_unlock(&fd_res->mutex);
+    fd_demonitor(env, fd_res);
 }
 
 /**
@@ -656,34 +724,29 @@ void fd_resource_down(ErlNifEnv *env, void *obj, ErlNifPid *pid,
     (void)pid;
     (void)mon;
 
-    /* Mark monitor as inactive */
+    pthread_mutex_lock(&fd_res->mutex);
     fd_res->monitor_active = false;
-
-    /* Transition to CLOSING state */
-    int expected = FD_STATE_OPEN;
-    if (!atomic_compare_exchange_strong(&fd_res->closing_state,
-                                        &expected, FD_STATE_CLOSING)) {
-        /* Already closing or closed */
-        return;
-    }
-
-    /* Take ownership for cleanup */
-    fd_res->owns_fd = true;
-
-    /* If select is active, trigger stop via ERL_NIF_SELECT_STOP */
-    if (fd_res->reader_active || fd_res->writer_active) {
-        enif_select(env, (ErlNifEvent)fd_res->fd, ERL_NIF_SELECT_STOP,
-                    fd_res, NULL, enif_make_atom(env, "owner_down"));
-    } else if (fd_res->fd >= 0) {
-        /* No active select, close directly */
-        int exp = FD_STATE_CLOSING;
-        if (atomic_compare_exchange_strong(&fd_res->closing_state,
-                                           &exp, FD_STATE_CLOSED)) {
-            close(fd_res->fd);
-            fd_res->fd = -1;
-        }
-    }
+    pthread_mutex_unlock(&fd_res->mutex);
+    if (fd_retire(env, fd_res, true) == -1)
+        fprintf(stderr, "FD ownership retirement failed on owner down\n");
 }
+
+/* All enif_select sites below operate on fd_resource_t. Keep their scheduler
+ * routing intact, but serialize the external selection with retirement. The
+ * actual STOP call lives above this wrapper and never holds the FD mutex. */
+static int fd_resource_select(ErlNifEnv *env, ErlNifEvent event,
+                               enum ErlNifSelectFlags mode, void *obj,
+                               const ErlNifPid *pid, ERL_NIF_TERM ref) {
+    fd_resource_t *res = obj;
+    if (mode & ERL_NIF_SELECT_STOP) return fd_retire(env, res, false);
+    pthread_mutex_lock(&res->mutex);
+    int result = -1;
+    if (res->fd == (int)event)
+        result = fd_select_locked(env, res, mode, pid, ref);
+    pthread_mutex_unlock(&res->mutex);
+    return result;
+}
+#define enif_select fd_resource_select
 
 /**
  * @brief Destructor for timer resources
@@ -1371,11 +1434,13 @@ ERL_NIF_TERM nif_add_reader(ErlNifEnv *env, int argc,
     fd_res->reader_active = true;
     fd_res->writer_active = false;
     fd_res->loop = loop;
-
-    /* Initialize lifecycle management fields */
     atomic_store(&fd_res->closing_state, FD_STATE_OPEN);
     fd_res->monitor_active = false;
     fd_res->owns_fd = false;
+    if (!fd_resource_initialize(fd_res)) {
+        enif_release_resource(fd_res);
+        return make_error(env, "mutex_failed");
+    }
 
     /* Monitor owner process for cleanup on death */
     if (enif_monitor_process(env, fd_res, target_pid,
@@ -1396,8 +1461,7 @@ ERL_NIF_TERM nif_add_reader(ErlNifEnv *env, int argc,
     }
 
     ERL_NIF_TERM fd_term = enif_make_resource(env, fd_res);
-    /* Keep the owner's reference - will be released in remove_reader.
-     * This ensures the fd_res stays alive while registered for select. */
+    enif_release_resource(fd_res); /* Term and ERTS relation own their references. */
 
     return enif_make_tuple2(env, ATOM_OK, fd_term);
 }
@@ -1422,22 +1486,9 @@ ERL_NIF_TERM nif_remove_reader(ErlNifEnv *env, int argc,
         return make_error(env, "invalid_fd_ref");
     }
 
-    if (!fd_res->reader_active) {
-        return ATOM_OK;  /* Already removed */
-    }
-
-    /* Stop monitoring for reads using the same resource */
-    enif_select(env, (ErlNifEvent)fd_res->fd, ERL_NIF_SELECT_STOP,
-                fd_res, NULL, enif_make_atom(env, "undefined"));
-
-    fd_res->reader_active = false;
-
-    /* Release the owner's reference that was kept in add_reader */
-    if (!fd_res->writer_active) {
-        enif_release_resource(fd_res);
-    }
-
-    return ATOM_OK;
+    if (fd_res->loop != loop) return make_error(env, "wrong_loop");
+    return fd_retire(env, fd_res, false) < 0
+        ? make_error(env, "select_stop_failed") : ATOM_OK;
 }
 
 /**
@@ -1483,11 +1534,13 @@ ERL_NIF_TERM nif_add_writer(ErlNifEnv *env, int argc,
     fd_res->reader_active = false;
     fd_res->writer_active = true;
     fd_res->loop = loop;
-
-    /* Initialize lifecycle management fields */
     atomic_store(&fd_res->closing_state, FD_STATE_OPEN);
     fd_res->monitor_active = false;
     fd_res->owns_fd = false;
+    if (!fd_resource_initialize(fd_res)) {
+        enif_release_resource(fd_res);
+        return make_error(env, "mutex_failed");
+    }
 
     /* Monitor owner process for cleanup on death */
     if (enif_monitor_process(env, fd_res, target_pid,
@@ -1508,8 +1561,7 @@ ERL_NIF_TERM nif_add_writer(ErlNifEnv *env, int argc,
     }
 
     ERL_NIF_TERM fd_term = enif_make_resource(env, fd_res);
-    /* Keep the owner's reference - will be released in remove_writer.
-     * This ensures the fd_res stays alive while registered for select. */
+    enif_release_resource(fd_res); /* Term and ERTS relation own their references. */
 
     return enif_make_tuple2(env, ATOM_OK, fd_term);
 }
@@ -1534,22 +1586,9 @@ ERL_NIF_TERM nif_remove_writer(ErlNifEnv *env, int argc,
         return make_error(env, "invalid_fd_ref");
     }
 
-    if (!fd_res->writer_active) {
-        return ATOM_OK;  /* Already removed */
-    }
-
-    /* Stop monitoring for writes using the same resource */
-    enif_select(env, (ErlNifEvent)fd_res->fd, ERL_NIF_SELECT_STOP,
-                fd_res, NULL, enif_make_atom(env, "undefined"));
-
-    fd_res->writer_active = false;
-
-    /* Release the owner's reference that was kept in add_writer */
-    if (!fd_res->reader_active) {
-        enif_release_resource(fd_res);
-    }
-
-    return ATOM_OK;
+    if (fd_res->loop != loop) return make_error(env, "wrong_loop");
+    return fd_retire(env, fd_res, false) < 0
+        ? make_error(env, "select_stop_failed") : ATOM_OK;
 }
 
 /**
@@ -5190,41 +5229,48 @@ ERL_NIF_TERM nif_close_fd(ErlNifEnv *env, int argc,
         return make_error(env, "invalid_fd_ref");
     }
 
-    /* Atomically transition to CLOSING state */
-    int expected = FD_STATE_OPEN;
-    if (!atomic_compare_exchange_strong(&fd_res->closing_state,
-                                        &expected, FD_STATE_CLOSING)) {
-        /* Already closing or closed - this is idempotent */
-        return ATOM_OK;
-    }
-
-    /* Take ownership of the FD for cleanup */
-    fd_res->owns_fd = true;
-
-    /* If select is active, trigger stop which will close the FD */
-    if (fd_res->reader_active || fd_res->writer_active) {
-        enif_select(env, (ErlNifEvent)fd_res->fd, ERL_NIF_SELECT_STOP,
-                    fd_res, NULL, enif_make_atom(env, "explicit_close"));
-    } else {
-        /* No active select, close directly */
-        atomic_store(&fd_res->closing_state, FD_STATE_CLOSED);
-        if (fd_res->fd >= 0) {
-            close(fd_res->fd);
-            fd_res->fd = -1;
-        }
-        /* Demonitor if active */
-        if (fd_res->monitor_active) {
-            enif_demonitor_process(env, fd_res, &fd_res->owner_monitor);
-            fd_res->monitor_active = false;
-        }
-    }
-
-    return ATOM_OK;
+    return fd_retire(env, fd_res, true) < 0
+        ? make_error(env, "select_stop_failed") : ATOM_OK;
 }
 
 /* ============================================================================
  * Test Helper Functions (for testing fd monitoring with pipes)
  * ============================================================================ */
+
+static ERL_NIF_TERM nif_fd_lifecycle_info(ErlNifEnv *env, int argc,
+                                          const ERL_NIF_TERM argv[]) {
+    (void)argc;
+    fd_resource_t *res;
+    if (!enif_get_resource(env, argv[0], FD_RESOURCE_TYPE, (void **)&res))
+        return enif_make_badarg(env);
+    pthread_mutex_lock(&res->mutex);
+    ERL_NIF_TERM values[] = {
+        enif_make_int(env, atomic_load(&res->closing_state)),
+        enif_make_int(env, res->selection), enif_make_int(env, res->fd),
+        enif_make_uint(env, res->stop_callbacks), enif_make_uint(env, res->direct_stops),
+        enif_make_int(env, res->stop_result)
+    };
+    pthread_mutex_unlock(&res->mutex);
+    return enif_make_tuple_from_array(env, values, 6);
+}
+
+static ERL_NIF_TERM nif_create_test_fd_resource(ErlNifEnv *env, int argc,
+                                                 const ERL_NIF_TERM argv[]) {
+    (void)argc;
+    int fd;
+    if (!enif_get_int(env, argv[0], &fd) || fd < 0) return enif_make_badarg(env);
+    fd_resource_t *res = enif_alloc_resource(FD_RESOURCE_TYPE, sizeof(*res));
+    if (res == NULL) return make_error(env, "alloc_failed");
+    memset(res, 0, sizeof(*res));
+    res->fd = fd;
+    if (!fd_resource_initialize(res)) {
+        enif_release_resource(res);
+        return make_error(env, "mutex_failed");
+    }
+    ERL_NIF_TERM term = enif_make_resource(env, res);
+    enif_release_resource(res);
+    return enif_make_tuple2(env, ATOM_OK, term);
+}
 
 #include <unistd.h>
 #include <fcntl.h>
@@ -5904,12 +5950,14 @@ ERL_NIF_TERM nif_reactor_register_fd(ErlNifEnv *env, int argc,
     fd_res->owner_pid = owner_pid;
     fd_res->reader_active = true;
     fd_res->writer_active = false;
-    fd_res->loop = NULL;  /* No event loop needed for reactor mode */
-
-    /* Initialize lifecycle management */
+    fd_res->loop = NULL;
     atomic_store(&fd_res->closing_state, FD_STATE_OPEN);
     fd_res->monitor_active = false;
-    fd_res->owns_fd = false;  /* Caller owns the fd */
+    fd_res->owns_fd = false;
+    if (!fd_resource_initialize(fd_res)) {
+        enif_release_resource(fd_res);
+        return make_error(env, "mutex_failed");
+    }
 
     /* Monitor owner process for cleanup on death */
     if (enif_monitor_process(env, fd_res, &owner_pid,
@@ -5930,7 +5978,7 @@ ERL_NIF_TERM nif_reactor_register_fd(ErlNifEnv *env, int argc,
     }
 
     ERL_NIF_TERM fd_term = enif_make_resource(env, fd_res);
-    /* Don't release - keep reference while registered */
+    enif_release_resource(fd_res); /* Term and ERTS relation own their references. */
 
     return enif_make_tuple2(env, ATOM_OK, fd_term);
 }
@@ -6316,17 +6364,19 @@ ERL_NIF_TERM nif_reactor_close_fd(ErlNifEnv *env, int argc,
         return make_error(env, "invalid_fd_ref");
     }
 
-    int fd = fd_res->fd;
-
-    /* Atomically transition to CLOSING state */
-    int expected = FD_STATE_OPEN;
-    if (!atomic_compare_exchange_strong(&fd_res->closing_state,
-                                        &expected, FD_STATE_CLOSING)) {
-        /* Already closing or closed */
-        return ATOM_OK;
+    pthread_mutex_lock(&fd_res->mutex);
+    if (atomic_load(&fd_res->closing_state) != FD_STATE_OPEN) {
+        pthread_mutex_unlock(&fd_res->mutex);
+        return fd_retire(env, fd_res, true) < 0
+            ? make_error(env, "select_stop_failed") : ATOM_OK;
     }
+    int fd = fd_res->fd;
+    atomic_store(&fd_res->closing_state, FD_STATE_CLOSING);
+    fd_res->reactor_cleanup = true;
+    pthread_mutex_unlock(&fd_res->mutex);
 
-    /* Call Python to clean up protocol handler */
+    /* This cleanup lease prevents concurrent owner-down/close from freeing
+     * the descriptor while Python still identifies the original connection. */
     if (fd >= 0) {
         py_context_guard_t guard = py_context_acquire(ctx);
         if (guard.acquired) {
@@ -6345,26 +6395,11 @@ ERL_NIF_TERM nif_reactor_close_fd(ErlNifEnv *env, int argc,
         }
     }
 
-    /* Take ownership for cleanup */
-    fd_res->owns_fd = true;
-
-    /* Stop select and close */
-    if (fd_res->reader_active || fd_res->writer_active) {
-        enif_select(env, (ErlNifEvent)fd_res->fd, ERL_NIF_SELECT_STOP,
-                    fd_res, NULL, enif_make_atom(env, "reactor_close"));
-    } else {
-        atomic_store(&fd_res->closing_state, FD_STATE_CLOSED);
-        if (fd_res->fd >= 0) {
-            close(fd_res->fd);
-            fd_res->fd = -1;
-        }
-        if (fd_res->monitor_active) {
-            enif_demonitor_process(env, fd_res, &fd_res->owner_monitor);
-            fd_res->monitor_active = false;
-        }
-    }
-
-    return ATOM_OK;
+    pthread_mutex_lock(&fd_res->mutex);
+    fd_res->reactor_cleanup = false;
+    pthread_mutex_unlock(&fd_res->mutex);
+    return fd_retire(env, fd_res, true) < 0
+        ? make_error(env, "select_stop_failed") : ATOM_OK;
 }
 
 /* ============================================================================
@@ -6484,8 +6519,17 @@ ERL_NIF_TERM nif_fd_select_read(ErlNifEnv *env, int argc,
     fd_res->loop = NULL;
     atomic_store(&fd_res->closing_state, FD_STATE_OPEN);
     fd_res->monitor_active = false;
-    fd_res->owns_fd = false;  /* Caller owns the fd */
+    fd_res->owns_fd = false;
+    if (!fd_resource_initialize(fd_res)) {
+        enif_release_resource(fd_res);
+        return make_error(env, "mutex_failed");
+    }
 
+    if (enif_monitor_process(env, fd_res, &caller_pid, &fd_res->owner_monitor) != 0) {
+        enif_release_resource(fd_res);
+        return make_error(env, "monitor_failed");
+    }
+    fd_res->monitor_active = true;
     int ret = enif_select(env, (ErlNifEvent)fd, ERL_NIF_SELECT_READ,
                           fd_res, &caller_pid, enif_make_ref(env));
     if (ret < 0) {
@@ -6535,8 +6579,17 @@ ERL_NIF_TERM nif_fd_select_write(ErlNifEnv *env, int argc,
     fd_res->loop = NULL;
     atomic_store(&fd_res->closing_state, FD_STATE_OPEN);
     fd_res->monitor_active = false;
-    fd_res->owns_fd = false;  /* Caller owns the fd */
+    fd_res->owns_fd = false;
+    if (!fd_resource_initialize(fd_res)) {
+        enif_release_resource(fd_res);
+        return make_error(env, "mutex_failed");
+    }
 
+    if (enif_monitor_process(env, fd_res, &caller_pid, &fd_res->owner_monitor) != 0) {
+        enif_release_resource(fd_res);
+        return make_error(env, "monitor_failed");
+    }
+    fd_res->monitor_active = true;
     int ret = enif_select(env, (ErlNifEvent)fd, ERL_NIF_SELECT_WRITE,
                           fd_res, &caller_pid, enif_make_ref(env));
     if (ret < 0) {
@@ -7131,6 +7184,22 @@ static fd_resource_t *fd_reg_take(uint64_t id) {
     return res;
 }
 
+static PyObject *fd_python_retire(uint64_t key, bool own) {
+    fd_resource_t *res = fd_reg_get(key);
+    if (res == NULL) Py_RETURN_NONE;
+    int result = fd_retire(NULL, res, own);
+    if (result == 0) {
+        fd_resource_t *entry = fd_reg_take(key);
+        if (entry != NULL) enif_release_resource(entry);
+    }
+    enif_release_resource(res);
+    if (result < 0) {
+        PyErr_SetString(PyExc_RuntimeError, "FD selection retirement failed");
+        return NULL;
+    }
+    Py_RETURN_NONE;
+}
+
 /* Python function: _add_reader(fd, callback_id) -> fd_key */
 static PyObject *py_add_reader(PyObject *self, PyObject *args) {
     (void)self;
@@ -7161,13 +7230,14 @@ static PyObject *py_add_reader(PyObject *self, PyObject *args) {
     fd_res->write_callback_id = 0;
     fd_res->reader_active = true;
     fd_res->writer_active = false;
-    /* Use worker_pid when available for scalable I/O */
     fd_res->owner_pid = loop->worker_pid;
-
-    /* Initialize lifecycle management fields */
     atomic_store(&fd_res->closing_state, FD_STATE_OPEN);
     fd_res->monitor_active = false;
     fd_res->owns_fd = false;
+    if (!fd_resource_initialize(fd_res)) {
+        enif_release_resource(fd_res);
+        return PyErr_NoMemory();
+    }
 
     /* Register with enif_select using the loop's persistent msg_env */
     /* Use worker_pid when available for scalable I/O */
@@ -7204,18 +7274,7 @@ static PyObject *py_remove_reader(PyObject *self, PyObject *args) {
         return NULL;
     }
 
-    /* Use per-interpreter event loop lookup - but still allow cleanup even if loop is gone */
-    fd_resource_t *fd_res = fd_reg_take(fd_key);
-    if (fd_res != NULL) {
-        if (fd_res->loop != NULL) {
-            enif_select(fd_res->loop->msg_env, (ErlNifEvent)fd_res->fd,
-                        ERL_NIF_SELECT_STOP, fd_res, NULL, ATOM_UNDEFINED);
-            fd_res->reader_active = false;
-        }
-        enif_release_resource(fd_res);
-    }
-
-    Py_RETURN_NONE;
+    return fd_python_retire(fd_key, false);
 }
 
 /* Python function: _add_writer(fd, callback_id) -> fd_key */
@@ -7248,13 +7307,14 @@ static PyObject *py_add_writer(PyObject *self, PyObject *args) {
     fd_res->write_callback_id = callback_id;
     fd_res->reader_active = false;
     fd_res->writer_active = true;
-    /* Use worker_pid when available for scalable I/O */
     fd_res->owner_pid = loop->worker_pid;
-
-    /* Initialize lifecycle management fields */
     atomic_store(&fd_res->closing_state, FD_STATE_OPEN);
     fd_res->monitor_active = false;
     fd_res->owns_fd = false;
+    if (!fd_resource_initialize(fd_res)) {
+        enif_release_resource(fd_res);
+        return PyErr_NoMemory();
+    }
 
     /* Register with enif_select using the loop's persistent msg_env */
     /* Use worker_pid when available for scalable I/O */
@@ -7291,18 +7351,7 @@ static PyObject *py_remove_writer(PyObject *self, PyObject *args) {
         return NULL;
     }
 
-    /* Use fd_res->loop directly - allows cleanup even if interpreter's loop is gone */
-    fd_resource_t *fd_res = fd_reg_take(fd_key);
-    if (fd_res != NULL) {
-        if (fd_res->loop != NULL) {
-            enif_select(fd_res->loop->msg_env, (ErlNifEvent)fd_res->fd,
-                        ERL_NIF_SELECT_STOP, fd_res, NULL, ATOM_UNDEFINED);
-            fd_res->writer_active = false;
-        }
-        enif_release_resource(fd_res);
-    }
-
-    Py_RETURN_NONE;
+    return fd_python_retire(fd_key, false);
 }
 
 /* Python function: _schedule_timer(delay_ms, callback_id) -> timer_ref */
@@ -8120,11 +8169,14 @@ static PyObject *py_add_reader_for(PyObject *self, PyObject *args) {
     fd_res->write_callback_id = 0;
     fd_res->reader_active = true;
     fd_res->writer_active = false;
-    /* Use worker_pid when available for scalable I/O */
     fd_res->owner_pid = loop->worker_pid;
     atomic_store(&fd_res->closing_state, FD_STATE_OPEN);
     fd_res->monitor_active = false;
     fd_res->owns_fd = false;
+    if (!fd_resource_initialize(fd_res)) {
+        enif_release_resource(fd_res);
+        return PyErr_NoMemory();
+    }
 
     /* Use worker_pid when available for scalable I/O */
     ErlNifPid *target_pid = &loop->worker_pid;
@@ -8154,29 +8206,10 @@ static PyObject *py_add_reader_for(PyObject *self, PyObject *args) {
 static PyObject *py_remove_reader_for(PyObject *self, PyObject *args) {
     (void)self;
     PyObject *capsule;
-    unsigned long long fd_key;
-
-    if (!PyArg_ParseTuple(args, "OK", &capsule, &fd_key)) {
-        return NULL;
-    }
-
-    /* Validate capsule (but we use fd_res->loop directly) */
-    if (!PyCapsule_CheckExact(capsule)) {
-        PyErr_SetString(PyExc_TypeError, "Expected event loop capsule");
-        return NULL;
-    }
-
-    fd_resource_t *fd_res = fd_reg_take(fd_key);
-    if (fd_res != NULL) {
-        if (fd_res->loop != NULL) {
-            enif_select(fd_res->loop->msg_env, (ErlNifEvent)fd_res->fd,
-                        ERL_NIF_SELECT_STOP, fd_res, NULL, ATOM_UNDEFINED);
-            fd_res->reader_active = false;
-        }
-        enif_release_resource(fd_res);
-    }
-
-    Py_RETURN_NONE;
+    unsigned long long key;
+    if (!PyArg_ParseTuple(args, "OK", &capsule, &key)) return NULL;
+    if (loop_from_capsule(capsule) == NULL) return NULL;
+    return fd_python_retire(key, false);
 }
 
 /* Python function: _add_writer_for(capsule, fd, callback_id) -> fd_key */
@@ -8212,11 +8245,14 @@ static PyObject *py_add_writer_for(PyObject *self, PyObject *args) {
     fd_res->write_callback_id = callback_id;
     fd_res->reader_active = false;
     fd_res->writer_active = true;
-    /* Use worker_pid when available for scalable I/O */
     fd_res->owner_pid = loop->worker_pid;
     atomic_store(&fd_res->closing_state, FD_STATE_OPEN);
     fd_res->monitor_active = false;
     fd_res->owns_fd = false;
+    if (!fd_resource_initialize(fd_res)) {
+        enif_release_resource(fd_res);
+        return PyErr_NoMemory();
+    }
 
     /* Use worker_pid when available for scalable I/O */
     ErlNifPid *target_pid = &loop->worker_pid;
@@ -8246,29 +8282,10 @@ static PyObject *py_add_writer_for(PyObject *self, PyObject *args) {
 static PyObject *py_remove_writer_for(PyObject *self, PyObject *args) {
     (void)self;
     PyObject *capsule;
-    unsigned long long fd_key;
-
-    if (!PyArg_ParseTuple(args, "OK", &capsule, &fd_key)) {
-        return NULL;
-    }
-
-    /* Validate capsule (but we use fd_res->loop directly) */
-    if (!PyCapsule_CheckExact(capsule)) {
-        PyErr_SetString(PyExc_TypeError, "Expected event loop capsule");
-        return NULL;
-    }
-
-    fd_resource_t *fd_res = fd_reg_take(fd_key);
-    if (fd_res != NULL) {
-        if (fd_res->loop != NULL) {
-            enif_select(fd_res->loop->msg_env, (ErlNifEvent)fd_res->fd,
-                        ERL_NIF_SELECT_STOP, fd_res, NULL, ATOM_UNDEFINED);
-            fd_res->writer_active = false;
-        }
-        enif_release_resource(fd_res);
-    }
-
-    Py_RETURN_NONE;
+    unsigned long long key;
+    if (!PyArg_ParseTuple(args, "OK", &capsule, &key)) return NULL;
+    if (loop_from_capsule(capsule) == NULL) return NULL;
+    return fd_python_retire(key, false);
 }
 
 /**
@@ -8461,39 +8478,7 @@ static PyObject *py_release_fd_resource(PyObject *self, PyObject *args) {
         return NULL;
     }
 
-    fd_resource_t *fd_res = fd_reg_take(fd_key);
-    if (fd_res != NULL) {
-        erlang_event_loop_t *loop = fd_res->loop;
-        if (take_ownership) {
-            fd_res->owns_fd = true;
-            /* Move to CLOSING under loop->mutex so a concurrent
-             * handle_fd_event_and_reselect cannot reselect this fd. */
-            if (loop != NULL) pthread_mutex_lock(&loop->mutex);
-            int expected = FD_STATE_OPEN;
-            atomic_compare_exchange_strong(&fd_res->closing_state,
-                                           &expected, FD_STATE_CLOSING);
-            fd_res->reader_active = false;
-            fd_res->writer_active = false;
-            if (loop != NULL) pthread_mutex_unlock(&loop->mutex);
-        }
-        int rc = -1;
-        if (loop != NULL) {
-            rc = enif_select(loop->msg_env, (ErlNifEvent)fd_res->fd,
-                             ERL_NIF_SELECT_STOP, fd_res, NULL, ATOM_UNDEFINED);
-        }
-        if (rc < 0 && take_ownership && fd_res->fd >= 0) {
-            /* Never selected (or no loop): nothing pending in the poll set */
-            int expected = FD_STATE_CLOSING;
-            if (atomic_compare_exchange_strong(&fd_res->closing_state,
-                                               &expected, FD_STATE_CLOSED)) {
-                close(fd_res->fd);
-                fd_res->fd = -1;
-            }
-        }
-        enif_release_resource(fd_res);
-    }
-
-    Py_RETURN_NONE;
+    return fd_python_retire(fd_key, take_ownership != 0);
 }
 
 /* Python function: _schedule_timer_for(capsule, delay_ms, callback_id) -> timer_ref */
@@ -9018,6 +9003,8 @@ int init_subinterpreter_event_loop(ErlNifEnv *env) {
     {"stop_writer", 1, nif_stop_writer, 0}, \
     {"start_writer", 1, nif_start_writer, 0}, \
     {"close_fd", 1, nif_close_fd, 0}, \
+    {"fd_lifecycle_info", 1, nif_fd_lifecycle_info, 0}, \
+    {"create_test_fd_resource", 1, nif_create_test_fd_resource, 0}, \
     {"create_test_pipe", 0, nif_create_test_pipe, 0}, \
     {"close_test_fd", 1, nif_close_test_fd, 0}, \
     {"dup_fd", 1, nif_dup_fd, 0}, \
@@ -9048,3 +9035,5 @@ int init_subinterpreter_event_loop(ErlNifEnv *env) {
     {"fd_select_write", 1, nif_fd_select_write, 0}, \
     {"fd_close", 1, nif_fd_close, 0}, \
     {"socketpair", 0, nif_socketpair, 0}
+
+#undef enif_select

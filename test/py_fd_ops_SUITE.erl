@@ -142,9 +142,11 @@ fd_select_test(_Config) ->
         ct:fail(write_select_timeout)
     end,
 
-    %% Clean up
-    ok = py_nif:fd_close(Fd1),
-    ok = py_nif:fd_close(Fd2),
+    %% Selected descriptors must retire their relation, not bypass STOP via integers.
+    ok = py_nif:close_fd(WriteRef),
+    ok = py_nif:close_fd(ReadRef),
+    ok = py_fd_retirement_SUITE:retired_for_test(WriteRef),
+    ok = py_fd_retirement_SUITE:retired_for_test(ReadRef),
     ok.
 
 %% @doc Test py:dup_fd/1 — duplicates an fd so caller and dup can be
