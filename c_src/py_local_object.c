@@ -8,6 +8,19 @@ typedef struct {
 } local_object_t;
 
 static ErlNifResourceType *LOCAL_OBJECT_RESOURCE_TYPE;
+static atomic_size_t local_object_count;
+static atomic_size_t local_object_value_count;
+static atomic_size_t local_object_context_count;
+static atomic_size_t local_object_env_count;
+
+static PyObject *python_actor_retained_object_stats(PyObject *self, PyObject *unused) {
+    (void)self;
+    (void)unused;
+    return Py_BuildValue("nnnn", (Py_ssize_t)atomic_load(&local_object_count),
+        (Py_ssize_t)atomic_load(&local_object_value_count),
+        (Py_ssize_t)atomic_load(&local_object_context_count),
+        (Py_ssize_t)atomic_load(&local_object_env_count));
+}
 
 #define LOCAL_OBJECT_CAPSULE "erlang.local_object"
 
@@ -29,6 +42,8 @@ static PyObject *python_actor_retain(PyObject *self, PyObject *value) {
     ref->value = Py_NewRef(value);
     ref->ctx = NULL;
     ref->env = NULL;
+    atomic_fetch_add(&local_object_count, 1);
+    atomic_fetch_add(&local_object_value_count, 1);
     PyObject *capsule = PyCapsule_New(ref, LOCAL_OBJECT_CAPSULE,
                                     python_actor_capsule_destroy);
     if (capsule == NULL) enif_release_resource(ref);
@@ -42,7 +57,46 @@ static PyObject *python_actor_unwrap(PyObject *self, PyObject *value) {
         return NULL;
     }
     local_object_t *ref = PyCapsule_GetPointer(value, LOCAL_OBJECT_CAPSULE);
-    return ref == NULL ? NULL : Py_NewRef(ref->value);
+    if (ref == NULL) return NULL;
+    if (ref->value == NULL) {
+        PyErr_SetString(PyExc_RuntimeError, "Retained result was already transferred");
+        return NULL;
+    }
+    return Py_NewRef(ref->value);
+}
+
+/* Only the task outcome consumer transfers terminal exceptions. GIL serializes
+ * take/unwrap. Detach every edge before releasing native owners (which may
+ * run destructors). The request/worker retain their own independent references;
+ * taking a result never constitutes a completion or cleanup acknowledgement. */
+static PyObject *python_actor_take_exception(PyObject *self, PyObject *value) {
+    (void)self;
+    if (PyInterpreterState_GetID(PyInterpreterState_Get()) != 0) {
+        PyErr_SetString(PyExc_RuntimeError, "Actors require the main interpreter");
+        return NULL;
+    }
+    local_object_t *ref = PyCapsule_GetPointer(value, LOCAL_OBJECT_CAPSULE);
+    if (ref == NULL) return NULL;
+    if (ref->value == NULL || !PyExceptionInstance_Check(ref->value)) {
+        PyErr_SetString(PyExc_TypeError, "Expected an unconsumed retained exception");
+        return NULL;
+    }
+    PyObject *error = ref->value;
+    py_context_t *ctx = ref->ctx;
+    py_env_resource_t *env = ref->env;
+    ref->value = NULL;
+    ref->ctx = NULL;
+    ref->env = NULL;
+    atomic_fetch_sub(&local_object_value_count, 1);
+    if (env != NULL) {
+        atomic_fetch_sub(&local_object_env_count, 1);
+        enif_release_resource(env);
+    }
+    if (ctx != NULL) {
+        atomic_fetch_sub(&local_object_context_count, 1);
+        enif_release_resource(ctx);
+    }
+    return error;
 }
 
 static ERL_NIF_TERM python_actor_to_term(ErlNifEnv *env, PyObject *value) {
@@ -69,6 +123,10 @@ static PyObject *python_actor_from_term(ErlNifEnv *env, ERL_NIF_TERM term) {
 static void local_object_destructor(ErlNifEnv *env, void *resource) {
     (void)env;
     local_object_t *ref = resource;
+    atomic_fetch_sub(&local_object_count, 1);
+    if (ref->value != NULL) atomic_fetch_sub(&local_object_value_count, 1);
+    if (ref->ctx != NULL) atomic_fetch_sub(&local_object_context_count, 1);
+    if (ref->env != NULL) atomic_fetch_sub(&local_object_env_count, 1);
     /* Only main-interpreter references can be constructed. A context resource
      * is retained for identity, not kept running after explicit destruction. */
     if (ref->value != NULL && runtime_is_running()) {
@@ -92,6 +150,10 @@ static ERL_NIF_TERM local_object_result(py_context_t *ctx, py_env_resource_t *en
     ref->value = value;
     ref->ctx = ctx;
     ref->env = env;
+    atomic_fetch_add(&local_object_count, 1);
+    atomic_fetch_add(&local_object_value_count, 1);
+    atomic_fetch_add(&local_object_context_count, 1);
+    atomic_fetch_add(&local_object_env_count, 1);
     enif_keep_resource(ctx);
     enif_keep_resource(env);
     ERL_NIF_TERM term = enif_make_resource(ctx->shared_env, ref);
@@ -104,6 +166,10 @@ static local_object_t *local_object_get(py_context_t *ctx, ERL_NIF_TERM term) {
     if (!enif_get_resource(ctx->shared_env, term, LOCAL_OBJECT_RESOURCE_TYPE,
                            (void **)&ref)) {
         PyErr_SetString(PyExc_TypeError, "Expected a retained local object reference");
+        return NULL;
+    }
+    if (ref->value == NULL) {
+        PyErr_SetString(PyExc_RuntimeError, "Retained result was already transferred");
         return NULL;
     }
     if (ref->ctx != NULL && ref->ctx != ctx) {

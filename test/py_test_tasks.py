@@ -1,7 +1,49 @@
 import asyncio
+import gc
+import weakref
 
 import erlang
 from erlang.tasks import Body, UncertainInflight, dispose, open_group, outcome, shutdown, start
+
+
+async def retained_exception_lifecycle() -> bool:
+    class OriginalError(Exception):
+        pass
+
+    for _ in range(3):
+        gc.collect()
+        await erlang.async_call("task_test_collect")
+        await asyncio.sleep(0.01)
+    baseline = erlang._actor_retained_object_stats()
+
+    async def scenario() -> weakref.ReferenceType[OriginalError]:
+        original = OriginalError("retained task failure")
+        weak = weakref.ref(original)
+
+        async def fail(payload: bytes) -> bytes:
+            raise original
+
+        group, gate = await open_group(1, 100)
+        pid = await start(group, gate, lambda: Body(fail), b"work")
+        success, error = await outcome(group, pid)
+        assert success is False and error is original
+        assert error.__traceback__ is not None
+        await shutdown(group, 1000)
+        await dispose(group)
+        return weak
+
+    for _ in range(3):
+        weak = await scenario()
+        for _ in range(20):
+            gc.collect()
+            await erlang.async_call("task_test_collect")
+            await asyncio.sleep(0.01)
+            if weak() is None and erlang._actor_retained_object_stats() == baseline:
+                break
+        assert weak() is None
+        stats = erlang._actor_retained_object_stats()
+        assert stats == baseline, (baseline, stats)
+    return True
 
 
 def unstarted_body() -> Body:

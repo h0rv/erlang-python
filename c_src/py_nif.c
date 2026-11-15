@@ -258,6 +258,8 @@ static int is_inline_schedule_marker(PyObject *obj);
 #include "py_mem_limit.c"
 static PyObject *python_actor_retain(PyObject *self, PyObject *value);
 static PyObject *python_actor_unwrap(PyObject *self, PyObject *value);
+static PyObject *python_actor_take_exception(PyObject *self, PyObject *value);
+static PyObject *python_actor_retained_object_stats(PyObject *self, PyObject *unused);
 static ERL_NIF_TERM python_actor_to_term(ErlNifEnv *env, PyObject *value);
 static ERL_NIF_TERM actor_data_to_term(ErlNifEnv *env, PyObject *value);
 static PyObject *actor_data_from_term(ErlNifEnv *env, ERL_NIF_TERM value);

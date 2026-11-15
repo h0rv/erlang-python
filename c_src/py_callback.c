@@ -3555,6 +3555,10 @@ static PyMethodDef ErlangModuleMethods[] = {
     {"_actor_complete", python_actor_complete, METH_O, "Acknowledge actual data dispatch completion."},
     {"_actor_retain", python_actor_retain, METH_O, "Retain a main-interpreter object."},
     {"_actor_unwrap", python_actor_unwrap, METH_O, "Recover a retained Python object."},
+    {"_actor_retained_object_stats", python_actor_retained_object_stats, METH_NOARGS,
+     "Snapshot retained resources and their Python value, context and environment edges."},
+    {"_actor_take_exception", python_actor_take_exception, METH_O,
+     "Transfer a terminal task exception exactly once, without retaining its traceback."},
     {"_get_async_callback_fd", get_async_callback_fd, METH_NOARGS,
      "Get the file descriptor for async callback responses.\n"
      "Used internally by async_call() to register with asyncio."},
