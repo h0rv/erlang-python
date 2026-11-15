@@ -37,7 +37,9 @@ import threading
 import time
 from asyncio import events, futures, tasks, transports
 from collections import deque
+from collections.abc import AsyncGenerator
 from typing import Any, Callable, Optional, Tuple
+from weakref import WeakSet
 
 from ._mode import detect_mode, ExecutionMode
 
@@ -94,6 +96,7 @@ class ErlangEventLoop(asyncio.AbstractEventLoop):
         '_callback_id',
         '_cached_time',  # uvloop-style time caching to avoid syscalls
         '_wake_pending',  # coalesced wakeup flag for call_soon_threadsafe
+        '_asyncgens', '_managed_shutdown_requested',
     )
 
     def __init__(self, capsule=None):
@@ -223,6 +226,8 @@ class ErlangEventLoop(asyncio.AbstractEventLoop):
 
         # Callback ID counter
         self._callback_id = 0
+        self._asyncgens: WeakSet[AsyncGenerator[object]] = WeakSet()
+        self._managed_shutdown_requested = False
 
     def _next_id(self):
         """Generate a unique callback ID for this loop."""
@@ -253,11 +258,17 @@ class ErlangEventLoop(asyncio.AbstractEventLoop):
 
         # Register as the running loop
         old_running_loop = events._get_running_loop()
+        old_asyncgen_hooks = sys.get_asyncgen_hooks()
+        sys.set_asyncgen_hooks(
+            firstiter=self._asyncgen_firstiter_hook,
+            finalizer=self._asyncgen_finalizer_hook,
+        )
         events._set_running_loop(self)
         try:
             while not self._stopping:
                 self._run_once()
         finally:
+            sys.set_asyncgen_hooks(*old_asyncgen_hooks)
             events._set_running_loop(old_running_loop)
             self._stopping = False
             self._running = False
@@ -383,15 +394,25 @@ class ErlangEventLoop(asyncio.AbstractEventLoop):
                 pass
         self._loop_capsule = None
 
-    async def shutdown_asyncgens(self):
-        """Shutdown all active asynchronous generators.
+    def _asyncgen_firstiter_hook(self, generator: AsyncGenerator[object]) -> None:
+        self._asyncgens.add(generator)
 
-        Note: This is a no-op in ErlangEventLoop. Async generators are
-        managed by Python's garbage collector. For proper cleanup, ensure
-        async generators are explicitly closed or exhausted before loop shutdown.
-        """
-        # No-op: we don't track async generators to avoid global hook issues
-        pass
+    def _asyncgen_finalizer_hook(self, generator: AsyncGenerator[object]) -> None:
+        self._asyncgens.discard(generator)
+        if not self.is_closed():
+            self.call_soon_threadsafe(self.create_task, generator.aclose())
+
+    async def shutdown_asyncgens(self) -> None:
+        generators = tuple(self._asyncgens)
+        self._asyncgens.clear()
+        closing = [self.create_task(generator.aclose()) for generator in generators]
+        if not closing:
+            return
+        await asyncio.wait(closing)
+        errors = [task.exception() for task in closing if not task.cancelled()]
+        failures = [error for error in errors if error is not None]
+        if failures:
+            raise BaseExceptionGroup("Asynchronous generator cleanup failed", failures)
 
     async def shutdown_default_executor(self, timeout=None):
         """Shutdown the default executor."""

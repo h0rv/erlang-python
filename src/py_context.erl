@@ -609,10 +609,10 @@ start_loop(Ctx, Opts) when is_pid(Ctx), is_map(Opts) ->
 
 %% @doc Stop a loop started with start_loop/1,2.
 %%
-%% Asks the loop to stop from inside (a coroutine calling `loop.stop()'),
-%% then interrupts the thread if it has not exited after Grace ms (default
-%% 5000). Returns `ok' once the loop has exited, `{error, no_loop}' when none
-%% is running, `{error, timeout}' if it survived the interrupt too.
+%% Cancels and awaits this managed loop's tasks and resource cleanup before
+%% closing it. Returns `ok' only after a normal driver exit within Grace ms
+%% (default 5000), `{error, no_loop}' when none is running, or an error on
+%% timeout or failed cleanup. A timeout leaves live work and the loop intact.
 -spec stop_loop(context()) -> ok | {error, term()}.
 stop_loop(Ctx) ->
     stop_loop(Ctx, 5000).
