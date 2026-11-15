@@ -184,6 +184,7 @@ static PyObject *local_object_apply(py_context_t *ctx, const ERL_NIF_TERM *parts
             : PyObject_CallMethod(module, "_outcome", "O", value);
         Py_XDECREF(module);
         PyObject *asyncio = wrapped == NULL ? NULL : PyImport_ImportModule("asyncio");
+        bool submission_attempted = asyncio != NULL;
         PyObject *future = asyncio == NULL ? NULL : PyObject_CallMethod(
             asyncio, "run_coroutine_threadsafe", "OO", wrapped, loop->py_loop);
         Py_XDECREF(asyncio);
@@ -200,14 +201,17 @@ static PyObject *local_object_apply(py_context_t *ctx, const ERL_NIF_TERM *parts
             PyErr_SetString(PyExc_RuntimeError, "Invalid actor outcome");
         }
         Py_XDECREF(outcome);
-        if (future == NULL && wrapped != NULL) {
+        if (!submission_attempted && wrapped != NULL) {
             PyObject *error = PyErr_GetRaisedException();
             PyObject *closed = PyObject_CallMethod(wrapped, "close", NULL);
             Py_XDECREF(closed);
             PyErr_SetRaisedException(error);
         }
         Py_XDECREF(wrapped);
-        if (result == NULL) {
+        /* A submission error may occur after a factory scheduled the real
+         * task. Closing its coroutine would interrupt live async finalizers.
+         * The task owner must retain credit until completion or sealed reap. */
+        if (result == NULL && !submission_attempted) {
             PyObject *error = PyErr_GetRaisedException();
             PyObject *closed = PyObject_CallMethod(value, "close", NULL);
             Py_XDECREF(closed);

@@ -164,6 +164,8 @@ handle_info({async_callback, CallbackId, FuncName, Args, WriteFd}, State0) ->
             case {FuncName, Args} of
                 {<<"_actor_data_call">>, {_, _, Ticket, _}} ->
                     py_nif:actor_ticket_reject(Ticket);
+                {<<"_task_start">>, {_, _, Ticket, _, _}} ->
+                    py_nif:actor_ticket_reject(Ticket);
                 _ -> ok
             end,
             Writer ! {overflow, CallbackId};
@@ -266,7 +268,8 @@ handle_thread_callback(WriteFd, CallbackId, FuncName, Args) ->
 %% Used by async_writer_loop (and indirectly by handle_thread_callback
 %% via the same encoding shape — the sync path keeps its own copy
 %% close to the write call site).
-run_async_callback(<<"_actor_", _/binary>> = FuncName, Args) ->
+run_async_callback(<<Prefix:6/binary, _/binary>> = FuncName, Args)
+  when Prefix =:= <<"_actor">>; Prefix =:= <<"_task_">> ->
     ArgsList = case Args of
         T when is_tuple(T) -> tuple_to_list(T);
         L when is_list(L) -> L

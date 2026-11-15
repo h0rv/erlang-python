@@ -78,7 +78,7 @@
 ]).
 
 %% Internal exports
--export([kill/1, pass_fd/2, child_info/1]).
+-export([kill/1, pass_fd/2, child_info/1, reap_dead/2]).
 
 -export([init/3, init/4, init_ref_tab/0]).
 %% Used by py_context_embedded
@@ -199,6 +199,20 @@ new(Opts) when is_map(Opts) ->
 -spec destroy(context()) -> ok.
 destroy(Ctx) ->
     stop(Ctx).
+
+%% Internal owner cleanup after independent proof that Python work ended,
+%% or that an unstarted body was sealed against execution. A dead context PID
+%% alone does not authorize releasing its native state.
+reap_dead(Ctx, Ref) when is_pid(Ctx) ->
+    case is_process_alive(Ctx) of
+        true -> {error, context_alive};
+        false ->
+            ok = py_nif:context_destroy(Ref),
+            case py_nif:context_cleanup_status(Ref) of
+                clean -> ets:delete_object(?REF_TAB, {Ctx, Ref}), clean;
+                Status -> Status
+            end
+    end.
 
 %% @doc Call a Python function with empty kwargs.
 %%

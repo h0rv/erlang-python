@@ -1,6 +1,7 @@
 /* Included by py_nif.c. Shares the LoopRef admission counter implementation.
  * Ticket lock precedes gate lock. No Python execution occurs under either. */
-typedef enum { ACTOR_RESERVED, ACTOR_ENQUEUED, ACTOR_COMMITTED, ACTOR_ABORTED, ACTOR_COMPLETE } actor_ticket_state;
+typedef enum { ACTOR_RESERVED, ACTOR_ENQUEUED, ACTOR_COMMITTED, ACTOR_ABORTED,
+               ACTOR_COMPLETE, TASK_REAPED } actor_ticket_state;
 typedef struct {
     pthread_mutex_t mutex;
     bool mutex_initialized;
@@ -92,6 +93,51 @@ static ERL_NIF_TERM nif_actor_gate_info(ErlNifEnv *env, int argc, const ERL_NIF_
         enif_make_uint64(env, unsettled), &result);
     return result;
 }
+static ERL_NIF_TERM nif_actor_gate_close(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
+    work_admission_t *gate;
+    if (!enif_get_resource(env, argv[0], WORK_ADMISSION_RESOURCE_TYPE, (void **)&gate))
+        return enif_make_badarg(env);
+    work_admission_close(gate);
+    return ATOM_OK;
+}
+static ERL_NIF_TERM nif_actor_ticket_info(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
+    actor_ticket_t *ticket;
+    if (!enif_get_resource(env, argv[0], ACTOR_TICKET_RESOURCE_TYPE, (void **)&ticket))
+        return enif_make_badarg(env);
+    const char *states[] = {"reserved", "enqueued", "committed", "aborted", "complete", "reaped"};
+    pthread_mutex_lock(&ticket->mutex);
+    ERL_NIF_TERM result = enif_make_atom(env, states[ticket->state]);
+    pthread_mutex_unlock(&ticket->mutex);
+    return result;
+}
+/* The task owner must first seal an unstarted Body under its Python lock.
+ * Native cleanup ACK then proves that this context cannot dispatch it later.
+ * Ordinary completion is still owned exclusively by execute's finally block. */
+static ERL_NIF_TERM nif_task_ticket_reap(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
+    actor_ticket_t *ticket;
+    py_context_t *ctx;
+    if (!enif_get_resource(env, argv[0], ACTOR_TICKET_RESOURCE_TYPE, (void **)&ticket) ||
+        !enif_get_resource(env, argv[1], PY_CONTEXT_RESOURCE_TYPE, (void **)&ctx))
+        return enif_make_badarg(env);
+    if (!atomic_load(&ctx->cleanup_complete)) return make_error(env, "context_cleanup_unacknowledged");
+    pthread_mutex_lock(&ticket->mutex);
+    const char *error = NULL;
+    if (ticket->state == ACTOR_COMMITTED) {
+        ticket->state = TASK_REAPED;
+        pthread_mutex_lock(&ticket->gate->mutex);
+        ticket->gate->unsettled--;
+        pthread_mutex_unlock(&ticket->gate->mutex);
+        work_ticket_dispose(ticket->work);
+        ticket->work = NULL;
+    } else if (ticket->state != ACTOR_COMPLETE && ticket->state != TASK_REAPED) {
+        error = "ticket_not_committed";
+    }
+    pthread_mutex_unlock(&ticket->mutex);
+    return error == NULL ? ATOM_OK : make_error(env, error);
+}
 static ERL_NIF_TERM nif_actor_ticket_commit(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     (void)argc;
     actor_ticket_t *ticket;
@@ -142,8 +188,8 @@ static ERL_NIF_TERM nif_actor_ticket_reject(ErlNifEnv *env, int argc, const ERL_
     actor_ticket_reject(ticket);
     return ATOM_OK;
 }
-static int actor_data_prepare(ErlNifEnv *env, PyObject *args) {
-    if (PyTuple_Size(args) != 4) {
+static int actor_data_prepare(ErlNifEnv *env, PyObject *args, Py_ssize_t arity) {
+    if (PyTuple_Size(args) != arity) {
         PyErr_SetString(PyExc_TypeError, "Expected destination, gate, ticket, bytes");
         return -1;
     }
@@ -236,6 +282,10 @@ static PyObject *python_actor_complete(PyObject *self, PyObject *capsule) {
     actor_ticket_t *ticket = PyCapsule_GetPointer(capsule, ACTOR_TICKET_CAPSULE);
     if (ticket == NULL) return NULL;
     pthread_mutex_lock(&ticket->mutex);
+    if (ticket->state == TASK_REAPED) {
+        pthread_mutex_unlock(&ticket->mutex);
+        Py_RETURN_NONE;
+    }
     if (ticket->state != ACTOR_COMMITTED) {
         pthread_mutex_unlock(&ticket->mutex);
         PyErr_SetString(PyExc_RuntimeError, "ticket_not_committed");

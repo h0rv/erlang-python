@@ -264,7 +264,7 @@ static PyObject *actor_data_from_term(ErlNifEnv *env, ERL_NIF_TERM value);
 static PyObject *python_actor_reserve(PyObject *self, PyObject *args);
 static PyObject *python_actor_abort(PyObject *self, PyObject *value);
 static PyObject *python_actor_complete(PyObject *self, PyObject *value);
-static int actor_data_prepare(ErlNifEnv *env, PyObject *args);
+static int actor_data_prepare(ErlNifEnv *env, PyObject *args, Py_ssize_t arity);
 static void actor_data_send_failed(PyObject *args);
 static PyObject *python_actor_from_term(ErlNifEnv *env, ERL_NIF_TERM term);
 
@@ -3562,6 +3562,7 @@ static ERL_NIF_TERM nif_context_create(ErlNifEnv *env, int argc, const ERL_NIF_T
     ctx->interp_id = atomic_fetch_add(&g_context_id_counter, 1);
     ctx->is_subinterp = use_owngil;
     atomic_store(&ctx->destroyed, false);
+    atomic_store(&ctx->cleanup_complete, false);
     atomic_store(&ctx->leaked, false);
     atomic_store(&ctx->init_error, false);
     ctx->has_callback_handler = false;
@@ -3803,13 +3804,11 @@ static ERL_NIF_TERM nif_context_destroy(ErlNifEnv *env, int argc, const ERL_NIF_
         return make_error(env, "invalid_context");
     }
 
-    /* Skip if already destroyed */
-    if (atomic_load(&ctx->destroyed)) {
+    /* Exactly one caller owns shutdown, even after a context PID was killed
+     * during its dirty NIF. Destroyed alone is not a cleanup acknowledgement. */
+    if (atomic_exchange(&ctx->destroyed, true)) {
         return ATOM_OK;
     }
-
-    /* Mark as destroyed early to prevent new operations */
-    atomic_store(&ctx->destroyed, true);
 
 #ifdef HAVE_SUBINTERPRETERS
     /* OWN_GIL mode: shutdown the dedicated thread */
@@ -3831,6 +3830,7 @@ static ERL_NIF_TERM nif_context_destroy(ErlNifEnv *env, int argc, const ERL_NIF_
             }
         }
         atomic_fetch_add(&g_counters.ctx_destroyed, 1);
+        atomic_store(&ctx->cleanup_complete, !atomic_load(&ctx->leaked));
         return ATOM_OK;
     }
 #endif
@@ -3851,12 +3851,25 @@ static ERL_NIF_TERM nif_context_destroy(ErlNifEnv *env, int argc, const ERL_NIF_
             }
         }
         atomic_fetch_add(&g_counters.ctx_destroyed, 1);
+        atomic_store(&ctx->cleanup_complete, !atomic_load(&ctx->leaked));
         return ATOM_OK;
     }
 
     /* Every context created by nif_context_create has a thread */
     atomic_fetch_add(&g_counters.ctx_destroyed, 1);
+    atomic_store(&ctx->cleanup_complete, true);
     return ATOM_OK;
+}
+
+static ERL_NIF_TERM nif_context_cleanup_status(ErlNifEnv *env, int argc,
+                                               const ERL_NIF_TERM argv[]) {
+    (void)argc;
+    py_context_t *ctx;
+    if (!enif_get_resource(env, argv[0], PY_CONTEXT_RESOURCE_TYPE, (void **)&ctx))
+        return enif_make_badarg(env);
+    if (atomic_load(&ctx->cleanup_complete)) return enif_make_atom(env, "clean");
+    if (atomic_load(&ctx->leaked)) return enif_make_atom(env, "uncertain");
+    return enif_make_atom(env, "pending");
 }
 
 /**
@@ -6061,10 +6074,14 @@ static ErlNifFunc nif_funcs[] = {
     {"context_call", 6, nif_context_call_with_env, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"context_call_async", 7, nif_context_call_async, 0},
     {"local_object_async", 5, nif_local_object_async, 0},
+    {"context_cleanup_status", 1, nif_context_cleanup_status, 0},
     {"actor_gate_new", 2, nif_actor_gate_new, 0},
     {"actor_gate_info", 1, nif_actor_gate_info, 0},
+    {"actor_gate_close", 1, nif_actor_gate_close, 0},
+    {"actor_ticket_info", 1, nif_actor_ticket_info, 0},
     {"actor_ticket_commit", 3, nif_actor_ticket_commit, 0},
     {"actor_ticket_reject", 1, nif_actor_ticket_reject, 0},
+    {"task_ticket_reap", 2, nif_task_ticket_reap, 0},
     {"context_eval_async", 5, nif_context_eval_async, 0},
     {"context_exec_async", 4, nif_context_exec_async, 0},
     {"context_call_with_env_async", 8, nif_context_call_with_env_async, 0},

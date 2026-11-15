@@ -2565,8 +2565,9 @@ static PyObject *send_async_callback_request(PyObject *self, PyObject *args) {
 
     /* Data actor credits cover this generic queue too. Transfer ownership
      * before copying payload bytes into the callback message environment. */
-    bool actor_data = strcmp(func_name, "_actor_data_call") == 0;
-    if (actor_data && actor_data_prepare(msg_env, call_args) < 0) {
+    bool task_start = strcmp(func_name, "_task_start") == 0;
+    bool actor_data = strcmp(func_name, "_actor_data_call") == 0 || task_start;
+    if (actor_data && actor_data_prepare(msg_env, call_args, task_start ? 5 : 4) < 0) {
         enif_free_env(msg_env);
         return NULL;
     }
@@ -3974,6 +3975,7 @@ static int create_erlang_module(void) {
         "        erlang.server = _erlang_impl.server\n"
         "        erlang.supervision = _erlang_impl.supervision\n"
         "        erlang.actors = _erlang_impl.actors\n"
+        "        erlang.tasks = _erlang_impl.tasks\n"
         "        erlang._run_loop_forever = _erlang_impl._run_loop_forever\n"
         "        erlang._stop_loop = _erlang_impl._stop_loop\n"
         "        # Make erlang behave as a package for 'import erlang.reactor' syntax\n"
@@ -3984,6 +3986,7 @@ static int create_erlang_module(void) {
         "        sys.modules['erlang.server'] = erlang.server\n"
         "        sys.modules['erlang.supervision'] = erlang.supervision\n"
         "        sys.modules['erlang.actors'] = erlang.actors\n"
+        "        sys.modules['erlang.tasks'] = erlang.tasks\n"
         "        return True\n"
         "    except ImportError as e:\n"
         "        import sys\n"
