@@ -183,6 +183,76 @@ def test_generation_state_graph() -> None:
     print("Generation state graph checked; context-DOWN-only restart rejected")
 
 
+@dataclass(frozen=True, slots=True)
+class TemporaryChild:
+    generation: int = 1
+    actor_alive: bool = True
+    context_alive: bool = True
+    unsettled: bool = True
+    otp_present: bool = True
+    registered: bool = True
+
+    def finished(self) -> bool:
+        return not (
+            self.actor_alive or self.context_alive or self.unsettled or self.otp_present
+        )
+
+
+def temporary_graph(
+    *, leak_slot: bool = False, early_reap: bool = False, stale_down: bool = False
+) -> tuple[set[TemporaryChild], bool]:
+    seen = {TemporaryChild()}
+    pending = deque(seen)
+    while pending:
+        state = pending.popleft()
+        if not state.registered and not state.finished():
+            return seen, False
+        choices = {
+            state,
+            replace(state, actor_alive=False),
+            replace(state, actor_alive=False, context_alive=False),
+            replace(state, unsettled=False),
+        }
+        if not state.actor_alive:
+            choices.add(replace(state, otp_present=False))
+        if not leak_slot and (
+            state.finished() or (early_reap and not state.otp_present)
+        ):
+            choices.add(replace(state, registered=False))
+        # Every fully finished temporary generation must have an enabled
+        # reclaim transition, not require an explicit stop or group close.
+        if (
+            state.registered
+            and state.finished()
+            and replace(state, registered=False) not in choices
+        ):
+            return seen, False
+        if not state.registered and state.generation < 3:
+            choices.add(TemporaryChild(generation=state.generation + 1))
+        if stale_down and state.generation > 1:
+            choices.add(replace(state, registered=False))
+        for candidate in choices - seen:
+            seen.add(candidate)
+            pending.append(candidate)
+    return seen, True
+
+
+def test_temporary_lifecycle_graph() -> None:
+    states, safe = temporary_graph()
+    assert safe
+    assert any(state.generation == 3 for state in states)
+    assert any(not state.registered for state in states)
+    assert not temporary_graph(leak_slot=True)[1]
+    assert not temporary_graph(early_reap=True)[1]
+    assert not temporary_graph(stale_down=True)[1]
+    print(
+        "Temporary lifecycle checked:",
+        len(states),
+        "states; 3 negative controls rejected",
+    )
+
+
 if __name__ == "__main__":
     test_admission_state_graph()
     test_generation_state_graph()
+    test_temporary_lifecycle_graph()

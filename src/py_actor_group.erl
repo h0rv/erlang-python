@@ -40,9 +40,12 @@ init(Max) when is_integer(Max), Max > 0 ->
     ok = py_actor_registry:watch(self()),
     {ok, Sup} = py_supervision:start_link(#{strategy => one_for_one,
         intensity => 5, period => 10, mailbox => bounded, max_children => Max}),
-    {ok, #{sup => Sup, max => Max, ids => []}}.
+    {ok, #{sup => Sup, max => Max, ids => [], temporary => #{}}}.
 
-handle_call({spawn, Id, Factory, Count, Bytes, Restart}, _From,
+handle_call(Request, From, State) ->
+    handle_request(Request, From, reap_finished(State)).
+
+handle_request({spawn, Id, Factory, Count, Bytes, Restart}, _From,
             #{sup := Sup, max := Max, ids := Ids} = State)
   when is_binary(Id), is_integer(Count), Count > 0, is_integer(Bytes), Bytes > 0,
        (Restart =:= <<"permanent">> orelse Restart =:= <<"transient">> orelse Restart =:= <<"temporary">>) ->
@@ -56,25 +59,84 @@ handle_call({spawn, Id, Factory, Count, Bytes, Restart}, _From,
                          [self(), Id, Factory, Count, Bytes]},
                      restart => Policy, shutdown => infinity},
             case supervisor:start_child(Sup, Spec) of
-                {ok, _Pid} -> {reply, resolve(self(), Id), State#{ids := [Id | Ids]}};
+                {ok, Pid} ->
+                    Next = track_temporary(Id, Pid, Policy, State#{ids := [Id | Ids]}),
+                    {reply, resolve(self(), Id), Next};
                 Error -> {reply, Error, State}
             end
     end;
-handle_call({stop, Id}, _From, #{sup := Sup, ids := Ids} = State) ->
+handle_request({stop, Id}, _From, #{sup := Sup} = State) ->
     case supervisor:terminate_child(Sup, Id) of
         ok ->
-            ok = supervisor:delete_child(Sup, Id),
-            case ets:lookup(py_actor_generations, {self(), Id}) of
-                [{_, _, _, Gate, Ctx}] -> wait_context(Ctx), wait_completion(Gate);
-                [] -> ok
+            %% OTP removes temporary specs itself, including explicit stops.
+            case supervisor:delete_child(Sup, Id) of
+                ok -> ok;
+                {error, not_found} -> ok
             end,
-            ets:delete(py_actor_generations, {self(), Id}),
-            {reply, {ok, stopped}, State#{ids := lists:delete(Id, Ids)}};
+            finish_stop(Id, State);
+        {error, not_found} -> finish_stop(Id, State);
         Error -> {reply, Error, State}
     end;
-handle_call({resolve, Id}, _From, State) ->
+handle_request({resolve, Id}, _From, State) ->
     {reply, resolve(self(), Id), State};
-handle_call(_, _From, State) -> {reply, {error, invalid_request}, State}.
+handle_request(_, _From, State) -> {reply, {error, invalid_request}, State}.
+
+track_temporary(Id, Pid, temporary, #{temporary := Temporary} = State) ->
+    [{_, Pid, Generation, _, _}] = ets:lookup(py_actor_generations, {self(), Id}),
+    monitor(process, Pid, [{tag, {temporary, Id, Generation}}]),
+    State#{temporary := Temporary#{Id => Generation}};
+track_temporary(_Id, _Pid, _Policy, State) -> State.
+
+finish_stop(Id, State) ->
+    case ets:lookup(py_actor_generations, {self(), Id}) of
+        [Snapshot = {_, _, _, Gate, Ctx}] ->
+            wait_context(Ctx), wait_completion(Gate),
+            ets:delete_object(py_actor_generations, Snapshot);
+        [] -> ok
+    end,
+    {reply, {ok, stopped}, forget_child(Id, State)}.
+
+forget_child(Id, #{ids := Ids, temporary := Temporary} = State) ->
+    State#{ids := lists:delete(Id, Ids), temporary := maps:remove(Id, Temporary)}.
+
+%% A missing OTP spec alone is not a free slot: its owned context or Python
+%% effect may still be draining. Check all three before quota or duplicate-ID
+%% admission. Permanent/transient specs retain their existing OTP lifecycle.
+reap_finished(#{temporary := Temporary} = State) ->
+    maps:fold(fun reap_finished/3, State, Temporary).
+
+reap_finished(Id, Generation, #{sup := Sup} = State) ->
+    case ets:lookup(py_actor_generations, {self(), Id}) of
+        [Snapshot = {_, Pid, Generation, Gate, Ctx}] ->
+            case not is_process_alive(Pid) andalso not is_process_alive(Ctx) of
+                true ->
+                    case py_nif:actor_gate_info(Gate) of
+                        #{unsettled := 0} ->
+                            case lists:keymember(Id, 1, supervisor:which_children(Sup)) of
+                                false ->
+                                    ets:delete_object(py_actor_generations, Snapshot),
+                                    forget_child(Id, State);
+                                true -> State
+                            end;
+                        _ -> State
+                    end;
+                false -> State
+            end;
+        _ -> State
+    end.
+
+reap_later(Id, Generation, #{temporary := Temporary} = State) ->
+    case maps:find(Id, Temporary) of
+        {ok, Generation} ->
+            Next = reap_finished(Id, Generation, State),
+            case maps:find(Id, maps:get(temporary, Next)) of
+                {ok, Generation} ->
+                    erlang:send_after(10, self(), {reap_temporary, Id, Generation});
+                _ -> ok
+            end,
+            {noreply, Next};
+        _ -> {noreply, State}
+    end.
 
 resolve(Group, Id) ->
     case ets:lookup(py_actor_generations, {Group, Id}) of
@@ -110,6 +172,10 @@ wait_context(Ctx) ->
 
 handle_cast(_, State) -> {noreply, State}.
 handle_info({'EXIT', Sup, Reason}, #{sup := Sup} = State) -> {stop, Reason, State};
+handle_info({{temporary, Id, Generation}, _Mon, process, _Pid, _Reason}, State) ->
+    reap_later(Id, Generation, State);
+handle_info({reap_temporary, Id, Generation}, State) ->
+    reap_later(Id, Generation, State);
 handle_info(_, State) -> {noreply, State}.
 terminate(_, #{sup := Sup, ids := Ids}) ->
     unlink(Sup),

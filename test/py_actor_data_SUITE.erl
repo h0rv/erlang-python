@@ -23,7 +23,9 @@ state_graphs(_) -> with_context(fun(Ctx) ->
     {ok, _} = py_context:call(Ctx, test_actor_admission_model,
         test_admission_state_graph, [], #{}),
     {ok, _} = py_context:call(Ctx, test_actor_admission_model,
-        test_generation_state_graph, [], #{})
+        test_generation_state_graph, [], #{}),
+    {ok, _} = py_context:call(Ctx, test_actor_admission_model,
+        test_temporary_lifecycle_graph, [], #{})
 end).
 
 basic(_) -> with_context(fun(Ctx) ->
