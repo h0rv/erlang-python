@@ -10,7 +10,14 @@ from unittest.mock import patch
 import pytest
 
 with patch.dict(sys.modules, {"erlang": ModuleType("erlang")}):
-    from _erlang_impl._fd import FdRetirementError, parse_fd_retirement
+    from _erlang_impl._fd import (
+        FdCallback,
+        FdPublication,
+        FdPublicationPhase,
+        FdRetirementError,
+        FdWatcher,
+        parse_fd_retirement,
+    )
     from _erlang_impl._loop import (
         EVENT_TYPE_READ,
         ErlangEventLoop,
@@ -274,3 +281,303 @@ def test_recv_does_not_publish_success_when_retirement_fails() -> None:
 def test_retirement_boundary_rejects_the_old_ambiguous_none_result() -> None:
     with pytest.raises(ValueError):
         parse_fd_retirement(None)
+
+
+class PublicationFailure[V](dict[int, V]):
+    def __init__(
+        self,
+        source: dict[int, V] | None = None,
+        *,
+        after_write: bool = False,
+        persistent: bool = False,
+    ) -> None:
+        super().__init__({} if source is None else source)
+        self.fail = True
+        self.after_write = after_write
+        self.persistent = persistent
+
+    @override
+    def __setitem__(self, key: int, value: V) -> None:
+        if self.fail:
+            self.fail = self.persistent
+            if self.after_write:
+                super().__setitem__(key, value)
+            raise MemoryError("simulated Python dictionary publication failure")
+        super().__setitem__(key, value)
+
+
+class NoFallbackSet(set[int]):
+    @override
+    def add(self, value: int) -> None:
+        raise AssertionError("Failure handling must not allocate a fallback owner")
+
+
+@pytest.mark.parametrize("reading", [True, False])
+def test_old_publication_order_loses_reader_and_writer_key(reading: bool) -> None:
+    loop = ErlangEventLoop()
+    native = LeaseBoundary()
+    capsule = _MockLoopCapsule()
+    loop._loop_capsule = capsule
+    loop._pel = native
+    loop._fd_resources = PublicationFailure[int]()
+    left, right = socket.socketpair()
+    try:
+        fd = left.fileno()
+        # Exact e133 failure window: native returns before the first map write.
+        with pytest.raises(MemoryError):
+            if reading:
+                key = native._add_reader_for(capsule, fd, 1)
+            else:
+                key = native._add_writer_for(capsule, fd, 1)
+            loop._fd_resources[fd] = key
+        assert not loop._fd_resources and not loop._fd_retirement_failed
+        assert not loop._fd_publications and len(native.leases) == 1
+        # This deliberate negative-control fixture, not loop.close(), knows it.
+        for leaked_key in tuple(native.leases):
+            native._release_fd_resource(leaked_key)
+    finally:
+        loop.close()
+        native.finish()
+        left.close()
+        right.close()
+
+
+class PublicationBoundary(LeaseBoundary):
+    def __init__(self, loop: ErlangEventLoop) -> None:
+        super().__init__()
+        self.loop = loop
+        self.before_effect: FdPublication | None = None
+        self.update_called = False
+
+    def witness(self, fd: int) -> None:
+        publication = self.loop._fd_publications[fd]
+        assert publication.key == 0
+        assert publication.phase == FdPublicationPhase.PREPARED
+        self.before_effect = publication
+
+    @override
+    def _add_reader_for(
+        self,
+        capsule: _MockLoopCapsule,
+        fd: int,
+        callback_id: int,
+    ) -> int:
+        self.witness(fd)
+        return super()._add_reader_for(capsule, fd, callback_id)
+
+    @override
+    def _add_writer_for(
+        self,
+        capsule: _MockLoopCapsule,
+        fd: int,
+        callback_id: int,
+    ) -> int:
+        self.witness(fd)
+        return super()._add_writer_for(capsule, fd, callback_id)
+
+    @override
+    def _update_fd_read(self, fd_key: int, callback_id: int) -> None:
+        self.update_called = True
+        if self.failure == Failure.STOP:
+            raise RuntimeError("simulated uncertain native callback update")
+
+    @override
+    def _update_fd_write(self, fd_key: int, callback_id: int) -> None:
+        self.update_called = True
+        if self.failure == Failure.STOP:
+            raise RuntimeError("simulated uncertain native callback update")
+
+
+def register(loop: ErlangEventLoop, fd: int, *, reading: bool) -> None:
+    if reading:
+        loop.add_reader(fd, lambda: None)
+    else:
+        loop.add_writer(fd, lambda: None)
+
+
+@pytest.mark.parametrize("reading", [True, False])
+@pytest.mark.parametrize("rollback_fails", [True, False])
+@pytest.mark.parametrize("after_write", [True, False])
+def test_publication_slot_owns_native_key_before_mapping_and_failed_rollback(
+    reading: bool,
+    rollback_fails: bool,
+    after_write: bool,
+) -> None:
+    loop = ErlangEventLoop()
+    native = PublicationBoundary(loop)
+    loop._pel = native
+    loop._fd_resources = PublicationFailure[int](after_write=after_write)
+    loop._fd_retirement_failed = NoFallbackSet()
+    left, right = socket.socketpair()
+    try:
+        fd = left.fileno()
+        if rollback_fails:
+            native.failure = Failure.STOP
+        with pytest.raises(RuntimeError):
+            register(loop, fd, reading=reading)
+        publication = native.before_effect
+        assert publication is not None and publication.key > 0
+        if rollback_fails:
+            assert loop._fd_publications[fd] is publication
+            assert publication.phase == FdPublicationPhase.ROLLBACK_FAILED
+            assert publication.key in native.leases
+            os.fstat(native.leases[publication.key])
+            with pytest.raises(FdRetirementError):
+                loop._close_socket(left)
+            assert publication.closing_socket is left and left.fileno() == fd
+            assert loop._fd_publications[fd] is publication
+            native.failure = Failure.NONE
+            # close discovers the slot even if _fd_resources is still empty.
+            loop.close()
+            assert left.fileno() == -1
+        else:
+            assert not loop._fd_publications and not native.leases
+            assert not loop._fd_resources
+            assert publication.phase == FdPublicationPhase.RETIRED
+        assert not loop._fd_retirement_failed
+        assert not loop._callbacks_by_cid
+    finally:
+        native.failure = Failure.NONE
+        loop.close()
+        native.finish()
+        left.close()
+        right.close()
+
+
+@pytest.mark.parametrize("reading", [True, False])
+def test_other_direction_survives_python_publication_failure(reading: bool) -> None:
+    loop = ErlangEventLoop()
+    native = PublicationBoundary(loop)
+    loop._pel = native
+    left, right = socket.socketpair()
+    try:
+        fd = left.fileno()
+        register(loop, fd, reading=not reading)
+        key = loop._fd_resources[fd]
+        others = loop._writers if reading else loop._readers
+        original = others[fd]
+        if reading:
+            loop._readers = PublicationFailure[FdWatcher]()
+        else:
+            loop._writers = PublicationFailure[FdWatcher]()
+        with pytest.raises(RuntimeError):
+            register(loop, fd, reading=reading)
+        assert loop._fd_resources[fd] == key and key in native.leases
+        assert others[fd] == original
+        assert original[2] in loop._callbacks_by_cid
+        assert len(loop._callbacks_by_cid) == 1
+        assert not native.update_called and not native.pending
+        assert not loop._fd_publications
+    finally:
+        loop.close()
+        native.finish()
+        left.close()
+        right.close()
+
+
+@pytest.mark.parametrize("reading", [True, False])
+def test_shared_update_failure_quarantines_without_retiring_other_direction(
+    reading: bool,
+) -> None:
+    loop = ErlangEventLoop()
+    native = PublicationBoundary(loop)
+    loop._pel = native
+    left, right = socket.socketpair()
+    try:
+        fd = left.fileno()
+        register(loop, fd, reading=not reading)
+        key = loop._fd_resources[fd]
+        native.failure = Failure.STOP
+        with pytest.raises(FdRetirementError):
+            register(loop, fd, reading=reading)
+        assert key in native.leases and not native.pending
+        assert loop._fd_resources[fd] == key
+        publication = loop._fd_publications[fd]
+        assert publication.key == key
+        assert publication.phase == FdPublicationPhase.UPDATE_FAILED
+        with pytest.raises(FdRetirementError):
+            loop._close_socket(left)
+        assert publication.closing_socket is left and left.fileno() == fd
+        native.failure = Failure.NONE
+        loop.close()
+        assert not loop._readers and not loop._writers
+        assert not loop._callbacks_by_cid and not loop._fd_publications
+        assert left.fileno() == -1
+    finally:
+        native.failure = Failure.NONE
+        loop.close()
+        native.finish()
+        left.close()
+        right.close()
+
+
+def test_slot_publication_failure_precedes_native_effect() -> None:
+    loop = ErlangEventLoop()
+    native = PublicationBoundary(loop)
+    loop._pel = native
+    loop._fd_publications = PublicationFailure[FdPublication]()
+    left, right = socket.socketpair()
+    try:
+        with pytest.raises(MemoryError):
+            register(loop, left.fileno(), reading=True)
+        assert native.before_effect is None and not native.leases
+        assert not loop._fd_publications and not loop._fd_resources
+    finally:
+        loop.close()
+        native.finish()
+        left.close()
+        right.close()
+
+
+def test_failed_shared_restore_keeps_owner_and_blocks_queued_old_callback() -> None:
+    loop = ErlangEventLoop()
+    native = PublicationBoundary(loop)
+    loop._pel = native
+    left, right = socket.socketpair()
+    calls: list[str] = []
+    try:
+        fd = left.fileno()
+        loop.add_reader(fd, calls.append, "old")
+        old_id = loop._readers[fd][2]
+        key = loop._fd_resources[fd]
+        loop._dispatch(old_id, EVENT_TYPE_READ)
+        loop._readers = PublicationFailure[FdWatcher](
+            loop._readers,
+            after_write=True,
+            persistent=True,
+        )
+        with pytest.raises(MemoryError):
+            loop.add_reader(fd, calls.append, "replacement")
+        assert loop._fd_publications[fd].key == key
+        assert loop._fd_resources[fd] == key and key in native.leases
+        assert not native.update_called and not native.pending
+        loop._ready.popleft()._run()
+        assert calls == []
+        loop.close()
+        assert not loop._callbacks_by_cid and not loop._fd_publications
+    finally:
+        loop.close()
+        native.finish()
+        left.close()
+        right.close()
+
+
+@pytest.mark.parametrize("reading", [True, False])
+def test_callback_publication_failure_rolls_back_a_new_native_lease(
+    reading: bool,
+) -> None:
+    loop = ErlangEventLoop()
+    native = PublicationBoundary(loop)
+    loop._pel = native
+    loop._callbacks_by_cid = PublicationFailure[FdCallback]()
+    left, right = socket.socketpair()
+    try:
+        with pytest.raises(RuntimeError):
+            register(loop, left.fileno(), reading=reading)
+        assert not loop._fd_resources and not loop._fd_publications
+        assert not native.leases and len(native.pending) == 1
+    finally:
+        loop.close()
+        native.finish()
+        left.close()
+        right.close()
