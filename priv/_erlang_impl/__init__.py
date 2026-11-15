@@ -66,6 +66,7 @@ from . import _reactor as reactor
 from . import _channel as channel
 from . import _byte_channel as byte_channel
 from . import _server as server
+from _erlang_impl import _supervision as supervision
 from ._channel import Channel, reply, ChannelClosed
 from ._byte_channel import ByteChannel, ByteChannelClosed
 
@@ -90,6 +91,7 @@ __all__ = [
     'ByteChannel',
     'ByteChannelClosed',
     'server',
+    'supervision',
     'atom',
 ]
 
