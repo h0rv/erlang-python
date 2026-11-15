@@ -191,21 +191,23 @@ def _run_loop_forever(notify_pid=None):
             except Exception:
                 pass
         loop.call_soon(_started)
-    from _erlang_impl._lifecycle import shutdown_managed_loop
+    from _erlang_impl._lifecycle import begin_managed_shutdown, shutdown_managed_loop
 
     try:
         loop.run_forever()
     finally:
         loop._managed_shutdown_requested = True
-        errors: list[BaseException] = []
+        observer = begin_managed_shutdown(loop)
+        cleanup_failed = False
         try:
             while True:
-                errors.extend(loop.run_until_complete(shutdown_managed_loop(loop)))
-                if not asyncio.all_tasks(loop) and not loop._ready and not loop._asyncgens:
+                errors = loop.run_until_complete(shutdown_managed_loop(loop))
+                cleanup_failed = cleanup_failed or bool(errors)
+                if not observer.pending() and not loop._ready and not loop._asyncgens:
                     break
             loop.close()
-            if errors:
-                raise BaseExceptionGroup("Managed loop cleanup failed", errors)
+            if cleanup_failed or observer.failed:
+                raise RuntimeError("Managed loop cleanup failed") from None
         finally:
             asyncio.set_event_loop(None)
     return 'stopped'
@@ -217,6 +219,9 @@ async def _stop_loop():
     if not isinstance(loop, ErlangEventLoop):
         raise RuntimeError("Managed shutdown requires an ErlangEventLoop")
     if not loop._managed_shutdown_requested:
+        from _erlang_impl._lifecycle import begin_managed_shutdown
+
+        begin_managed_shutdown(loop)
         loop._managed_shutdown_requested = True
         loop.stop()
     return 'stopping'

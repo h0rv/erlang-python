@@ -38,8 +38,11 @@ import time
 from asyncio import events, futures, tasks, transports
 from collections import deque
 from collections.abc import AsyncGenerator
-from typing import Any, Callable, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Optional, Tuple
 from weakref import WeakSet
+
+if TYPE_CHECKING:
+    from _erlang_impl._lifecycle import ShutdownObserver
 
 from ._mode import detect_mode, ExecutionMode
 
@@ -96,7 +99,7 @@ class ErlangEventLoop(asyncio.AbstractEventLoop):
         '_callback_id',
         '_cached_time',  # uvloop-style time caching to avoid syscalls
         '_wake_pending',  # coalesced wakeup flag for call_soon_threadsafe
-        '_asyncgens', '_managed_shutdown_requested',
+        '_asyncgens', '_managed_shutdown_requested', '_shutdown_observer',
     )
 
     def __init__(self, capsule=None):
@@ -228,6 +231,7 @@ class ErlangEventLoop(asyncio.AbstractEventLoop):
         self._callback_id = 0
         self._asyncgens: WeakSet[AsyncGenerator[object]] = WeakSet()
         self._managed_shutdown_requested = False
+        self._shutdown_observer: ShutdownObserver | None = None
 
     def _next_id(self):
         """Generate a unique callback ID for this loop."""
@@ -515,14 +519,14 @@ class ErlangEventLoop(asyncio.AbstractEventLoop):
         """Create a Future object attached to this loop."""
         return futures.Future(loop=self)
 
-    def create_task(self, coro, *, name=None, context=None):
+    def create_task(self, coro, *, name=None, context=None, eager_start=None):
         """Schedule a coroutine to be executed."""
         self._check_closed()
         if self._task_factory is None:
             if sys.version_info >= (3, 12):
-                # Python 3.12+: use eager_start=False to prevent eager execution
+                # Native admission retains the historical non-eager default.
                 task = tasks.Task(coro, loop=self, name=name, context=context,
-                                  eager_start=False)
+                                  eager_start=False if eager_start is None else eager_start)
             elif sys.version_info >= (3, 11):
                 task = tasks.Task(coro, loop=self, name=name, context=context)
             elif sys.version_info >= (3, 8):
@@ -532,12 +536,19 @@ class ErlangEventLoop(asyncio.AbstractEventLoop):
                 if name is not None:
                     task.set_name(name)
         else:
-            if sys.version_info >= (3, 11) and context is not None:
+            if eager_start is not None:
+                if context is None:
+                    task = self._task_factory(self, coro, eager_start=eager_start)
+                else:
+                    task = self._task_factory(self, coro, context=context, eager_start=eager_start)
+            elif sys.version_info >= (3, 11) and context is not None:
                 task = self._task_factory(self, coro, context=context)
             else:
                 task = self._task_factory(self, coro)
             if name is not None:
                 task.set_name(name)
+        if self._shutdown_observer is not None:
+            self._shutdown_observer.observe(task)
         return task
 
     def set_task_factory(self, factory):
@@ -1485,6 +1496,12 @@ async def _run_and_send(coro, caller_pid, ref):
     import erlang
     from . import atom  # Use cached version from _erlang_impl
 
+    loop = asyncio.get_running_loop()
+    observer = loop._shutdown_observer if isinstance(loop, ErlangEventLoop) else None
+    current = asyncio.current_task()
+    if observer is not None and current is not None:
+        observer.observe(current)
+
     # Create atoms for message keys (strings become binaries, await expects atoms)
     async_result = atom('async_result')
     ok = atom('ok')
@@ -1502,6 +1519,9 @@ async def _run_and_send(coro, caller_pid, ref):
         except erlang.ProcessError:
             pass  # Caller gone, nothing to do
     except Exception as e:
+        active_observer = loop._shutdown_observer if isinstance(loop, ErlangEventLoop) else None
+        if active_observer is not None:
+            active_observer.failed = True
         import traceback
         tb = traceback.format_exc()
         try:
