@@ -5874,6 +5874,10 @@ static int load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info) {
     }
 
     if (actor_data_init(env) != 0) return -1;
+    NATIVE_ASYNC_REPLY_RESOURCE_TYPE = enif_open_resource_type(
+        env, NULL, "py_native_async_reply", native_async_reply_dtor,
+        ERL_NIF_RT_CREATE | ERL_NIF_RT_TAKEOVER, NULL);
+    if (NATIVE_ASYNC_REPLY_RESOURCE_TYPE == NULL) return -1;
 
     /* Create resource types */
     PYOBJ_RESOURCE_TYPE = enif_open_resource_type(

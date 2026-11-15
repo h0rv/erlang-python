@@ -2493,6 +2493,170 @@ static PyObject *get_async_callback_fd(PyObject *self, PyObject *args) {
     return PyLong_FromLong(state->async_callback_pipe[0]);
 }
 
+/* Native loops use the same reserved readiness queue as Channel waiters.
+ * A reply owns no Python references and no FD. Its registration ID is globally
+ * unique and disjoint from a wrapper's positive, low-half callback IDs, so a
+ * queued notification cannot address a replacement wrapper after close/rebind.
+ * The Python owner removes its handler before abandoning the reply. A late
+ * writer then drops the term without decoding it or repeating its effects. */
+typedef struct {
+    pthread_mutex_t mutex;
+    erlang_event_loop_t *loop;
+    pending_event_t *event;
+    ErlNifEnv *env;
+    ERL_NIF_TERM response;
+    uint64_t id;
+    uint64_t owner_generation;
+    bool ready;
+    bool abandoned;
+    bool submitted;
+} native_async_reply_t;
+
+static ErlNifResourceType *NATIVE_ASYNC_REPLY_RESOURCE_TYPE = NULL;
+#define NATIVE_ASYNC_REPLY_CAPSULE "erlang_python.async_reply"
+
+static void native_async_reply_abandon(native_async_reply_t *reply) {
+    pthread_mutex_lock(&reply->mutex);
+    reply->abandoned = true;
+    if (reply->event != NULL) {
+        event_loop_cancel_reserved(reply->loop, reply->event);
+        reply->event = NULL;
+    }
+    ErlNifEnv *env = reply->env;
+    reply->env = NULL;
+    pthread_mutex_unlock(&reply->mutex);
+    if (env != NULL) enif_free_env(env);
+}
+
+static void native_async_reply_dtor(ErlNifEnv *env, void *object) {
+    (void)env;
+    native_async_reply_t *reply = object;
+    native_async_reply_abandon(reply);
+    if (reply->loop != NULL) enif_release_resource(reply->loop);
+    pthread_mutex_destroy(&reply->mutex);
+}
+
+static void native_async_reply_capsule_dtor(PyObject *capsule) {
+    native_async_reply_t *reply = PyCapsule_GetPointer(capsule, NATIVE_ASYNC_REPLY_CAPSULE);
+    if (reply != NULL) enif_release_resource(reply);
+    else PyErr_Clear();
+}
+
+static PyObject *prepare_native_async_reply(PyObject *self, PyObject *args) {
+    (void)self;
+    PyObject *capsule, *owner;
+    if (!PyArg_ParseTuple(args, "OO", &capsule, &owner)) return NULL;
+    erlang_event_loop_t *loop = PyCapsule_GetPointer(capsule, "erlang_python.event_loop");
+    if (loop == NULL) return NULL;
+    if (PyInterpreterState_GetID(PyInterpreterState_Get()) != loop->interp_id) {
+        PyErr_SetString(PyExc_RuntimeError, "Native loop belongs to another interpreter");
+        return NULL;
+    }
+    pthread_mutex_lock(&loop->mutex);
+    bool valid = loop->py_loop == owner && !loop->shutdown;
+    uint64_t generation = loop->py_owner_generation;
+    pthread_mutex_unlock(&loop->mutex);
+    if (!valid) {
+        PyErr_SetString(PyExc_RuntimeError, "Async callback requires the exact native loop owner");
+        return NULL;
+    }
+    native_async_reply_t *reply = enif_alloc_resource(NATIVE_ASYNC_REPLY_RESOURCE_TYPE, sizeof(*reply));
+    if (reply == NULL) return PyErr_NoMemory();
+    memset(reply, 0, sizeof(*reply));
+    pthread_mutex_init(&reply->mutex, NULL);
+    reply->loop = loop;
+    reply->owner_generation = generation;
+    enif_keep_resource(loop);
+    bool overloaded;
+    reply->event = event_loop_reserve_pending(loop, &overloaded);
+    reply->env = enif_alloc_env();
+    if (reply->event == NULL || reply->env == NULL) {
+        enif_release_resource(reply);
+        PyErr_SetString(PyExc_RuntimeError, overloaded ? "Native callback queue full" : "Native callback allocation failed");
+        return NULL;
+    }
+    reply->id = atomic_fetch_add(&g_callback_id_counter, 1) | (UINT64_C(1) << 63);
+    PyObject *handle = PyCapsule_New(reply, NATIVE_ASYNC_REPLY_CAPSULE, native_async_reply_capsule_dtor);
+    if (handle == NULL) {
+        enif_release_resource(reply);
+        return NULL;
+    }
+    PyObject *result = Py_BuildValue("(KO)", (unsigned long long)reply->id, handle);
+    Py_DECREF(handle);
+    return result;
+}
+
+static PyObject *abandon_native_async_reply(PyObject *self, PyObject *capsule) {
+    (void)self;
+    native_async_reply_t *reply = PyCapsule_GetPointer(capsule, NATIVE_ASYNC_REPLY_CAPSULE);
+    if (reply == NULL) return NULL;
+    native_async_reply_abandon(reply);
+    Py_RETURN_NONE;
+}
+
+static PyObject *take_native_async_reply(PyObject *self, PyObject *args) {
+    (void)self;
+    PyObject *capsule, *owner;
+    if (!PyArg_ParseTuple(args, "OO", &capsule, &owner)) return NULL;
+    native_async_reply_t *reply = PyCapsule_GetPointer(capsule, NATIVE_ASYNC_REPLY_CAPSULE);
+    if (reply == NULL) return NULL;
+    pthread_mutex_lock(&reply->loop->mutex);
+    bool valid = reply->loop->py_loop == owner &&
+        reply->loop->py_owner_generation == reply->owner_generation &&
+        PyInterpreterState_GetID(PyInterpreterState_Get()) == reply->loop->interp_id;
+    pthread_mutex_unlock(&reply->loop->mutex);
+    if (!valid) {
+        PyErr_SetString(PyExc_RuntimeError, "Native callback reply requires its exact loop owner");
+        return NULL;
+    }
+    pthread_mutex_lock(&reply->mutex);
+    ErlNifEnv *env = reply->ready && !reply->abandoned ? reply->env : NULL;
+    ERL_NIF_TERM response = reply->response;
+    if (env != NULL) {
+        reply->env = NULL;
+        reply->abandoned = true;
+    }
+    pthread_mutex_unlock(&reply->mutex);
+    if (env == NULL) {
+        PyErr_SetString(PyExc_RuntimeError, "Native callback reply is not available");
+        return NULL;
+    }
+    ErlNifBinary binary;
+    PyObject *result = NULL;
+    const ERL_NIF_TERM *parts;
+    int arity;
+    if (enif_inspect_binary(env, response, &binary)) {
+        result = parse_callback_response(binary.data, binary.size);
+    } else if (enif_get_tuple(env, response, &arity, &parts) && arity == 2 &&
+               enif_is_identical(parts[0], enif_make_atom(env, "native"))) {
+        result = term_to_py(env, parts[1]);
+    } else {
+        PyErr_SetString(PyExc_RuntimeError, "Invalid native callback response");
+    }
+    enif_free_env(env);
+    return result;
+}
+
+/* Runs without Python or its GIL, from the existing response NIF. The resource
+ * in the Erlang message keeps this state alive until its one writer completes. */
+static ERL_NIF_TERM respond_native_async_reply(ErlNifEnv *env, native_async_reply_t *reply,
+                                              uint64_t id, ERL_NIF_TERM response) {
+    pthread_mutex_lock(&reply->mutex);
+    if (reply->id != id) {
+        pthread_mutex_unlock(&reply->mutex);
+        return make_error(env, "invalid_callback_id");
+    }
+    if (!reply->abandoned && !reply->ready) {
+        reply->response = enif_make_copy(reply->env, response);
+        reply->ready = true;
+        pending_event_t *event = reply->event;
+        reply->event = NULL;
+        event_loop_dispatch_reserved(reply->loop, event, reply->id);
+    }
+    pthread_mutex_unlock(&reply->mutex);
+    return ATOM_OK;
+}
+
 /**
  * Send an async callback request to Erlang.
  * Returns the callback_id for tracking.
@@ -2502,8 +2666,10 @@ static PyObject *send_async_callback_request(PyObject *self, PyObject *args) {
 
     PyObject *name_obj;
     PyObject *call_args;
+    PyObject *reply_capsule = Py_None;
+    native_async_reply_t *reply = NULL;
 
-    if (!PyArg_ParseTuple(args, "OO", &name_obj, &call_args)) {
+    if (!PyArg_ParseTuple(args, "OO|O", &name_obj, &call_args, &reply_capsule)) {
         return NULL;
     }
 
@@ -2530,13 +2696,25 @@ static PyObject *send_async_callback_request(PyObject *self, PyObject *args) {
         return NULL;
     }
 
-    /* Get per-interpreter state for the pipe */
+    if (reply_capsule != Py_None) {
+        reply = PyCapsule_GetPointer(reply_capsule, NATIVE_ASYNC_REPLY_CAPSULE);
+        if (reply == NULL) return NULL;
+        pthread_mutex_lock(&reply->mutex);
+        bool valid = !reply->submitted && !reply->abandoned;
+        if (valid) reply->submitted = true;
+        pthread_mutex_unlock(&reply->mutex);
+        if (!valid) {
+            PyErr_SetString(PyExc_RuntimeError, "Native callback reply was already submitted or abandoned");
+            return NULL;
+        }
+    }
+    /* Non-native asyncio loops retain the existing pipe protocol. */
     erlang_module_state_t *state = get_erlang_module_state();
-    if (state == NULL || !state->pipe_initialized) {
+    if (reply == NULL && (state == NULL || !state->pipe_initialized)) {
         PyErr_SetString(PyExc_RuntimeError, "Async callback system not initialized");
         return NULL;
     }
-    if (state->pipe_broken) {
+    if (reply == NULL && state->pipe_broken) {
         PyErr_SetString(PyExc_RuntimeError,
             "async callback pipe broken; restart the erlang_python "
             "application to recover");
@@ -2544,7 +2722,8 @@ static PyObject *send_async_callback_request(PyObject *self, PyObject *args) {
     }
 
     /* Generate callback ID */
-    uint64_t callback_id = atomic_fetch_add(&g_callback_id_counter, 1);
+    uint64_t callback_id = reply != NULL ? reply->id
+        : atomic_fetch_add(&g_callback_id_counter, 1);
 
     /* Send callback request to Erlang via thread worker coordinator */
     ErlNifEnv *msg_env = enif_alloc_env();
@@ -2586,7 +2765,8 @@ static PyObject *send_async_callback_request(PyObject *self, PyObject *args) {
         id_term,
         func_term,
         args_term,
-        enif_make_int(msg_env, state->async_callback_pipe[1]));
+        reply != NULL ? enif_make_resource(msg_env, reply)
+                      : enif_make_int(msg_env, state->async_callback_pipe[1]));
 
     if (!enif_send(NULL, &g_thread_coordinator_pid, msg_env, msg)) {
         if (actor_data) actor_data_send_failed(call_args);
@@ -3559,6 +3739,12 @@ static PyMethodDef ErlangModuleMethods[] = {
      "Snapshot retained resources and their Python value, context and environment edges."},
     {"_actor_take_exception", python_actor_take_exception, METH_O,
      "Transfer a terminal task exception exactly once, without retaining its traceback."},
+    {"_prepare_native_async_reply", prepare_native_async_reply, METH_VARARGS,
+     "Reserve readiness on the exact Future owner's native loop"},
+    {"_take_native_async_reply", take_native_async_reply, METH_VARARGS,
+     "Consume a completed callback reply on its owner"},
+    {"_abandon_native_async_reply", abandon_native_async_reply, METH_O,
+     "Abandon reply delivery without cancelling callback effects"},
     {"_get_async_callback_fd", get_async_callback_fd, METH_NOARGS,
      "Get the file descriptor for async callback responses.\n"
      "Used internally by async_call() to register with asyncio."},
@@ -3900,8 +4086,11 @@ static int create_erlang_module(void) {
         "        The result from the Erlang function\n"
         "    '''\n"
         "    loop = asyncio.get_running_loop()\n"
+        "    from _erlang_impl._loop import ErlangEventLoop\n"
+        "    if isinstance(loop, ErlangEventLoop):\n"
+        "        return await loop._async_call(func_name, args)\n"
         "    \n"
-        "    # Ensure the reader is registered with this event loop\n"
+        "    # Non-native loops use the existing pipe reader\n"
         "    if loop not in _async_reader_registered:\n"
         "        fd = erlang._get_async_callback_fd()\n"
         "        loop.add_reader(fd, erlang._async_callback_reader)\n"

@@ -222,6 +222,36 @@ class ErlangEventLoop(asyncio.AbstractEventLoop):
         if hasattr(self._pel, '_set_loop_ref'):
             self._pel._set_loop_ref(self._loop_capsule, self)
 
+    async def _async_call(self, func_name: str, args: tuple[object, ...]) -> object:
+        import erlang
+
+        self._check_closed()
+        future = self.create_future()
+        callback_id, reply = erlang._prepare_native_async_reply(self._loop_capsule, self)
+
+        def completed() -> None:
+            if future.done():
+                return
+            try:
+                value = erlang._take_native_async_reply(reply, self)
+            except BaseException as error:
+                future.set_exception(error)
+            else:
+                future.set_result(value)
+
+        try:
+            # Publish the owning handler before the request can complete on a
+            # different Erlang scheduler. No interpreter-wide Future map or
+            # callback pipe participates in native loop delivery.
+            self._timers[callback_id] = events.Handle(completed, (), self)
+            erlang._send_async_request(func_name, args, reply)
+            return await future
+        finally:
+            handle = self._timers.pop(callback_id, None)
+            if handle is not None:
+                handle.cancel()
+            erlang._abandon_native_async_reply(reply)
+
     async def _unsupported_io(self, *args: object, **kwargs: object) -> Never:
         raise NotImplementedError("This asyncio I/O operation is not supported by ErlangEventLoop")
 
