@@ -196,6 +196,7 @@
     %% Channel API - bidirectional message passing
     channel_create/0,
     channel_create/1,
+    channel_create/2,
     channel_send/2,
     channel_receive/2,
     channel_try_receive/1,
@@ -1635,6 +1636,10 @@ channel_create() ->
 %% @returns {ok, ChannelRef} | {error, Reason}
 -spec channel_create(non_neg_integer()) -> {ok, reference()} | {error, term()}.
 channel_create(_MaxSize) ->
+    ?NIF_STUB.
+
+-spec channel_create(non_neg_integer(), non_neg_integer()) -> {ok, reference()} | {error, term()}.
+channel_create(_MaxSize, _MaxMessages) ->
     ?NIF_STUB.
 
 %% @doc Send a message to a channel.

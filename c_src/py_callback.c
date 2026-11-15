@@ -2697,6 +2697,28 @@ static PyObject *erlang_module_getattr(PyObject *module, PyObject *name) {
 
 #define CHANNEL_CAPSULE_NAME "erlang.channel_ref"
 
+static PyObject *raise_channel_error(const char *name, const char *message) {
+    PyObject *module = PyImport_ImportModule("_erlang_impl._channel");
+    if (module == NULL) return NULL;
+    PyObject *exception = PyObject_GetAttrString(module, name);
+    Py_DECREF(module);
+    if (exception == NULL) return NULL;
+    PyErr_SetString(exception, message);
+    Py_DECREF(exception);
+    return NULL;
+}
+
+static PyObject *raise_channel_closed(void) {
+    return raise_channel_error("ChannelClosed", "channel closed");
+}
+
+static bool channel_was_aborted(py_channel_t *channel) {
+    pthread_mutex_lock(&channel->mutex);
+    bool aborted = channel->aborted;
+    pthread_mutex_unlock(&channel->mutex);
+    return aborted;
+}
+
 /**
  * @brief Direct channel try_receive - non-blocking
  *
@@ -2752,13 +2774,11 @@ static PyObject *erlang_channel_try_receive_impl(PyObject *self, PyObject *args)
 
         return py_obj;  /* May be NULL if conversion failed */
     } else if (result == 1) {
-        /* Empty */
         Py_RETURN_NONE;
-    } else {
-        /* Closed */
-        PyErr_SetString(PyExc_RuntimeError, "channel closed");
-        return NULL;
+    } else if (result == -1) {
+        return raise_channel_closed();
     }
+    return PyErr_NoMemory();
 }
 
 /**
@@ -2804,8 +2824,9 @@ static PyObject *erlang_channel_receive_impl(PyObject *self, PyObject *args) {
         PyErr_SetString(PyExc_TimeoutError, "channel receive timeout");
         return NULL;
     } else if (result == -1) {
-        PyErr_SetString(PyExc_RuntimeError, "channel closed");
-        return NULL;
+        return raise_channel_closed();
+    } else if (result < 0) {
+        return PyErr_NoMemory();
     }
 
     /* Decode from Erlang external term format to Python */
@@ -2871,10 +2892,10 @@ static PyObject *erlang_channel_send_impl(PyObject *self, PyObject *args) {
     } else if (result == 1) {
         PyErr_SetString(PyExc_RuntimeError, "channel busy (backpressure)");
         return NULL;
-    } else {
-        PyErr_SetString(PyExc_RuntimeError, "channel closed");
-        return NULL;
+    } else if (result == -1) {
+        return raise_channel_closed();
     }
+    return PyErr_NoMemory();
 }
 
 /**
@@ -2902,11 +2923,10 @@ static PyObject *erlang_channel_is_closed_impl(PyObject *self, PyObject *args) {
         return NULL;
     }
 
-    if (channel->closed) {
-        Py_RETURN_TRUE;
-    } else {
-        Py_RETURN_FALSE;
-    }
+    pthread_mutex_lock(&channel->mutex);
+    bool closed = channel->closed;
+    pthread_mutex_unlock(&channel->mutex);
+    return PyBool_FromLong(closed);
 }
 
 /**
@@ -2982,13 +3002,11 @@ static PyObject *erlang_byte_channel_try_receive_bytes_impl(PyObject *self, PyOb
         enif_free(data);
         return bytes;  /* May be NULL if allocation failed */
     } else if (result == 1) {
-        /* Empty */
         Py_RETURN_NONE;
-    } else {
-        /* Closed */
-        PyErr_SetString(PyExc_RuntimeError, "channel closed");
-        return NULL;
+    } else if (result == -1) {
+        return raise_channel_closed();
     }
+    return PyErr_NoMemory();
 }
 
 /**
@@ -3034,8 +3052,9 @@ static PyObject *erlang_byte_channel_receive_bytes_impl(PyObject *self, PyObject
         PyErr_SetString(PyExc_TimeoutError, "channel receive timeout");
         return NULL;
     } else if (result == -1) {
-        PyErr_SetString(PyExc_RuntimeError, "channel closed");
-        return NULL;
+        return raise_channel_closed();
+    } else if (result < 0) {
+        return PyErr_NoMemory();
     }
 
     /* Return raw bytes (NO term decoding) */
@@ -3100,26 +3119,16 @@ static PyObject *erlang_channel_wait_impl(PyObject *self, PyObject *args) {
         return Py_BuildValue("(ss)", "error", "waiter_exists");
     }
 
-    /* Check if data available */
-    size_t queue_size = enif_ioq_size(channel->queue);
-    if (queue_size > 0) {
-        SysIOVec *iov;
-        int iovcnt;
-        iov = enif_ioq_peek(channel->queue, &iovcnt);
-
-        if (iovcnt > 0 && iov != NULL && iov[0].iov_len > 0) {
-            size_t msg_size = iov[0].iov_len;
-            unsigned char *data = enif_alloc(msg_size);
-            if (data == NULL) {
-                pthread_mutex_unlock(&channel->mutex);
-                PyErr_SetString(PyExc_MemoryError, "failed to allocate memory");
-                return NULL;
-            }
-
-            memcpy(data, iov[0].iov_base, msg_size);
-            enif_ioq_deq(channel->queue, msg_size, NULL);
-            channel->current_size -= msg_size;
-            pthread_mutex_unlock(&channel->mutex);
+    if (channel->message_count > 0) {
+        unsigned char *data = NULL;
+        size_t msg_size = 0;
+        int popped = channel_pop_locked(channel, &data, &msg_size);
+        pthread_mutex_unlock(&channel->mutex);
+        if (popped != 0) {
+            PyErr_SetString(PyExc_MemoryError, "failed to allocate memory");
+            return NULL;
+        }
+        {
 
             /* Decode term: binary -> Erlang term -> Python */
             ErlNifEnv *tmp_env = enif_alloc_env();
@@ -3258,30 +3267,18 @@ static PyObject *erlang_byte_channel_wait_impl(PyObject *self, PyObject *args) {
         return Py_BuildValue("(ss)", "error", "waiter_exists");
     }
 
-    /* Check if data available */
-    size_t queue_size = enif_ioq_size(channel->queue);
-    if (queue_size > 0) {
-        SysIOVec *iov;
-        int iovcnt;
-        iov = enif_ioq_peek(channel->queue, &iovcnt);
-
-        if (iovcnt > 0 && iov != NULL && iov[0].iov_len > 0) {
-            size_t msg_size = iov[0].iov_len;
-
-            /* Create Python bytes object */
-            PyObject *bytes = PyBytes_FromStringAndSize((char *)iov[0].iov_base, msg_size);
-            if (bytes == NULL) {
-                pthread_mutex_unlock(&channel->mutex);
-                return NULL;
-            }
-
-            enif_ioq_deq(channel->queue, msg_size, NULL);
-            channel->current_size -= msg_size;
-            pthread_mutex_unlock(&channel->mutex);
-
-            /* Return raw bytes (NO term decoding) */
-            return Py_BuildValue("(sO)", "ok", bytes);
-        }
+    if (channel->message_count > 0) {
+        unsigned char *data = NULL;
+        size_t size = 0;
+        int popped = channel_pop_locked(channel, &data, &size);
+        pthread_mutex_unlock(&channel->mutex);
+        if (popped != 0) return PyErr_NoMemory();
+        PyObject *bytes = PyBytes_FromStringAndSize((char *)data, size);
+        enif_free(data);
+        if (bytes == NULL) return NULL;
+        PyObject *result = Py_BuildValue("(sO)", "ok", bytes);
+        Py_DECREF(bytes);
+        return result;
     }
 
     /* No data - register waiter */
@@ -3367,8 +3364,156 @@ static PyObject *erlang_whereis_impl(PyObject *self, PyObject *args) {
     return result;
 }
 
+static void bounded_channel_capsule_destroy(PyObject *capsule) {
+    py_channel_t *channel = PyCapsule_GetPointer(capsule, CHANNEL_CAPSULE_NAME);
+    if (channel != NULL) enif_release_resource(channel);
+}
+
+static PyObject *erlang_channel_create_bounded(PyObject *self, PyObject *args) {
+    (void)self;
+    Py_ssize_t capacity, bytes;
+    if (!PyArg_ParseTuple(args, "nn", &capacity, &bytes)) return NULL;
+    if (capacity < 0 || bytes < 0) {
+        PyErr_SetString(PyExc_ValueError, "channel limits must be non-negative");
+        return NULL;
+    }
+    py_channel_t *channel = channel_alloc((size_t)bytes);
+    if (channel == NULL) return PyErr_NoMemory();
+    channel->max_messages = capacity;
+    PyObject *capsule = PyCapsule_New(channel, CHANNEL_CAPSULE_NAME, bounded_channel_capsule_destroy);
+    if (capsule == NULL) enif_release_resource(channel);
+    return capsule;
+}
+
+static PyObject *erlang_channel_ready(PyObject *self, PyObject *args) {
+    (void)self;
+    PyObject *capsule, *loop_capsule;
+    unsigned long long id, size;
+    int writing;
+    if (!PyArg_ParseTuple(args, "OOKpK", &capsule, &loop_capsule, &id, &writing, &size)) return NULL;
+    py_channel_t *channel = PyCapsule_GetPointer(capsule, CHANNEL_CAPSULE_NAME);
+    if (channel == NULL) return NULL;
+    erlang_event_loop_t *loop = PyCapsule_GetPointer(loop_capsule, "erlang_python.event_loop");
+    if (loop == NULL) return NULL;
+    int result = channel_wait_ready(channel, loop, id, writing, size);
+    if (result == -3) return raise_channel_error("ChannelOverloaded", "Native readiness capacity exhausted");
+    if (result < 0) return PyErr_NoMemory();
+    return PyBool_FromLong(result);
+}
+
+static PyObject *erlang_channel_cancel_ready(PyObject *self, PyObject *args) {
+    (void)self;
+    PyObject *capsule;
+    unsigned long long id;
+    if (!PyArg_ParseTuple(args, "OK", &capsule, &id)) return NULL;
+    py_channel_t *channel = PyCapsule_GetPointer(capsule, CHANNEL_CAPSULE_NAME);
+    if (channel == NULL) return NULL;
+    channel_cancel_ready(channel, id);
+    Py_RETURN_NONE;
+}
+
+static PyObject *erlang_channel_abort(PyObject *self, PyObject *args) {
+    (void)self;
+    PyObject *capsule;
+    if (!PyArg_ParseTuple(args, "O", &capsule)) return NULL;
+    py_channel_t *channel = PyCapsule_GetPointer(capsule, CHANNEL_CAPSULE_NAME);
+    if (channel == NULL) return NULL;
+    channel_abort(channel);
+    Py_RETURN_NONE;
+}
+
+static PyObject *erlang_channel_send_result(PyObject *self, PyObject *args) {
+    (void)self;
+    PyObject *capsule;
+    Py_buffer data;
+    if (!PyArg_ParseTuple(args, "Oy*", &capsule, &data)) return NULL;
+    py_channel_t *channel = PyCapsule_GetPointer(capsule, CHANNEL_CAPSULE_NAME);
+    if (channel == NULL) { PyBuffer_Release(&data); return NULL; }
+    int result = channel_send(channel, data.buf, data.len);
+    PyBuffer_Release(&data);
+    if (result == -2) return PyErr_NoMemory();
+    return PyUnicode_FromString(result == 0 ? "ok" : result == 1 ? "full" : "closed");
+}
+
+static PyObject *erlang_channel_receive_result(PyObject *self, PyObject *args) {
+    (void)self;
+    PyObject *capsule;
+    if (!PyArg_ParseTuple(args, "O", &capsule)) return NULL;
+    py_channel_t *channel = PyCapsule_GetPointer(capsule, CHANNEL_CAPSULE_NAME);
+    if (channel == NULL) return NULL;
+    unsigned char *data = NULL;
+    size_t size = 0;
+    int result = channel_try_receive(channel, &data, &size);
+    if (result == -2) return PyErr_NoMemory();
+    if (result != 0) return Py_BuildValue("(sO)", result == 1 ? "empty" :
+        channel_was_aborted(channel) ? "aborted" : "closed", Py_None);
+    PyObject *payload = PyBytes_FromStringAndSize((char *)data, size);
+    enif_free(data);
+    if (payload == NULL) return NULL;
+    PyObject *out = Py_BuildValue("(sO)", "ok", payload);
+    Py_DECREF(payload);
+    return out;
+}
+
+static PyObject *erlang_channel_term_result(PyObject *self, PyObject *args) {
+    (void)self;
+    PyObject *capsule;
+    if (!PyArg_ParseTuple(args, "O", &capsule)) return NULL;
+    py_channel_t *channel = PyCapsule_GetPointer(capsule, CHANNEL_CAPSULE_NAME);
+    if (channel == NULL) return NULL;
+    unsigned char *data = NULL;
+    size_t size = 0;
+    int result = channel_try_receive(channel, &data, &size);
+    if (result == -2) return PyErr_NoMemory();
+    if (result == -1) return channel_was_aborted(channel)
+        ? raise_channel_error("ChannelAborted", "Channel aborted; queued payloads discarded")
+        : raise_channel_closed();
+    if (result == 1) return Py_BuildValue("(iO)", 1, Py_None);
+    ErlNifEnv *env = enif_alloc_env();
+    if (env == NULL) { enif_free(data); return PyErr_NoMemory(); }
+    ERL_NIF_TERM term;
+    int decoded = enif_binary_to_term(env, data, size, &term, ERL_NIF_BIN2TERM_SAFE);
+    enif_free(data);
+    if (!decoded) {
+        enif_free_env(env);
+        PyErr_SetString(PyExc_ValueError, "invalid channel term");
+        return NULL;
+    }
+    PyObject *payload = term_to_py(env, term);
+    enif_free_env(env);
+    if (payload == NULL) return NULL;
+    PyObject *out = Py_BuildValue("(iO)", 0, payload);
+    Py_DECREF(payload);
+    return out;
+}
+
+static PyObject *erlang_channel_snapshot(PyObject *self, PyObject *args) {
+    (void)self;
+    PyObject *capsule;
+    if (!PyArg_ParseTuple(args, "O", &capsule)) return NULL;
+    py_channel_t *channel = PyCapsule_GetPointer(capsule, CHANNEL_CAPSULE_NAME);
+    if (channel == NULL) return NULL;
+    pthread_mutex_lock(&channel->mutex);
+    size_t waiters = 0;
+    for (channel_ready_waiter_t *w = channel->ready_waiters; w != NULL; w = w->next) waiters++;
+    PyObject *out = Py_BuildValue("(KKKKOK)", (unsigned long long)channel->message_count,
+        (unsigned long long)channel->current_size, (unsigned long long)channel->max_messages,
+        (unsigned long long)channel->max_size, channel->closed ? Py_True : Py_False,
+        (unsigned long long)waiters);
+    pthread_mutex_unlock(&channel->mutex);
+    return out;
+}
+
 /* Python method definitions for erlang module */
 static PyMethodDef ErlangModuleMethods[] = {
+    {"_channel_create_bounded", erlang_channel_create_bounded, METH_VARARGS, NULL},
+    {"_channel_ready", erlang_channel_ready, METH_VARARGS, NULL},
+    {"_channel_cancel_ready", erlang_channel_cancel_ready, METH_VARARGS, NULL},
+    {"_channel_abort", erlang_channel_abort, METH_VARARGS, NULL},
+    {"_channel_send_result", erlang_channel_send_result, METH_VARARGS, NULL},
+    {"_channel_receive_result", erlang_channel_receive_result, METH_VARARGS, NULL},
+    {"_channel_snapshot", erlang_channel_snapshot, METH_VARARGS, NULL},
+    {"_channel_term_result", erlang_channel_term_result, METH_VARARGS, NULL},
     {"_call_blocking", erlang_call_blocking_impl, METH_VARARGS,
      "Call an Erlang function on the blocking thread path (no suspension, no replay)"},
     {"call", erlang_call_impl, METH_VARARGS,

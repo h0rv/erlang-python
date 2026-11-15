@@ -54,6 +54,9 @@ typedef struct _is PyInterpreterState;
 /** @brief Maximum pending events capacity (hard safety cap) */
 #define MAX_PENDING_CAPACITY 16384
 
+/* Idle channel waiters must leave capacity for ordinary I/O and timer events. */
+#define MAX_RESERVED_PENDING (MAX_PENDING_CAPACITY / 2)
+
 /** @brief Legacy alias for initial capacity */
 #define MAX_PENDING_EVENTS INITIAL_PENDING_CAPACITY
 
@@ -347,6 +350,9 @@ typedef struct erlang_event_loop {
 
     /** @brief Current pending capacity (starts at INITIAL_PENDING_CAPACITY) */
     size_t pending_capacity;
+
+    /* Slots reserved by native readiness waiters, guarded by mutex. */
+    size_t reserved_pending;
 
     /** @brief Flag indicating shutdown requested */
     volatile bool shutdown;
@@ -848,6 +854,10 @@ ERL_NIF_TERM nif_loop_import_list(ErlNifEnv *env, int argc,
  */
 bool event_loop_add_pending(erlang_event_loop_t *loop, event_type_t type,
                             uint64_t callback_id, int fd);
+pending_event_t *event_loop_reserve_pending(erlang_event_loop_t *loop, bool *overloaded);
+void event_loop_cancel_reserved(erlang_event_loop_t *loop, pending_event_t *event);
+void event_loop_dispatch_reserved(erlang_event_loop_t *loop, pending_event_t *event,
+                                  uint64_t callback_id);
 
 /**
  * @brief Clear all pending events

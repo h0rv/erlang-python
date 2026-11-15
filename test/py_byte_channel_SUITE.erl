@@ -16,6 +16,7 @@
 -export([
     create_byte_channel_test/1,
     create_byte_channel_with_max_size_test/1,
+    message_count_and_empty_payload_test/1,
     erlang_send_bytes_test/1,
     erlang_receive_bytes_test/1,
     send_receive_multiple_bytes_test/1,
@@ -48,6 +49,7 @@
 all() -> [
     create_byte_channel_test,
     create_byte_channel_with_max_size_test,
+    message_count_and_empty_payload_test,
     erlang_send_bytes_test,
     erlang_receive_bytes_test,
     send_receive_multiple_bytes_test,
@@ -109,6 +111,25 @@ end_per_testcase(_TestCase, _Config) ->
 %%% ============================================================================
 %%% Test Cases
 %%% ============================================================================
+
+message_count_and_empty_payload_test(_Config) ->
+    {ok, Ch} = py_byte_channel:new(#{max_size => 3, max_messages => 2}),
+    ok = py_byte_channel:send(Ch, <<>>),
+    ok = py_byte_channel:send(Ch, <<>>),
+    #{size := 0, count := 2, max_messages := 2} = py_byte_channel:info(Ch),
+    busy = py_byte_channel:send(Ch, <<>>),
+    {ok, <<>>} = py_byte_channel:try_receive(Ch),
+    ok = py_byte_channel:send(Ch, <<"abc">>),
+    {ok, <<>>} = py_byte_channel:try_receive(Ch),
+    busy = py_byte_channel:send(Ch, <<"x">>),
+    #{size := 3, count := 1} = py_byte_channel:info(Ch),
+    ok = py_byte_channel:close(Ch),
+    {ok, <<"abc">>} = py_byte_channel:try_receive(Ch),
+    {error, closed} = py_byte_channel:try_receive(Ch),
+    #{size := 0, count := 0} = py_byte_channel:info(Ch),
+    {ok, Legacy} = py_byte_channel:new(),
+    #{max_size := 0, max_messages := 0} = py_byte_channel:info(Legacy),
+    ok = py_byte_channel:close(Legacy).
 
 %% @doc Test creating a byte channel with default settings
 create_byte_channel_test(_Config) ->
