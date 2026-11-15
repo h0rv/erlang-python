@@ -1497,7 +1497,7 @@ class _MockNifModule:
     def _wakeup_for(self, capsule):
         pass
 
-    def _add_reader_for(self, capsule, fd, callback_id):
+    def _add_reader_for(self, capsule: _MockLoopCapsule, fd: int, callback_id: int) -> int:
         capsule._counter += 1
         capsule.readers[fd] = (callback_id, capsule._counter)
         self._fd_by_key[capsule._counter] = fd
@@ -1509,7 +1509,7 @@ class _MockNifModule:
                 del capsule.readers[fd]
                 break
 
-    def _add_writer_for(self, capsule, fd, callback_id):
+    def _add_writer_for(self, capsule: _MockLoopCapsule, fd: int, callback_id: int) -> int:
         capsule._counter += 1
         capsule.writers[fd] = (callback_id, capsule._counter)
         self._fd_by_key[capsule._counter] = fd

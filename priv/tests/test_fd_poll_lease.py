@@ -3,6 +3,7 @@ import socket
 import sys
 from enum import StrEnum
 from types import ModuleType
+from typing import override
 from unittest.mock import patch
 
 import pytest
@@ -32,6 +33,7 @@ class LeaseBoundary(_MockNifModule):
         self.leases: dict[int, int] = {}
         self.pending: list[int] = []
 
+    @override
     def _add_reader_for(
         self, capsule: _MockLoopCapsule, fd: int, callback_id: int
     ) -> int:
@@ -39,6 +41,7 @@ class LeaseBoundary(_MockNifModule):
         self.leases[key] = os.dup(fd)
         return key
 
+    @override
     def _add_writer_for(
         self, capsule: _MockLoopCapsule, fd: int, callback_id: int
     ) -> int:
@@ -46,10 +49,12 @@ class LeaseBoundary(_MockNifModule):
         self.leases[key] = os.dup(fd)
         return key
 
+    @override
     def _clear_fd_read(self, fd_key: int) -> None:
         if self.failure == Failure.CANCEL:
             raise RuntimeError("simulated CANCEL failure at Python boundary")
 
+    @override
     def _release_fd_resource(self, fd_key: int, take_ownership: bool = False) -> str:
         if self.failure == Failure.ALLOCATION:
             raise MemoryError("simulated environment allocation failure")
