@@ -6,6 +6,15 @@ from typing import Literal
 
 import erlang
 
+from ._actor_common import _owned_wait, _result
+from ._actor_data import ActorAdmissionClosed as ActorAdmissionClosed
+from ._actor_data import ActorGenerationChanged as ActorGenerationChanged
+from ._actor_data import ActorOverloaded as ActorOverloaded
+from ._actor_data import DataActorGroup as DataActorGroup
+from ._actor_data import DataActorRef as DataActorRef
+from ._actor_data import DataDispatcher as DataDispatcher
+from ._actor_data import DataTicket as DataTicket
+
 
 def _validate_method(state: object, method: object) -> None:
     if type(method) is not FunctionType or not inspect.iscoroutinefunction(method):
@@ -22,34 +31,6 @@ async def _outcome(awaitable: Awaitable[object]) -> tuple[bool, object]:
         return True, await awaitable
     except BaseException as error:
         return False, error
-
-
-def _result(reply: object) -> object:
-    if not isinstance(reply, tuple) or len(reply) != 2:
-        raise RuntimeError("Invalid native actor response", reply)
-    status, value = reply
-    if status == "ok":
-        return value
-    if status == "error" and isinstance(value, tuple):
-        return _result(value)
-    if status == "python_error":
-        error = erlang._actor_unwrap(value)
-        if isinstance(error, BaseException):
-            raise error
-    raise RuntimeError("Native actor operation failed", reply)
-
-
-async def _owned_wait[T](pending: asyncio.Task[T]) -> T:
-    cancelled: asyncio.CancelledError | None = None
-    while not pending.done():
-        try:
-            await asyncio.shield(pending)
-        except asyncio.CancelledError as error:
-            cancelled = error
-    result = pending.result()
-    if cancelled is not None:
-        raise cancelled
-    return result
 
 
 class OwnedActor:

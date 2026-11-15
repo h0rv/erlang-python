@@ -2211,40 +2211,44 @@ static int async_callback_init(void) {
  * current Python exception (or a generic RuntimeError fallback).
  * Borrows @p future; caller still owns its reference.
  */
+static PyObject *resolve_future_on_owner(PyObject *payload, PyObject *unused) {
+    (void)unused;
+    PyObject *future = PyTuple_GetItem(payload, 0);
+    PyObject *done = PyObject_CallMethod(future, "done", NULL);
+    if (done == NULL) return NULL;
+    int finished = PyObject_IsTrue(done);
+    Py_DECREF(done);
+    if (finished < 0) return NULL;
+    if (finished) Py_RETURN_NONE;
+    return PyObject_CallMethod(future,
+        PyTuple_GetItem(payload, 2) == Py_True ? "set_exception" : "set_result",
+        "(O)", PyTuple_GetItem(payload, 1));
+}
+static PyMethodDef resolve_future_on_owner_method = {
+    "_resolve_callback_on_owner", resolve_future_on_owner, METH_NOARGS, NULL
+};
 static void resolve_future_with_result(PyObject *future, PyObject *result) {
-    if (result != NULL) {
-        PyObject *set_result = PyObject_GetAttrString(future, "set_result");
-        if (set_result != NULL) {
-            PyObject *ret = PyObject_CallFunctionObjArgs(set_result, result, NULL);
-            Py_XDECREF(ret);
-            Py_DECREF(set_result);
-        }
-        return;
-    }
-
-    /* Result was NULL: carry the Python exception over to the future. */
-    PyObject *exc_type = NULL, *exc_value = NULL, *exc_tb = NULL;
-    PyErr_Fetch(&exc_type, &exc_value, &exc_tb);
-
-    PyObject *set_exception = PyObject_GetAttrString(future, "set_exception");
-    if (set_exception != NULL) {
-        if (exc_value != NULL) {
-            PyObject *ret = PyObject_CallFunctionObjArgs(set_exception, exc_value, NULL);
-            Py_XDECREF(ret);
-        } else {
-            PyObject *runtime_err = PyObject_CallFunction(
-                PyExc_RuntimeError, "s", "Erlang callback failed");
-            PyObject *ret = PyObject_CallFunctionObjArgs(
-                set_exception, runtime_err, NULL);
-            Py_XDECREF(ret);
-            Py_XDECREF(runtime_err);
-        }
-        Py_DECREF(set_exception);
-    }
-
-    Py_XDECREF(exc_type);
-    Py_XDECREF(exc_value);
-    Py_XDECREF(exc_tb);
+    /* Actor dispatch and its caller may run on distinct existing loops.
+     * set_result from the reader's thread does not wake the owning selector.
+     * Schedule on that loop and recheck cancellation there. */
+    PyObject *error = result == NULL ? PyErr_GetRaisedException() : NULL;
+    if (result == NULL && error == NULL)
+        error = PyObject_CallFunction(PyExc_RuntimeError, "s", "Erlang callback failed");
+    PyObject *value = result != NULL ? result : error;
+    PyObject *payload = value == NULL ? NULL :
+        PyTuple_Pack(3, future, value, result == NULL ? Py_True : Py_False);
+    PyObject *callback = payload == NULL ? NULL :
+        PyCFunction_New(&resolve_future_on_owner_method, payload);
+    PyObject *loop = callback == NULL ? NULL : PyObject_CallMethod(future, "get_loop", NULL);
+    PyObject *scheduled = loop == NULL ? NULL :
+        PyObject_CallMethod(loop, "call_soon_threadsafe", "O", callback);
+    Py_XDECREF(scheduled);
+    Py_XDECREF(loop);
+    Py_XDECREF(callback);
+    Py_XDECREF(payload);
+    Py_XDECREF(error);
+    /* A closed caller loop has abandoned its reply. Native decoding above
+     * already released the retained reply environment. */
     PyErr_Clear();
 }
 
@@ -2559,8 +2563,19 @@ static PyObject *send_async_callback_request(PyObject *self, PyObject *args) {
     }
     memcpy(fn_buf, func_name, func_name_len);
 
-    /* Convert args to Erlang term */
+    /* Data actor credits cover this generic queue too. Transfer ownership
+     * before copying payload bytes into the callback message environment. */
+    bool actor_data = strcmp(func_name, "_actor_data_call") == 0;
+    if (actor_data && actor_data_prepare(msg_env, call_args) < 0) {
+        enif_free_env(msg_env);
+        return NULL;
+    }
     ERL_NIF_TERM args_term = py_to_term(msg_env, call_args);
+    if (PyErr_Occurred()) {
+        if (actor_data) actor_data_send_failed(call_args);
+        enif_free_env(msg_env);
+        return NULL;
+    }
     ERL_NIF_TERM id_term = enif_make_uint64(msg_env, callback_id);
 
     /* Send message: {async_callback, CallbackId, FuncName, Args, WriteFd}
@@ -2573,6 +2588,7 @@ static PyObject *send_async_callback_request(PyObject *self, PyObject *args) {
         enif_make_int(msg_env, state->async_callback_pipe[1]));
 
     if (!enif_send(NULL, &g_thread_coordinator_pid, msg_env, msg)) {
+        if (actor_data) actor_data_send_failed(call_args);
         enif_free_env(msg_env);
         PyErr_SetString(PyExc_RuntimeError, "Failed to send async callback message");
         return NULL;
@@ -3388,6 +3404,9 @@ static PyMethodDef ErlangModuleMethods[] = {
      "Check/consume NIF time slice for cooperative scheduling.\n\n"
      "Usage: if erlang.consume_time_slice(percent): return erlang.schedule_py(...)\n"
      "Returns True if time slice exhausted (should yield), False if more time remains."},
+    {"_actor_reserve", python_actor_reserve, METH_VARARGS, "Reserve encoded request bytes before callback enqueue."},
+    {"_actor_abort", python_actor_abort, METH_O, "Abort only an uncommitted ticket."},
+    {"_actor_complete", python_actor_complete, METH_O, "Acknowledge actual data dispatch completion."},
     {"_actor_retain", python_actor_retain, METH_O, "Retain a main-interpreter object."},
     {"_actor_unwrap", python_actor_unwrap, METH_O, "Recover a retained Python object."},
     {"_get_async_callback_fd", get_async_callback_fd, METH_NOARGS,
@@ -3705,10 +3724,11 @@ static int create_erlang_module(void) {
      * This is implemented in Python for easier asyncio integration. */
     const char *async_call_code =
         "import asyncio\n"
+        "import weakref\n"
         "import erlang\n"
         "\n"
         "# Track if we've registered the reader with the event loop\n"
-        "_async_reader_registered = {}\n"
+        "_async_reader_registered = weakref.WeakKeyDictionary()\n"
         "\n"
         "async def async_call(func_name, *args):\n"
         "    '''\n"
@@ -3732,11 +3752,10 @@ static int create_erlang_module(void) {
         "    loop = asyncio.get_running_loop()\n"
         "    \n"
         "    # Ensure the reader is registered with this event loop\n"
-        "    loop_id = id(loop)\n"
-        "    if loop_id not in _async_reader_registered:\n"
+        "    if loop not in _async_reader_registered:\n"
         "        fd = erlang._get_async_callback_fd()\n"
         "        loop.add_reader(fd, erlang._async_callback_reader)\n"
-        "        _async_reader_registered[loop_id] = True\n"
+        "        _async_reader_registered[loop] = True\n"
         "    \n"
         "    # Create a Future for this call\n"
         "    future = loop.create_future()\n"

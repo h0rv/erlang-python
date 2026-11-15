@@ -1,11 +1,20 @@
 -module(py_supervision).
 -behaviour(supervisor).
 
--export([start_link/1, init/1, register_callbacks/0, callback/1]).
+-export([start_link/1, start_actor_root/0, init/1, register_callbacks/0, callback/1]).
+
+start_actor_root() ->
+    supervisor:start_link({local, py_actor_root}, ?MODULE,
+        #{strategy => one_for_one, intensity => 5, period => 10}).
 
 %% Install this supervisor as a child of the application's OTP supervisor.
-%% There is deliberately no unowned root creation callback.
+%% The actor root is owned by erlang_python_sup, never a Python callback.
 -spec start_link(map()) -> supervisor:startlink_ret().
+start_link(#{mailbox := bounded, max_children := Max} = Flags)
+  when is_integer(Max), Max > 0 ->
+    %% py_actor_group serializes child admission before start_child. This
+    %% supervisor owns only OTP lifecycle, not a second admission queue.
+    supervisor:start_link(?MODULE, maps:without([mailbox, max_children], Flags));
 start_link(#{mailbox := unbounded, max_children := unbounded} = Flags) ->
     supervisor:start_link(?MODULE, maps:without([mailbox, max_children], Flags));
 start_link(_) ->

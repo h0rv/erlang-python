@@ -427,6 +427,10 @@ static ERL_NIF_TERM py_to_term_d(ErlNifEnv *env, PyObject *obj, int depth) {
         PyErr_Clear();
     }
 
+    if (PyCapsule_IsValid(obj, "erlang.actor_gate") ||
+        PyCapsule_IsValid(obj, "erlang.actor_ticket"))
+        return actor_data_to_term(env, obj);
+
     if (PyCapsule_IsValid(obj, "erlang.local_object"))
         return python_actor_to_term(env, obj);
 
@@ -722,6 +726,9 @@ static PyObject *term_to_py_d(ErlNifEnv *env, ERL_NIF_TERM term, int depth) {
             return (PyObject *)obj;
         }
     }
+
+    PyObject *admission = actor_data_from_term(env, term);
+    if (admission != NULL || PyErr_Occurred()) return admission;
 
     PyObject *local = python_actor_from_term(env, term);
     if (local != NULL || PyErr_Occurred()) return local;

@@ -159,6 +159,13 @@ handle_info({async_callback, CallbackId, FuncName, Args, WriteFd}, State0) ->
             %% rather than hanging). Overflow replies are not reserved
             %% slots and do not decrement the counter in the writer.
             atomics:sub(Counter, 1, 1),
+            %% No dispatch was started: the pre-enqueue actor reservation
+            %% can be rejected here, never by caller cancellation.
+            case {FuncName, Args} of
+                {<<"_actor_data_call">>, {_, _, Ticket, _}} ->
+                    py_nif:actor_ticket_reject(Ticket);
+                _ -> ok
+            end,
             Writer ! {overflow, CallbackId};
         _ ->
             spawn(fun() ->

@@ -77,6 +77,10 @@
     %% Async task queue NIFs (uvloop-inspired)
     submit_task/7,
     submit_task_with_env/8,
+    actor_gate_new/2,
+    actor_gate_info/1,
+    actor_ticket_commit/3,
+    actor_ticket_reject/1,
     work_admission_configure/4,
     work_admission_info/1,
     work_admission_close/1,
@@ -619,6 +623,11 @@ event_loop_run_async(_LoopRef, _CallerPid, _Ref, _Module, _Func, _Args, _Kwargs)
     ok | {error, term()}.
 submit_task(_LoopRef, _CallerPid, _Ref, _Module, _Func, _Args, _Kwargs) ->
     ?NIF_STUB.
+
+actor_gate_new(_Count, _Bytes) -> ?NIF_STUB.
+actor_gate_info(_Gate) -> ?NIF_STUB.
+actor_ticket_commit(_Ticket, _Gate, _Bytes) -> ?NIF_STUB.
+actor_ticket_reject(_Ticket) -> ?NIF_STUB.
 
 %% @doc Configure one shared native gate for this LoopRef. Never reopens.
 -spec work_admission_configure(reference(), pid(), admission_limit(), admission_limit()) ->

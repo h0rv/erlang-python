@@ -49,6 +49,7 @@ init([]) ->
 
     %% Initialize callback registry ETS table (owned by supervisor for resilience)
     ok = py_callback:init_tab(),
+    ok = py_actor_group:register_callbacks(),
 
     %% Initialize shared state ETS table (owned by supervisor for resilience)
     ok = py_state:init_tab(),
@@ -178,10 +179,17 @@ init([]) ->
         modules => [py_event_loop_pool]
     },
 
+    ActorRegistrySpec = #{id => py_actor_registry,
+        start => {py_actor_registry, start_link, []}, restart => permanent,
+        shutdown => 5000, type => worker},
+    ActorRootSpec = #{id => py_actor_root,
+        start => {py_supervision, start_actor_root, []}, restart => permanent,
+        shutdown => infinity, type => supervisor},
+
     Children = [CallbackSpec, ShmSpec, ThreadHandlerSpec, LoggerSpec, TracerSpec,
                 ContextSupSpec, ContextRouterInitSpec,
                 WorkerRegistrySpec, WorkerSupSpec, EventLoopSpec,
-                EventLoopPoolSpec],
+                EventLoopPoolSpec, ActorRegistrySpec, ActorRootSpec],
 
     {ok, {
         #{strategy => one_for_all, intensity => 5, period => 10},

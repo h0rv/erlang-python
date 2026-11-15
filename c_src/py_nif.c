@@ -259,6 +259,13 @@ static int is_inline_schedule_marker(PyObject *obj);
 static PyObject *python_actor_retain(PyObject *self, PyObject *value);
 static PyObject *python_actor_unwrap(PyObject *self, PyObject *value);
 static ERL_NIF_TERM python_actor_to_term(ErlNifEnv *env, PyObject *value);
+static ERL_NIF_TERM actor_data_to_term(ErlNifEnv *env, PyObject *value);
+static PyObject *actor_data_from_term(ErlNifEnv *env, ERL_NIF_TERM value);
+static PyObject *python_actor_reserve(PyObject *self, PyObject *args);
+static PyObject *python_actor_abort(PyObject *self, PyObject *value);
+static PyObject *python_actor_complete(PyObject *self, PyObject *value);
+static int actor_data_prepare(ErlNifEnv *env, PyObject *args);
+static void actor_data_send_failed(PyObject *args);
 static PyObject *python_actor_from_term(ErlNifEnv *env, ERL_NIF_TERM term);
 
 #include "py_convert.c"
@@ -272,6 +279,7 @@ static PyObject *ctx_call_erlang_inline(py_context_t *ctx, const char *func_name
 #include "py_callback.c"
 #include "py_thread_worker.c"
 #include "py_work_admission.c"
+#include "py_actor_data.c"
 #include "py_event_loop.c"
 #include "py_subinterp_thread.c"
 #include "py_reactor_buffer.c"
@@ -5850,6 +5858,8 @@ static int load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info) {
         return -1;
     }
 
+    if (actor_data_init(env) != 0) return -1;
+
     /* Create resource types */
     PYOBJ_RESOURCE_TYPE = enif_open_resource_type(
         env, NULL, "py_object", pyobj_destructor,
@@ -6051,6 +6061,10 @@ static ErlNifFunc nif_funcs[] = {
     {"context_call", 6, nif_context_call_with_env, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"context_call_async", 7, nif_context_call_async, 0},
     {"local_object_async", 5, nif_local_object_async, 0},
+    {"actor_gate_new", 2, nif_actor_gate_new, 0},
+    {"actor_gate_info", 1, nif_actor_gate_info, 0},
+    {"actor_ticket_commit", 3, nif_actor_ticket_commit, 0},
+    {"actor_ticket_reject", 1, nif_actor_ticket_reject, 0},
     {"context_eval_async", 5, nif_context_eval_async, 0},
     {"context_exec_async", 4, nif_context_exec_async, 0},
     {"context_call_with_env_async", 8, nif_context_call_with_env_async, 0},

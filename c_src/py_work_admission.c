@@ -11,6 +11,9 @@ struct work_admission {
     uint64_t max_bytes;
     uint64_t count;
     uint64_t bytes;
+    /* Work transferred to an external dispatch queue, whose completion may
+     * outlive its owner process. Protected by the same admission mutex. */
+    uint64_t unsettled;
     bool closed;
 };
 
