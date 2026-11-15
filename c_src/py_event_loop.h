@@ -424,6 +424,10 @@ typedef struct erlang_event_loop {
     /** @brief Python ErlangEventLoop instance (direct ref, no thread-local) */
     PyObject *py_loop;
 
+    /* Exact-owner claim generation, guarded by mutex. Native callback replies
+     * retain this number, not a Python owner reference. */
+    uint64_t py_owner_generation;
+
     /** @brief Whether py_loop has been set */
     bool py_loop_valid;
 

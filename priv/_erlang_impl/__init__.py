@@ -181,7 +181,18 @@ def _run_loop_forever(notify_pid: object | None = None, capsule: object | None =
     running. Returns 'stopped' when _stop_loop() ran, propagates
     KeyboardInterrupt when py_context:interrupt/1 was used.
     """
-    loop = ErlangEventLoop(capsule)
+    import py_event_loop
+
+    # submit_await may already have created the shared resource's driver on
+    # an Erlang scheduler thread. Thread-local asyncio policy state is not its
+    # identity. Resume that exact owner; never release a stopped wrapper here.
+    loop = py_event_loop._get_loop_ref(capsule)
+    if loop is None:
+        loop = ErlangEventLoop(capsule)
+    if not isinstance(loop, ErlangEventLoop) or loop.is_closed():
+        raise RuntimeError("Native resource has no usable ErlangEventLoop owner")
+    if loop.is_running():
+        raise RuntimeError("Native resource driver is already running")
     asyncio.set_event_loop(loop)
     if notify_pid is not None:
         import erlang as _erlang

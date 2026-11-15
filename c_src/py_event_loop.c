@@ -7746,6 +7746,7 @@ static int claim_python_loop(erlang_event_loop_t *loop, PyObject *owner) {
     bool claimed = !stopped && !conflict && loop->py_loop == NULL;
     if (claimed) {
         loop->py_loop = owner;
+        loop->py_owner_generation++;
         loop->py_loop_valid = true;
     }
     pthread_mutex_unlock(&loop->mutex);
@@ -7848,6 +7849,29 @@ static PyObject *py_clear_loop_ref(PyObject *self, PyObject *args) {
     bool had_owner = released != NULL;
     Py_XDECREF(released);
     return PyBool_FromLong(had_owner);
+}
+
+/* Internal driver lookup. Observe the exact resource owner without releasing
+ * or replacing its claim. Constructors must continue to use claim_python_loop. */
+static PyObject *py_get_loop_ref(PyObject *self, PyObject *args) {
+    (void)self;
+    PyObject *capsule = Py_None;
+    if (!PyArg_ParseTuple(args, "|O", &capsule)) return NULL;
+    erlang_event_loop_t *loop = capsule == Py_None
+        ? get_interpreter_event_loop() : loop_from_capsule(capsule);
+    if (loop == NULL) {
+        if (!PyErr_Occurred()) PyErr_SetString(PyExc_RuntimeError, "No native event loop");
+        return NULL;
+    }
+    if (PyInterpreterState_GetID(PyInterpreterState_Get()) != loop->interp_id) {
+        PyErr_SetString(PyExc_RuntimeError, "Native loop belongs to another interpreter");
+        return NULL;
+    }
+    pthread_mutex_lock(&loop->mutex);
+    PyObject *owner = Py_XNewRef(loop->py_loop);
+    pthread_mutex_unlock(&loop->mutex);
+    if (owner == NULL) Py_RETURN_NONE;
+    return owner;
 }
 
 /* Python function: _get_global_loop_capsule() -> capsule
@@ -8635,6 +8659,7 @@ static PyMethodDef PyEventLoopMethods[] = {
     {"_loop_new", py_loop_new, METH_NOARGS, "Create a new event loop, returns capsule"},
     {"_get_global_loop_capsule", py_get_global_loop_capsule, METH_NOARGS, "Get capsule for global event loop"},
     {"_has_loop_ref", py_has_loop_ref, METH_VARARGS, "Check if loop capsule has Python loop reference"},
+    {"_get_loop_ref", py_get_loop_ref, METH_VARARGS, "Get the exact native resource owner for an internal driver transition"},
     {"_clear_loop_ref", py_clear_loop_ref, METH_VARARGS, "Clear Python loop reference from C struct"},
     {"_loop_destroy", py_loop_destroy, METH_VARARGS, "Destroy an event loop"},
     {"_set_loop_ref", py_set_loop_ref, METH_VARARGS, "Store Python loop reference in C struct"},
