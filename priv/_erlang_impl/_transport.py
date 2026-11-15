@@ -21,10 +21,10 @@ for TCP, UDP, and Unix sockets backed by the Erlang event loop.
 
 import asyncio
 import errno
-import socket
 from asyncio import transports
 from collections import deque
-from typing import Any, Optional, Tuple
+from collections.abc import Callable
+from typing import override
 
 __all__ = [
     'ErlangSocketTransport',
@@ -33,23 +33,26 @@ __all__ = [
 ]
 
 
-class ErlangSocketTransport(transports.Transport):
+class ErlangSocketTransport(transports._FlowControlMixin):
     """Socket transport for ErlangEventLoop.
 
     Implements asyncio.Transport for TCP and Unix stream sockets.
     """
 
     __slots__ = (
-        '_loop', '_sock', '_protocol', '_buffer', '_buffer_offset', '_closing',
+        '_sock', '_protocol', '_buffer', '_buffer_offset', '_closing',
         '_conn_lost', '_write_ready', '_paused', '_extra', '_fileno', '_extra_loaded',
     )
+
+    # These inherited CPython methods are not declared in typeshed.
+    _maybe_pause_protocol: Callable[[], None]
+    _maybe_resume_protocol: Callable[[], None]
 
     _buffer_factory = bytearray
     max_size = 256 * 1024  # 256 KB
 
     def __init__(self, loop, sock, protocol, extra=None):
-        super().__init__(extra)
-        self._loop = loop
+        super().__init__(extra, loop=loop)
         self._sock = sock
         self._protocol = protocol
         self._buffer = self._buffer_factory()
@@ -124,6 +127,7 @@ class ErlangSocketTransport(transports.Transport):
                     self._call_connection_lost(None)
                 return
 
+    @override
     def write(self, data):
         """Write data to the transport."""
         if self._conn_lost or self._closing:
@@ -152,6 +156,7 @@ class ErlangSocketTransport(transports.Transport):
             self._loop.add_writer(self._fileno, self._write_ready_cb)
 
         self._buffer.extend(data)
+        self._maybe_pause_protocol()
 
     # Maximum writes per callback to avoid starving other events
     _max_writes_per_call = 16
@@ -174,9 +179,8 @@ class ErlangSocketTransport(transports.Transport):
                     self._call_connection_lost(None)
                 return
 
+            data_view = memoryview(self._buffer)[self._buffer_offset:]
             try:
-                # Use memoryview with offset for O(1) access to remaining data
-                data_view = memoryview(self._buffer)[self._buffer_offset:]
                 n = self._sock.send(data_view)
             except (BlockingIOError, InterruptedError):
                 # EAGAIN - socket buffer full
@@ -194,8 +198,12 @@ class ErlangSocketTransport(transports.Transport):
                 self._fatal_error(exc, 'Fatal write error')
                 return
 
+            finally:
+                data_view.release()
+
             if n:
                 self._buffer_offset += n  # O(1) offset update instead of O(n) deletion
+                self._maybe_resume_protocol()
 
         # Check if buffer is fully consumed after budget exhausted
         if self._buffer_offset >= len(self._buffer):
@@ -206,6 +214,7 @@ class ErlangSocketTransport(transports.Transport):
             if self._closing:
                 self._call_connection_lost(None)
 
+    @override
     def write_eof(self):
         """Close the write end."""
         if self._closing:
@@ -216,9 +225,11 @@ class ErlangSocketTransport(transports.Transport):
             self._loop._stop_reading(self._fileno)
             self._call_connection_lost(None)
 
+    @override
     def can_write_eof(self):
         return True
 
+    @override
     def close(self):
         """Close the transport."""
         if self._closing:
@@ -254,8 +265,9 @@ class ErlangSocketTransport(transports.Transport):
             'transport': self,
             'protocol': self._protocol,
         })
-        self.close()
+        self.abort()
 
+    @override
     def get_extra_info(self, name, default=None):
         # Lazy load sockname/peername on first access
         if not self._extra_loaded:
@@ -270,18 +282,15 @@ class ErlangSocketTransport(transports.Transport):
                 pass
         return self._extra.get(name, default)
 
+    @override
     def is_closing(self):
         return self._closing
 
+    @override
     def get_write_buffer_size(self):
-        return len(self._buffer)
+        return len(self._buffer) - self._buffer_offset
 
-    def get_write_buffer_limits(self):
-        return (0, 0)
-
-    def set_write_buffer_limits(self, high=None, low=None):
-        pass
-
+    @override
     def abort(self):
         """Close immediately."""
         self._closing = True
@@ -290,6 +299,7 @@ class ErlangSocketTransport(transports.Transport):
         self._loop._stop_writing(self._fileno)
         self._call_connection_lost(None)
 
+    @override
     def pause_reading(self):
         """Pause reading from the transport."""
         if self._closing or self._paused:
@@ -297,6 +307,7 @@ class ErlangSocketTransport(transports.Transport):
         self._paused = True
         self._loop._stop_reading(self._fileno)
 
+    @override
     def resume_reading(self):
         """Resume reading from the transport."""
         if self._closing or not self._paused:
@@ -304,6 +315,7 @@ class ErlangSocketTransport(transports.Transport):
         self._paused = False
         self._loop.add_reader(self._fileno, self._read_ready)
 
+    @override
     def is_reading(self):
         """Return True if the transport is receiving."""
         return not self._paused and not self._closing
@@ -384,6 +396,7 @@ class ErlangDatagramTransport(transports.DatagramTransport):
 
             self._protocol.datagram_received(data, addr)
 
+    @override
     def sendto(self, data, addr=None):
         """Send data to the transport."""
         if self._conn_lost or self._closing:
@@ -456,6 +469,7 @@ class ErlangDatagramTransport(transports.DatagramTransport):
         if self._closing:
             self._call_connection_lost(None)
 
+    @override
     def close(self):
         """Close the transport."""
         if self._closing:
@@ -492,6 +506,7 @@ class ErlangDatagramTransport(transports.DatagramTransport):
         })
         self.close()
 
+    @override
     def get_extra_info(self, name, default=None):
         # Lazy load sockname on first access
         if not self._extra_loaded:
@@ -502,9 +517,11 @@ class ErlangDatagramTransport(transports.DatagramTransport):
                 pass
         return self._extra.get(name, default)
 
+    @override
     def is_closing(self):
         return self._closing
 
+    @override
     def abort(self):
         """Close immediately."""
         self._closing = True

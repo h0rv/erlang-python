@@ -9,6 +9,7 @@ start() ->
         application:set_env(erlang_python, num_contexts, 1),
         application:set_env(erlang_python, event_loop_pool_size, 1),
         {ok, _} = application:ensure_all_started(erlang_python),
+        Services = start_services(),
         Ctx = py:context(1),
         ok = py_context:exec(Ctx,
             <<"import json, os, sys; "
@@ -23,7 +24,7 @@ start() ->
         ok = py_context:start_loop(Ctx),
         {ok, Task} = py_context:submit(Ctx, 'pybeam.runtime.loader', invoke, []),
         {Status, Deadline} = wait(Ctx, Task, Shutdown, Budget),
-        finish(Ctx, Status, Deadline)
+        finish(Ctx, Services, Status, Deadline)
     catch
         Class:Reason:Stack ->
             io:format(standard_error, "PyBeam runtime failed: ~p:~p~n~p~n",
@@ -75,7 +76,31 @@ bounded(Operation, Deadline) ->
         error(shutdown_deadline_exceeded)
     end.
 
-finish(Ctx, Status, Deadline) ->
+%% Hornbeam's supervisor starts dormant listener ownership, not an HTTP service.
+%% Keep this opt-in: ordinary managed programs must not require Hornbeam.
+start_services() ->
+    case os:getenv("PYBEAM_HORNBEAM_SERVICES") of
+        false -> none;
+        "1" ->
+            ok = application:load(hornbeam),
+            {ok, Sup} = hornbeam_sup:start_link(),
+            false = hornbeam_listener:is_running(),
+            ok = py:register_function(hornbeam_services, hornbeam_services, callback),
+            Sup;
+        Other -> error({invalid_hornbeam_services_option, Other})
+    end.
+
+stop_services(none, _Deadline) -> ok;
+stop_services(Sup, Deadline) ->
+    %% Refuse to stop a replacement or another owner's supervisor.
+    Sup = whereis(hornbeam_sup),
+    false = hornbeam_listener:is_running(),
+    ok = bounded(fun() -> gen_server:stop(Sup, normal, remaining(Deadline)) end, Deadline),
+    undefined = whereis(hornbeam_sup),
+    undefined = whereis(hornbeam_services),
+    ok = py:unregister_function(hornbeam_services).
+
+finish(Ctx, Services, Status, Deadline) ->
     try
         ok = marker("PYBEAM_COMPLETION", integer_to_binary(Status)),
         %% Python None is converted to the atom none by py_convert.c.
@@ -83,6 +108,7 @@ finish(Ctx, Status, Deadline) ->
             Left = remaining(Deadline),
             py_context:submit_await(Ctx, 'pybeam.runtime.loader', shutdown, [Left], #{}, Left)
         end, Deadline),
+        ok = stop_services(Services, Deadline),
         ok = bounded(fun() -> py_context:stop_loop(Ctx, remaining(Deadline)) end, Deadline),
         %% stop_loop replies ok even after an interrupted driver exit. Require
         %% the driver's actual normal result, not just the control reply.
