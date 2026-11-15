@@ -182,6 +182,10 @@ stop(Ctx) when is_pid(Ctx) ->
 %%
 %% Options:
 %% - `mode' - Context mode (worker | owngil | isolated), default: worker
+%% - `managed_loop' - `shared' (default) or `dedicated' for worker mode.
+%%   Dedicated binds start_loop/submit/stop_loop to a context-owned native loop
+%%   without replacing the interpreter's shared loop. Python objects still share
+%%   the main interpreter and GIL; this is not interpreter isolation.
 %% - `memory_limit' - Cap in bytes on memory allocated by this context.
 %%   Requires `mode => owngil' and the runtime started with
 %%   `enable_memory_limits'; see py_nif:context_set_memory_limit/2 for what
@@ -193,7 +197,12 @@ stop(Ctx) when is_pid(Ctx) ->
 new(Opts) when is_map(Opts) ->
     Mode = maps:get(mode, Opts, worker),
     Id = erlang:unique_integer([positive]),
-    start_link(Id, Mode, Opts).
+    case {maps:get(managed_loop, Opts, shared), Mode} of
+        {shared, _} -> start_link(Id, Mode, Opts);
+        {dedicated, worker} -> start_link(Id, Mode, Opts);
+        {dedicated, _} -> {error, {unsupported_managed_loop, Mode}};
+        {Other, _} -> {error, {invalid_managed_loop, Other}}
+    end.
 
 %% @doc Alias for stop/1 for API consistency.
 -spec destroy(context()) -> ok.

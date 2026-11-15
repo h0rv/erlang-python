@@ -171,7 +171,7 @@ def new_event_loop() -> ErlangEventLoop:
     return ErlangEventLoop()
 
 
-def _run_loop_forever(notify_pid=None):
+def _run_loop_forever(notify_pid: object | None = None, capsule: object | None = None) -> str:
     """Run an ErlangEventLoop on this thread until it is stopped.
 
     Entry point of py_context:start_loop/1: the context thread stays here
@@ -180,7 +180,7 @@ def _run_loop_forever(notify_pid=None):
     running. Returns 'stopped' when _stop_loop() ran, propagates
     KeyboardInterrupt when py_context:interrupt/1 was used.
     """
-    loop = new_event_loop()
+    loop = ErlangEventLoop(capsule)
     asyncio.set_event_loop(loop)
     if notify_pid is not None:
         import erlang as _erlang

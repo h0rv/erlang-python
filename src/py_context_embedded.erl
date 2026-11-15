@@ -107,7 +107,7 @@ init_started(Parent, Id, Ref, InterpId, Opts) ->
             end
     end,
     %% For subinterpreters, create a dedicated event worker
-    EventState = setup_event_worker(Ref, InterpId),
+    EventState = setup_event_worker(Ref, InterpId, Opts),
     %% For thread-model subinterpreters, spawn a dedicated callback handler
     %% because the main context process will be blocked in the NIF
     CallbackHandler = case maps:get(mode, EventState, normal) of
@@ -133,7 +133,7 @@ init_started(Parent, Id, Ref, InterpId, Opts) ->
     loop(State).
 
 %% @private Create event worker for subinterpreter contexts
-setup_event_worker(Ref, InterpId) ->
+setup_event_worker(Ref, InterpId, Opts) ->
     case py_nif:context_get_event_loop(Ref) of
         {ok, LoopRef} ->
             %% This is a subinterpreter - create dedicated event worker
@@ -151,8 +151,21 @@ setup_event_worker(Ref, InterpId) ->
                     #{}
             end;
         {error, not_subinterp} ->
-            %% Worker mode - uses shared router (lazy initialization)
-            #{};
+            case maps:get(managed_loop, Opts, shared) of
+                shared -> #{};
+                dedicated ->
+                    {ok, LoopRef} = py_nif:event_loop_new(),
+                    WorkerId = iolist_to_binary(["ctx_loop_", pid_to_list(self())]),
+                    case py_event_worker:start_link(WorkerId, LoopRef) of
+                        {ok, WorkerPid} ->
+                            ok = py_nif:event_loop_set_worker(LoopRef, WorkerPid),
+                            #{loop_ref => LoopRef, worker_pid => WorkerPid, dedicated => true};
+                        {error, Error} ->
+                            ok = py_nif:event_loop_destroy(LoopRef),
+                            error({dedicated_loop_worker, Error})
+                    end;
+                Other -> error({invalid_managed_loop, Other})
+            end;
         {error, event_loop_owned_by_thread} ->
             %% Thread-model subinterpreter: event loop is managed by dedicated thread.
             %% This is expected behavior, not a failure.
@@ -398,7 +411,11 @@ loop(#state{ref = Ref, interp_id = InterpId, loop_req = LoopReq} = State) ->
                             error_logger:warning_msg(
                                 "py_context ~p: Event worker died: ~p~n",
                                 [InterpId, Reason]),
-                            NewState = State#state{event_state = #{}},
+                            EventState = case maps:get(dedicated, State#state.event_state, false) of
+                                true -> maps:remove(worker_pid, State#state.event_state);
+                                false -> #{}
+                            end,
+                            NewState = State#state{event_state = EventState},
                             loop(NewState);
                         _ when Reason =:= shutdown; Reason =:= kill ->
                             %% Supervisor shutdown or kill signal - clean exit
@@ -440,8 +457,12 @@ do_start_loop(Owner, #state{ref = Ref} = State) ->
     case context_loop_ref(State) of
         {ok, _} ->
             LoopReq = make_ref(),
+            Args = case State#state.event_state of
+                #{dedicated := true, loop_ref := Dedicated} -> [self(), Dedicated];
+                _ -> [self()]
+            end,
             case py_nif:context_call_async(Ref, self(), LoopReq, <<"erlang">>,
-                                           <<"_run_loop_forever">>, [self()], #{}) of
+                                           <<"_run_loop_forever">>, Args, #{}) of
                 {enqueued, LoopReq} ->
                     %% Wait for the loop to actually run before answering, so
                     %% a submit right after start_loop finds it
@@ -538,6 +559,11 @@ terminate(_Reason, #state{ref = Ref, event_state = EventState, callback_handler 
     end,
     %% Destroy the Python context
     try py_nif:context_destroy(Ref) catch _:_ -> ok end,
+    case EventState of
+        #{dedicated := true, loop_ref := LoopRef} ->
+            ok = py_nif:event_loop_destroy(LoopRef);
+        _ -> ok
+    end,
     ok.
 
 %% ============================================================================
