@@ -186,9 +186,9 @@ dup_fd_test(_Config) ->
 %% fd-handle registry: pre-fix the id was cast straight to a pointer and
 %% dereferenced, so a bogus id crashed the node.
 fd_registry_invalid_id_test(_Config) ->
-    {ok, none} = py:eval(<<"__import__('py_event_loop')._remove_reader(999999999)">>),
-    {ok, none} = py:eval(<<"__import__('py_event_loop')._remove_writer(123456789)">>),
-    {ok, none} = py:eval(<<"__import__('py_event_loop')._release_fd_resource(42)">>),
+    {ok, <<"absent">>} = py:eval(<<"__import__('py_event_loop')._remove_reader(999999999)">>),
+    {ok, <<"absent">>} = py:eval(<<"__import__('py_event_loop')._remove_writer(123456789)">>),
+    {ok, <<"absent">>} = py:eval(<<"__import__('py_event_loop')._release_fd_resource(42)">>),
     {ok, none} = py:eval(<<"__import__('py_event_loop')._clear_fd_read(7)">>),
     %% _update_fd_* rejects an unknown id with a clean ValueError, not a crash.
     {error, _} = py:eval(<<"__import__('py_event_loop')._update_fd_read(54321, 1)">>),
