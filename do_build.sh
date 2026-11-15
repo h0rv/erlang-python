@@ -25,13 +25,18 @@ case "$requested" in
     *) echo '-j requires 1 or 2' >&2; exit 2 ;;
 esac
 [ "$requested" -ge "$jobs" ] || jobs=$requested
-# Do not permit later native-tool options to override the ceiling.
-for argument do
-    case "$argument" in
-        *-j*|*--jobs*|*--parallel*)
-            echo 'Additional parallelism options are forbidden' >&2; exit 2 ;;
-    esac
-done
+# Project hooks use only no arguments or one bounded -j option. Do not expose
+# make's CLI: clusters, abbreviations and variable assignments can undo -j.
+if [ "$#" -ne 0 ]; then
+    echo 'Unsupported build arguments; use no arguments, -j1, -j2, -j 1 or -j 2' >&2
+    exit 2
+fi
+# Inherited make controls can carry variable redefinitions into recursive make.
+# CMake's explicit parallel budget is the sole source of job control here.
+if [ -n "${MAKEFLAGS-}${MFLAGS-}${GNUMAKEFLAGS-}${MAKEOVERRIDES-}" ]; then
+    echo 'Inherited make controls replaced by the compiler job budget' >&2
+fi
+unset MAKEFLAGS MFLAGS GNUMAKEFLAGS MAKEOVERRIDES
 
 cd _build/cmake
 if command -v cmake3 > /dev/null 2>&1; then
@@ -39,4 +44,4 @@ if command -v cmake3 > /dev/null 2>&1; then
 else
     CMAKE=cmake
 fi
-exec "$CMAKE" --build . --parallel "$jobs" -- "$@"
+exec "$CMAKE" --build . --parallel "$jobs"
