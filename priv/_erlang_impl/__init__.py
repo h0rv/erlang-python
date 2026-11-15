@@ -68,6 +68,7 @@ from . import _byte_channel as byte_channel
 from . import _server as server
 from _erlang_impl import _supervision as supervision
 from . import _actors as actors
+from _erlang_impl import _tasks as tasks
 from ._channel import Channel, reply, ChannelClosed
 from ._byte_channel import ByteChannel, ByteChannelClosed
 
@@ -171,7 +172,7 @@ def new_event_loop() -> ErlangEventLoop:
     return ErlangEventLoop()
 
 
-def _run_loop_forever(notify_pid=None):
+def _run_loop_forever(notify_pid: object | None = None, capsule: object | None = None) -> str:
     """Run an ErlangEventLoop on this thread until it is stopped.
 
     Entry point of py_context:start_loop/1: the context thread stays here
@@ -180,30 +181,69 @@ def _run_loop_forever(notify_pid=None):
     running. Returns 'stopped' when _stop_loop() ran, propagates
     KeyboardInterrupt when py_context:interrupt/1 was used.
     """
-    loop = new_event_loop()
-    asyncio.set_event_loop(loop)
-    if notify_pid is not None:
-        import erlang as _erlang
+    import py_event_loop
+
+    # submit_await may already have created the shared resource's driver on
+    # an Erlang scheduler thread. Thread-local asyncio policy state is not its
+    # identity. Resume that exact owner; never release a stopped wrapper here.
+    loop = py_event_loop._get_loop_ref(capsule)
+    if loop is None:
+        loop = ErlangEventLoop(capsule)
+    if not isinstance(loop, ErlangEventLoop) or loop.is_closed():
+        raise RuntimeError("Native resource has no usable ErlangEventLoop owner")
+    # Claim before publishing a startup callback or changing thread policy.
+    # A stopped wrapper is reusable, but its driver session is exclusive.
+    with loop._driver_session():
+        from _erlang_impl._lifecycle import begin_managed_shutdown, shutdown_managed_loop
+
+        started = False
 
         def _started():
-            try:
+            nonlocal started
+            started = True
+            if notify_pid is not None:
+                import erlang as _erlang
                 _erlang.send(notify_pid, (atom('py_loop_started'),))
-            except Exception:
-                pass
-        loop.call_soon(_started)
-    try:
-        loop.run_forever()
-    finally:
+
+        startup = None
         try:
-            asyncio.set_event_loop(None)
+            asyncio.set_event_loop(loop)
+            startup = loop.call_soon(_started)
+            loop.run_forever()
         finally:
-            loop.close()
+            if startup is not None:
+                startup.cancel()
+            try:
+                # A failed startup never ran this driver's acknowledgement.
+                # Leave its retained wrapper and callbacks intact for retry.
+                if started:
+                    loop._managed_shutdown_requested = True
+                    observer = begin_managed_shutdown(loop)
+                    cleanup_failed = False
+                    while True:
+                        errors = loop.run_until_complete(shutdown_managed_loop(loop))
+                        cleanup_failed = cleanup_failed or bool(errors)
+                        if not observer.pending() and not loop._ready and not loop._asyncgens:
+                            break
+                    loop.close()
+                    if cleanup_failed or observer.failed:
+                        raise RuntimeError("Managed loop cleanup failed") from None
+            finally:
+                asyncio.set_event_loop(None)
     return 'stopped'
 
 
 async def _stop_loop():
-    """Stop the loop running _run_loop_forever() from inside it."""
-    asyncio.get_running_loop().stop()
+    """Request managed shutdown without interrupting cleanup already in progress."""
+    loop = asyncio.get_running_loop()
+    if not isinstance(loop, ErlangEventLoop):
+        raise RuntimeError("Managed shutdown requires an ErlangEventLoop")
+    if not loop._managed_shutdown_requested:
+        from _erlang_impl._lifecycle import begin_managed_shutdown
+
+        begin_managed_shutdown(loop)
+        loop._managed_shutdown_requested = True
+        loop.stop()
     return 'stopping'
 
 

@@ -802,11 +802,15 @@ static ERL_NIF_TERM nif_async_callback_response(ErlNifEnv *env, int argc,
     ErlNifUInt64 callback_id;
     ErlNifBinary response;
 
-    if (!enif_get_int(env, argv[0], &fd)) {
-        return make_error(env, "invalid_fd");
-    }
     if (!enif_get_uint64(env, argv[1], &callback_id)) {
         return make_error(env, "invalid_callback_id");
+    }
+    native_async_reply_t *reply;
+    if (enif_get_resource(env, argv[0], NATIVE_ASYNC_REPLY_RESOURCE_TYPE, (void **)&reply)) {
+        return respond_native_async_reply(env, reply, callback_id, argv[2]);
+    }
+    if (!enif_get_int(env, argv[0], &fd)) {
+        return make_error(env, "invalid_fd");
     }
     uint64_t native_id = 0;
     unsigned char native_frame[1 + sizeof(uint64_t)];

@@ -51,15 +51,34 @@ Usage:
     reply(pid, {"status": "ok", "data": result})
 """
 
-__all__ = ["Channel", "reply", "ChannelClosed"]
+from typing import Self
+
+__all__ = ["Channel", "reply", "ChannelClosed", "ChannelAborted", "ChannelEmpty", "ChannelOverloaded",
+           "UnsupportedChannelRuntime"]
 
 # A valid native wait result may contain None; only this identity means retry.
 _RETRY_RECEIVE = object()
 
 
-class ChannelClosed(Exception):
+class ChannelClosed(RuntimeError):
     """Raised when attempting to receive from a closed channel."""
 
+    pass
+
+
+class ChannelAborted(RuntimeError):
+    pass
+
+
+class ChannelOverloaded(RuntimeError):
+    pass
+
+
+class ChannelEmpty(RuntimeError):
+    pass
+
+
+class UnsupportedChannelRuntime(RuntimeError):
     pass
 
 
@@ -102,12 +121,7 @@ class Channel:
         import erlang
 
         # Direct NIF call - no erlang.call() roundtrip
-        try:
-            return erlang._channel_receive(self._ref, timeout_ms)
-        except RuntimeError as e:
-            if "closed" in str(e):
-                raise ChannelClosed("Channel has been closed")
-            raise
+        return erlang._channel_receive(self._ref, timeout_ms)
 
     def try_receive(self):
         """Try to receive a message without blocking.
@@ -121,12 +135,7 @@ class Channel:
         import erlang
 
         # Direct NIF call - no erlang.call() roundtrip
-        try:
-            return erlang._channel_try_receive(self._ref)
-        except RuntimeError as e:
-            if "closed" in str(e):
-                raise ChannelClosed("Channel has been closed")
-            raise
+        return erlang._channel_try_receive(self._ref)
 
     def __iter__(self):
         """Iterate over messages until the channel is closed.
@@ -155,12 +164,11 @@ class Channel:
         When data arrives, the channel notifies the event loop via timer dispatch,
         avoiding polling overhead.
 
-        Falls back to polling on non-Erlang event loops or after an empty
-        notification, unless native_only is True.
+        Falls back to the legacy executor path only on non-Erlang event loops,
+        unless native_only is True. That compatibility path is not cancellation safe.
 
-        Delivery is advisory, not durable. Cancellation after a ready callback
-        has consumed a message may discard that delivery; cancelling a receive
-        does not requeue it or establish an acknowledgment/replay protocol.
+        Native callbacks signal readiness only. Dequeue occurs in the receiving
+        task with no intervening await before returning the delivery.
 
         Args:
             native_only: Require native dispatch, even when data is already
@@ -179,19 +187,19 @@ class Channel:
         """
         import asyncio
 
+        from _erlang_impl._loop import ErlangEventLoop
+
         loop = asyncio.get_running_loop()
-        native_dispatch = hasattr(loop, "_loop_capsule") and hasattr(loop, "_timers")
+        native_dispatch = isinstance(loop, ErlangEventLoop)
         if native_only and not native_dispatch:
-            raise RuntimeError("native_only=True requires an ErlangEventLoop")
+            raise UnsupportedChannelRuntime("native_only=True requires an ErlangEventLoop")
 
         # Try non-blocking first (direct NIF - fast)
-        result = self.try_receive()
-        if result is not None:
-            return result
+        import erlang
 
-        # Check if closed
-        if self._is_closed():
-            raise ChannelClosed("Channel has been closed")
+        empty, result = erlang._channel_term_result(self._ref)
+        if not empty:
+            return result
 
         if native_dispatch:
             while True:
@@ -199,9 +207,7 @@ class Channel:
                 if result is not _RETRY_RECEIVE:
                     return result
                 # Another consumer may have drained the notification's data.
-                if not native_only:
-                    return await self._async_receive_polling()
-                # Strict native receive registers a fresh waiter on every retry.
+                # Always re-register native readiness; never dequeue in a worker.
         else:
             # Fallback for non-Erlang event loops: use polling
             return await self._async_receive_polling()
@@ -209,10 +215,9 @@ class Channel:
     async def _async_receive_event_driven(self, loop):
         """Event-driven async receive using channel waiter mechanism.
 
-        Registers with the channel and waits for EVENT_TYPE_TIMER dispatch
-        when data arrives. Returns _RETRY_RECEIVE after an empty notification
-        so the caller can retry with native dispatch or the compatibility
-        fallback. None from an immediate ('ok', None) result is valid data.
+        Registers for EVENT_TYPE_TIMER readiness, never delivery. Empty
+        notifications return _RETRY_RECEIVE. Tagged native receive results
+        distinguish an empty queue from a valid None payload.
         """
         import asyncio
         import asyncio.events
@@ -226,17 +231,7 @@ class Channel:
         def on_channel_ready():
             if future.done():
                 return
-            try:
-                data = self.try_receive()
-                if data is not None:
-                    future.set_result(data)
-                elif self._is_closed():
-                    future.set_exception(ChannelClosed("Channel closed"))
-                else:
-                    # Data consumed by race - use an out-of-band retry token.
-                    future.set_result(_RETRY_RECEIVE)
-            except Exception as e:
-                future.set_exception(e)
+            future.set_result(None)
 
         # Create handle and register in timer dispatch system
         # Only use _timers dict - don't touch _handle_to_callback_id (for timer cancellation only)
@@ -245,27 +240,14 @@ class Channel:
 
         try:
             # Register waiter with channel (direct C call, no Erlang overhead)
-            result = erlang._channel_wait(self._ref, callback_id, loop._loop_capsule)
-
-            if isinstance(result, tuple):
-                if result[0] == "ok":
-                    # Data already available - clean up and return
-                    loop._timers.pop(callback_id, None)
-                    return result[1]
-                elif result[0] == "error":
-                    loop._timers.pop(callback_id, None)
-                    if result[1] == "closed":
-                        raise ChannelClosed("Channel closed")
-                    raise RuntimeError("Channel wait failed: {}".format(result[1]))
-
-            # Waiter registered - await notification
-            try:
-                return await future
-            except asyncio.CancelledError:
-                erlang._channel_cancel_wait(self._ref, callback_id)
-                raise
+            ready = erlang._channel_ready(self._ref, loop._loop_capsule, callback_id, False, 0)
+            if not ready:
+                await future
+            empty, data = erlang._channel_term_result(self._ref)
+            return _RETRY_RECEIVE if empty else data
         finally:
             loop._timers.pop(callback_id, None)
+            erlang._channel_cancel_ready(self._ref, callback_id)
 
     async def _async_receive_polling(self):
         """Fallback async receive for non-Erlang event loops.
@@ -292,10 +274,6 @@ class Channel:
                 # Check for cancellation, then retry
                 await asyncio.sleep(0)
                 continue
-            except RuntimeError as e:
-                if "channel closed" in str(e).lower():
-                    raise ChannelClosed("Channel closed")
-                raise
 
     def __aiter__(self):
         """Return async iterator for the channel.
@@ -315,16 +293,13 @@ class Channel:
         try:
             return await self.async_receive()
         except ChannelClosed:
-            raise StopAsyncIteration
+            raise StopAsyncIteration from None
 
     def _is_closed(self):
         """Check if the channel is closed."""
         import erlang
 
-        try:
-            return erlang._channel_is_closed(self._ref)
-        except Exception:
-            return True
+        return erlang._channel_is_closed(self._ref)
 
     def close(self):
         """Close the channel.
@@ -337,10 +312,83 @@ class Channel:
         """
         import erlang
 
+        erlang._channel_close(self._ref)
+
+    @classmethod
+    def create_bytes(cls, *, capacity: int, max_bytes: int) -> Self:
+        import erlang
+
+        return cls(erlang._channel_create_bounded(capacity, max_bytes))
+
+    def send_bytes_nowait(self, payload: bytes) -> None:
+        import erlang
+
+        result = erlang._channel_send_result(self._ref, payload)
+        if result == "full":
+            raise ChannelOverloaded("Queued payload limit reached")
+        if result == "closed":
+            raise ChannelClosed("Channel closed")
+
+    def receive_bytes_nowait(self) -> bytes:
+        import erlang
+
+        status, payload = erlang._channel_receive_result(self._ref)
+        if status == "empty":
+            raise ChannelEmpty("Channel empty")
+        if status == "closed":
+            raise ChannelClosed("Channel closed")
+        if status == "aborted":
+            raise ChannelAborted("Channel aborted; queued payloads discarded")
+        return payload
+
+    async def wait_ready(self, *, writing: bool = False, size: int = 0) -> None:
+        import asyncio
+        import erlang
+        from _erlang_impl._loop import ErlangEventLoop
+
+        loop = asyncio.get_running_loop()
+        if not isinstance(loop, ErlangEventLoop):
+            raise UnsupportedChannelRuntime("PyBEAM channels require ErlangEventLoop")
+        future = loop.create_future()
+        callback_id = id(future)
+
+        def ready() -> None:
+            if not future.done():
+                future.set_result(None)
+
+        loop._timers[callback_id] = asyncio.Handle(ready, (), loop)
         try:
-            erlang._channel_close(self._ref)
-        except Exception:
-            pass  # Ignore errors on close (may already be closed)
+            if not erlang._channel_ready(self._ref, loop._loop_capsule, callback_id, writing, size):
+                await future
+        finally:
+            loop._timers.pop(callback_id, None)
+            erlang._channel_cancel_ready(self._ref, callback_id)
+
+    async def receive_bytes(self) -> bytes:
+        self.require_native_loop()
+        while True:
+            try:
+                return self.receive_bytes_nowait()
+            except ChannelEmpty:
+                await self.wait_ready()
+
+    @staticmethod
+    def require_native_loop() -> None:
+        import asyncio
+        from _erlang_impl._loop import ErlangEventLoop
+
+        if not isinstance(asyncio.get_running_loop(), ErlangEventLoop):
+            raise UnsupportedChannelRuntime("PyBEAM channels require ErlangEventLoop")
+
+    def abort(self) -> None:
+        import erlang
+
+        erlang._channel_abort(self._ref)
+
+    def snapshot(self) -> tuple[int, int, int, int, bool, int]:
+        import erlang
+
+        return erlang._channel_snapshot(self._ref)
 
     def __enter__(self):
         """Context manager entry - returns self."""

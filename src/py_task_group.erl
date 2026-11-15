@@ -1,0 +1,254 @@
+-module(py_task_group).
+-behaviour(gen_server).
+-export([start_link/2, register_callbacks/0, init/1, handle_call/3, handle_cast/2,
+         handle_info/2, terminate/2]).
+
+start_link(Count, Bytes) -> gen_server:start_link(?MODULE, {Count, Bytes}, []).
+register_callbacks() ->
+    py_callback:register('_task_open', fun([Count, Bytes]) ->
+        Spec = #{id => make_ref(), start => {?MODULE, start_link, [Count, Bytes]},
+                 restart => temporary, shutdown => infinity},
+        case supervisor:start_child(py_actor_root, Spec) of
+            {ok, Pid} -> gen_server:call(Pid, gate);
+            Error -> Error
+        end
+    end),
+    py_callback:register('_task_start', fun([Group, Gate, Ticket, Payload, Factory]) ->
+        safe_call(Group, {start, Gate, Ticket, Payload, Factory})
+    end),
+    py_callback:register('_task_wait', fun([Group, Pid]) ->
+        safe_call(Group, {wait, Pid})
+    end),
+    py_callback:register('_task_cancel', fun([Group, Pid]) -> safe_call(Group, {cancel, Pid}) end),
+    py_callback:register('_task_shutdown', fun([Group, Budget]) -> safe_call(Group, {shutdown, Budget}) end),
+    py_callback:register('_task_info', fun([Group]) -> safe_call(Group, info) end),
+    py_callback:register('_task_dispose', fun([Group]) ->
+        try
+            case gen_server:call(Group, disposal) of
+                {ok, Native} ->
+                    gen_server:stop(Group, normal, infinity),
+                    case py_nif:context_cleanup_status(Native) of
+                        clean -> ok;
+                        Status -> {error, {uncertain_inflight, {control_cleanup, Status}}}
+                    end;
+                Error -> Error
+            end
+        catch exit:Reason -> {error, {uncertain_inflight, Reason}} end
+    end),
+    ok.
+
+safe_call(Group, Request) ->
+    try gen_server:call(Group, Request, infinity)
+    catch exit:Reason -> {error, {uncertain_inflight, Reason}} end.
+
+init({Count, Bytes}) when is_integer(Count), Count > 0, is_integer(Bytes), Bytes > 0 ->
+    process_flag(trap_exit, true),
+    {ok, Sup} = py_supervision:start_link(#{strategy => one_for_one, intensity => 0,
+        period => 1, mailbox => bounded, max_children => Count}),
+    {ok, Control} = py_context:new(#{mode => worker, context_owner => self()}),
+    Native = py_context:get_nif_ref(Control),
+    Gate = py_nif:actor_gate_new(Count, Bytes),
+    {ok, #{sup => Sup, control => Control, control_native => Native, gate => Gate, max => Count,
+           jobs => #{}, closed => false, closing => none, polling => false}}.
+
+handle_call(gate, _, #{gate := Gate} = State) -> {reply, {ok, {self(), Gate}}, State};
+handle_call(disposal, _, #{control_native := Native, jobs := Jobs, gate := Gate} = State) ->
+    py_nif:actor_gate_close(Gate),
+    Reply = case {map_size(Jobs), py_nif:actor_gate_info(Gate)} of
+        {0, #{count := 0, unsettled := 0}} -> {ok, Native};
+        _ -> {error, {uncertain_inflight, {unobserved_results, maps:keys(Jobs)}}}
+    end,
+    {reply, Reply, State#{closed := true}};
+handle_call(info, _, #{gate := Gate, sup := Sup, jobs := Jobs} = State) ->
+    {reply, #{gate => py_nif:actor_gate_info(Gate), children => supervisor:which_children(Sup),
+              contexts => [maps:get(ctx, Job) || Job <- maps:values(Jobs)],
+              jobs => map_size(Jobs)}, State};
+handle_call({start, Gate, Ticket, Payload, Factory}, _,
+            #{gate := Gate, jobs := Jobs, max := Max, closed := false,
+              sup := Sup} = State) when map_size(Jobs) < Max ->
+    ok = py_nif:actor_ticket_commit(Ticket, Gate, byte_size(Payload)),
+    Id = make_ref(),
+    Spec = #{id => Id, start => {py_task, start_link, [self(), Factory, Ticket, Payload]},
+             restart => temporary, shutdown => infinity},
+    case supervisor:start_child(Sup, Spec) of
+        {ok, Pid} ->
+            {Ctx, Object, Native} = gen_server:call(Pid, info, infinity),
+            Mon = monitor(process, Pid),
+            Job = #{id => Id, ctx => Ctx, native => Native, object => Object,
+                    ticket => Ticket, mon => Mon, result => pending, waiters => [],
+                    ready => false, down => false, reaping => false, reaped => false,
+                    observed => false, cancel_sent => false, seal_sent => false, sealed => false},
+            Pid ! run,
+            {reply, {ok, Pid}, State#{jobs := Jobs#{Pid => Job}}};
+        Error ->
+            %% Commit happened but Python did not run. Retain uncertainty;
+            %% releasing it here would require proof across factory startup.
+            py_nif:actor_gate_close(Gate),
+            {reply, {error, {uncertain_inflight, Error}}, State#{closed := true}}
+    end;
+handle_call({start, _Gate, Ticket, _Payload, _Factory}, _, State) ->
+    py_nif:actor_ticket_reject(Ticket),
+    {reply, {error, task_slots_full_or_closed}, State};
+handle_call({wait, Pid}, From, #{jobs := Jobs} = State) ->
+    case maps:find(Pid, Jobs) of
+        {ok, #{ready := true, result := Result}} ->
+            {reply, Result, State#{jobs := maps:remove(Pid, Jobs)}};
+        {ok, #{result := {error, {uncertain_inflight, _}} = Result} = Job} ->
+            {reply, Result, State#{jobs := Jobs#{Pid := Job#{observed := true}}}};
+        {ok, #{waiters := Waiters} = Job} ->
+            {noreply, State#{jobs := Jobs#{Pid := Job#{waiters := [From | Waiters]}}}};
+        error -> {reply, {error, unknown_task}, State}
+    end;
+handle_call({cancel, Pid}, _, #{jobs := Jobs, control := Control} = State) ->
+    case maps:find(Pid, Jobs) of
+        {ok, #{ready := false} = Job} ->
+            {reply, ok, State#{jobs := Jobs#{Pid := request_cancel(Job, Control)}}};
+        _ -> {reply, ok, State}
+    end;
+handle_call({shutdown, Budget}, From, #{gate := Gate, jobs := Jobs, control := Control,
+                                      closing := none} = State)
+        when is_integer(Budget), Budget > 0 ->
+    ok = py_nif:actor_gate_close(Gate),
+    Deadline = make_ref(),
+    Timer = erlang:send_after(Budget, self(), {deadline, Deadline}),
+    Next = maps:map(fun(_, Job) -> request_cancel(Job, Control) end, Jobs),
+    {noreply, queue_poll(State#{jobs := Next, closed := true, closing := {From, Timer, Deadline}})};
+handle_call(_, _, State) -> {reply, {error, invalid_request}, State}.
+
+request_cancel(#{cancel_sent := false, ready := false, object := Object} = Job, Control) ->
+    %% One bounded control RPC per admitted child. Never block this owner on
+    %% Python's GIL: its shutdown timer must also work during a native C call.
+    spawn(fun() ->
+        py_context:call(Control, '_erlang_impl._tasks', request_cancel, [Object], #{}, infinity)
+    end),
+    Job#{cancel_sent := true};
+request_cancel(Job, _) -> Job.
+
+seal_unstarted(Pid, true, #{seal_sent := false, ticket := Ticket, object := Object} = Job, Control) ->
+    case py_nif:actor_ticket_info(Ticket) of
+        complete -> Job;
+        reaped -> Job;
+        _ ->
+            Owner = self(),
+            spawn(fun() ->
+                Result = py_context:call(Control, '_erlang_impl._tasks', seal, [Object], #{}, infinity),
+                Owner ! {sealed, Pid, Result}
+            end),
+            Job#{seal_sent := true}
+    end;
+seal_unstarted(_, _, Job, _) -> Job.
+
+reap_context(Pid, true, #{ctx := Ctx, native := Native, reaping := false} = Job) ->
+    Owner = self(),
+    spawn(fun() -> Owner ! {reaped, Pid, py_context:reap_dead(Ctx, Native)} end),
+    Job#{reaping := true};
+reap_context(_, true, #{ctx := Ctx, native := Native, reaped := false} = Job) ->
+    case py_nif:context_cleanup_status(Native) of
+        clean -> clean = py_context:reap_dead(Ctx, Native), Job#{reaped := true};
+        _ -> Job
+    end;
+reap_context(_, _, Job) -> Job.
+
+queue_poll(#{polling := false} = State) ->
+    erlang:send_after(5, self(), poll),
+    State#{polling := true};
+queue_poll(State) -> State.
+
+handle_cast(_, State) -> {noreply, State}.
+handle_info({work_result, Pid, Reply}, #{jobs := Jobs, gate := Gate} = State) ->
+    case maps:find(Pid, Jobs) of
+        {ok, #{result := pending, ticket := Ticket} = Job} ->
+            {Result, Closed} = case {py_nif:actor_ticket_info(Ticket), Reply} of
+                {complete, {ok, _}} -> {Reply, maps:get(closed, State)};
+                {complete, {python_error, _}} -> {Reply, maps:get(closed, State)};
+                _ -> py_nif:actor_gate_close(Gate), {{error, {uncertain_inflight, Reply}}, true}
+            end,
+            {noreply, queue_poll(State#{closed := Closed,
+                jobs := Jobs#{Pid := Job#{result := Result}}})};
+        _ -> {noreply, State}
+    end;
+handle_info({'DOWN', Mon, process, Pid, Reason}, #{jobs := Jobs, gate := Gate} = State) ->
+    case maps:find(Pid, Jobs) of
+        {ok, #{mon := Mon, result := Previous} = Job} ->
+            Result = case Reason of normal -> Previous;
+                _ -> py_nif:actor_gate_close(Gate), {error, {uncertain_inflight, Reason}} end,
+            Closed = maps:get(closed, State) orelse Reason =/= normal,
+            {noreply, queue_poll(State#{closed := Closed,
+                jobs := Jobs#{Pid := Job#{down := true, result := Result}}})};
+        _ -> {noreply, State}
+    end;
+handle_info({sealed, Pid, {ok, Sealed}}, #{jobs := Jobs} = State) when is_boolean(Sealed) ->
+    case maps:find(Pid, Jobs) of
+        {ok, Job} -> {noreply, queue_poll(State#{jobs := Jobs#{Pid := Job#{sealed := Sealed}}})};
+        error -> {noreply, State}
+    end;
+handle_info({sealed, Pid, _}, #{jobs := Jobs, gate := Gate} = State) ->
+    case maps:is_key(Pid, Jobs) of
+        true -> py_nif:actor_gate_close(Gate), {noreply, queue_poll(State#{closed := true})};
+        false -> {noreply, State}
+    end;
+handle_info({reaped, Pid, _}, #{jobs := Jobs, gate := Gate} = State) ->
+    case maps:find(Pid, Jobs) of
+        {ok, #{ctx := Ctx, native := Native} = Job} ->
+            case py_nif:context_cleanup_status(Native) of
+                clean ->
+                    clean = py_context:reap_dead(Ctx, Native),
+                    {noreply, queue_poll(State#{jobs := Jobs#{Pid := Job#{reaped := true}}})};
+                pending -> {noreply, queue_poll(State)};
+                uncertain ->
+                    py_nif:actor_gate_close(Gate),
+                    {noreply, queue_poll(State#{closed := true})}
+            end;
+        error -> {noreply, State}
+    end;
+handle_info(poll, #{jobs := Jobs, closing := Closing, gate := Gate,
+                    sup := Sup, control := Control} = State) ->
+    Children = supervisor:which_children(Sup),
+    Next = maps:fold(fun(Pid, Job, Acc) ->
+        #{id := Id, ctx := Ctx, ticket := Ticket, down := Down,
+          result := Result, waiters := Waiters, observed := Observed} = Job,
+        Gone = Down andalso not lists:keymember(Id, 1, Children) andalso
+                not is_process_alive(Ctx) andalso Result =/= pending,
+        Sealing = seal_unstarted(Pid, Gone, Job, Control),
+        TicketState = py_nif:actor_ticket_info(Ticket),
+        Settled = TicketState =:= complete orelse TicketState =:= reaped,
+        Ended = Gone andalso (Settled orelse maps:get(sealed, Sealing)),
+        Reaped = reap_context(Pid, Ended, Sealing),
+        Ready = Ended andalso maps:get(reaped, Reaped),
+        case Ready andalso not Settled of
+            true -> ok = py_nif:task_ticket_reap(Ticket, maps:get(native, Reaped));
+            false -> ok
+        end,
+        Unknown = case Result of {error, {uncertain_inflight, _}} -> true; _ -> false end,
+        case {Ready, Observed, Waiters, Unknown} of
+            {true, true, _, _} -> Acc;
+            {true, _, [_ | _], _} ->
+                [gen_server:reply(From, Result) || From <- Waiters], Acc;
+            {false, _, [_ | _], true} ->
+                [gen_server:reply(From, Result) || From <- Waiters],
+                Acc#{Pid => Reaped#{waiters := [], observed := true}};
+            _ -> Acc#{Pid => Reaped#{ready := Ready}}
+        end
+    end, #{}, Jobs),
+    #{count := Count, unsettled := Unsettled} = py_nif:actor_gate_info(Gate),
+    AllReady = Count =:= 0 andalso Unsettled =:= 0 andalso
+        lists:all(fun(#{ready := Ready}) -> Ready end, maps:values(Next)),
+    NewClosing = case {AllReady, Closing} of
+        {true, {From, Timer, _}} -> erlang:cancel_timer(Timer), gen_server:reply(From, ok), none;
+        _ -> Closing
+    end,
+    NextState = State#{jobs := Next, closing := NewClosing, polling := false},
+    {noreply, case AllReady of false -> queue_poll(NextState); true -> NextState end};
+handle_info({deadline, Deadline}, #{closing := {From, _, Deadline}} = State) ->
+    gen_server:reply(From, {error, {uncertain_inflight, shutdown_deadline}}),
+    {noreply, State#{closing := none}};
+handle_info({'EXIT', Sup, Reason}, #{sup := Sup} = State) -> {stop, Reason, State};
+handle_info({'EXIT', Control, Reason}, #{control := Control} = State) ->
+    {stop, {control_context_died, Reason}, State};
+handle_info(_, State) -> {noreply, State}.
+
+terminate(_, #{sup := Sup, control := Control, gate := Gate}) ->
+    py_nif:actor_gate_close(Gate),
+    unlink(Sup),
+    case is_process_alive(Sup) of true -> gen_server:stop(Sup, shutdown, infinity); false -> ok end,
+    py_context:destroy(Control).

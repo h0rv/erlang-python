@@ -70,7 +70,8 @@
 
 -type channel() :: reference().
 -type opts() :: #{
-    max_size => non_neg_integer()
+    max_size => non_neg_integer(),
+    max_messages => non_neg_integer()
 }.
 
 -export_type([channel/0, opts/0]).
@@ -96,7 +97,8 @@ new() ->
 -spec new(opts()) -> {ok, channel()} | {error, term()}.
 new(Opts) when is_map(Opts) ->
     MaxSize = maps:get(max_size, Opts, 0),
-    py_nif:channel_create(MaxSize).
+    MaxMessages = maps:get(max_messages, Opts, 0),
+    py_nif:channel_create(MaxSize, MaxMessages).
 
 %% @doc Send a message to a channel.
 %%

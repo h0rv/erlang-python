@@ -37,7 +37,13 @@ import threading
 import time
 from asyncio import events, futures, tasks, transports
 from collections import deque
-from typing import Any, Callable, Optional, Tuple
+from collections.abc import AsyncGenerator, Generator
+from contextlib import contextmanager
+from typing import TYPE_CHECKING, Any, Callable, Never, Optional, Tuple
+from weakref import WeakSet
+
+if TYPE_CHECKING:
+    from _erlang_impl._lifecycle import ShutdownObserver
 
 from ._mode import detect_mode, ExecutionMode
 
@@ -94,9 +100,10 @@ class ErlangEventLoop(asyncio.AbstractEventLoop):
         '_callback_id',
         '_cached_time',  # uvloop-style time caching to avoid syscalls
         '_wake_pending',  # coalesced wakeup flag for call_soon_threadsafe
+        '_asyncgens', '_managed_shutdown_requested', '_shutdown_observer',
     )
 
-    def __init__(self, capsule=None):
+    def __init__(self, capsule: object | None = None) -> None:
         """Initialize the Erlang event loop.
 
         The event loop is backed by Erlang's scheduler via the py_event_loop
@@ -139,12 +146,11 @@ class ErlangEventLoop(asyncio.AbstractEventLoop):
             try:
                 self._loop_capsule = self._pel._get_global_loop_capsule()
                 self._uses_global_capsule = True
-                # Check if another loop already owns this capsule.
-                # Only one ErlangEventLoop per interpreter is supported.
+                # A shared resource stays owned between driver turns.
                 if hasattr(self._pel, '_has_loop_ref') and self._pel._has_loop_ref(self._loop_capsule):
                     raise RuntimeError(
-                        "An ErlangEventLoop already exists for this interpreter. "
-                        "Only one loop per interpreter is supported."
+                        "An ErlangEventLoop already exists for this native resource. "
+                        "Close its owner before constructing another wrapper."
                     )
             except RuntimeError as e:
                 # Re-raise our "already exists" error
@@ -157,21 +163,6 @@ class ErlangEventLoop(asyncio.AbstractEventLoop):
         else:
             self._loop_capsule = self._pel._loop_new()
             self._owns_capsule = True
-
-        # Store reference to this Python loop in the C struct
-        # This enables process_ready_tasks to access the loop directly
-        # without thread-local lookup issues from dirty schedulers
-        if hasattr(self._pel, '_set_loop_ref'):
-            self._pel._set_loop_ref(self._loop_capsule, self)
-
-        # Also set reference on the global interpreter loop
-        # This is needed for py_nif:submit_task which uses the global loop
-        if self._uses_global_capsule and hasattr(self._pel, '_set_global_loop_ref'):
-            try:
-                self._pel._set_global_loop_ref(self)
-            except RuntimeError:
-                # Global loop not yet initialized, ignore
-                pass
 
         # Callback management
         self._readers = {}  # fd -> (callback, args, callback_id)
@@ -223,6 +214,57 @@ class ErlangEventLoop(asyncio.AbstractEventLoop):
 
         # Callback ID counter
         self._callback_id = 0
+        self._asyncgens: WeakSet[AsyncGenerator[object]] = WeakSet()
+        self._managed_shutdown_requested = False
+        self._shutdown_observer: ShutdownObserver | None = None
+
+        # Publish only fully initialized objects. Native claim rejects capsule
+        # aliases on every constructor path, including explicit capsules.
+        if hasattr(self._pel, '_set_loop_ref'):
+            self._pel._set_loop_ref(self._loop_capsule, self)
+
+    async def _async_call(self, func_name: str, args: tuple[object, ...]) -> object:
+        import erlang
+
+        self._check_closed()
+        future = self.create_future()
+        callback_id, reply = erlang._prepare_native_async_reply(self._loop_capsule, self)
+
+        def completed() -> None:
+            if future.done():
+                return
+            try:
+                value = erlang._take_native_async_reply(reply, self)
+            except BaseException as error:
+                future.set_exception(error)
+            else:
+                future.set_result(value)
+
+        try:
+            # Publish the owning handler before the request can complete on a
+            # different Erlang scheduler. No interpreter-wide Future map or
+            # callback pipe participates in native loop delivery.
+            self._timers[callback_id] = events.Handle(completed, (), self)
+            erlang._send_async_request(func_name, args, reply)
+            return await future
+        finally:
+            handle = self._timers.pop(callback_id, None)
+            if handle is not None:
+                handle.cancel()
+            erlang._abandon_native_async_reply(reply)
+
+    async def _unsupported_io(self, *args: object, **kwargs: object) -> Never:
+        raise NotImplementedError("This asyncio I/O operation is not supported by ErlangEventLoop")
+
+    # These inherited operations already raise NotImplementedError. Declare that
+    # unsupported surface explicitly instead of appearing abstract to type checkers.
+    start_tls = _unsupported_io
+    sendfile = _unsupported_io
+    connect_read_pipe = _unsupported_io
+    connect_write_pipe = _unsupported_io
+    sock_recvfrom = _unsupported_io
+    sock_recvfrom_into = _unsupported_io
+    sock_sendto = _unsupported_io
 
     def _next_id(self):
         """Generate a unique callback ID for this loop."""
@@ -233,8 +275,22 @@ class ErlangEventLoop(asyncio.AbstractEventLoop):
     # Running and stopping the event loop
     # ========================================================================
 
+    @contextmanager
+    def _driver_session(self, *, allow_current: bool = False) -> Generator[None]:
+        capsule = self._loop_capsule
+        token, acquired = self._pel._claim_driver_session(capsule, self, allow_current)
+        try:
+            yield
+        finally:
+            if acquired:
+                self._pel._release_driver_session(capsule, self, token)
+
     def run_forever(self):
         """Run the event loop until stop() is called."""
+        with self._driver_session(allow_current=True):
+            return self._run_forever_owned()
+
+    def _run_forever_owned(self):
         self._check_closed()
         self._check_running()
         self._set_coroutine_origin_tracking(self._debug)
@@ -253,11 +309,17 @@ class ErlangEventLoop(asyncio.AbstractEventLoop):
 
         # Register as the running loop
         old_running_loop = events._get_running_loop()
+        old_asyncgen_hooks = sys.get_asyncgen_hooks()
+        sys.set_asyncgen_hooks(
+            firstiter=self._asyncgen_firstiter_hook,
+            finalizer=self._asyncgen_finalizer_hook,
+        )
         events._set_running_loop(self)
         try:
             while not self._stopping:
                 self._run_once()
         finally:
+            sys.set_asyncgen_hooks(*old_asyncgen_hooks)
             events._set_running_loop(old_running_loop)
             self._stopping = False
             self._running = False
@@ -271,6 +333,10 @@ class ErlangEventLoop(asyncio.AbstractEventLoop):
 
     def run_until_complete(self, future):
         """Run the event loop until a future is done."""
+        with self._driver_session(allow_current=True):
+            return self._run_until_complete_owned(future)
+
+    def _run_until_complete_owned(self, future):
         self._check_closed()
         self._check_running()
 
@@ -327,7 +393,14 @@ class ErlangEventLoop(asyncio.AbstractEventLoop):
             raise RuntimeError("Cannot close a running event loop")
         if self._closed:
             return
+        if self._pel._has_loop_ref(self._loop_capsule):
+            with self._driver_session(allow_current=True):
+                self._close_owned()
+        else:
+            # Explicit native disposal may already have released this wrapper.
+            self._close_owned()
 
+    def _close_owned(self):
         self._closed = True
 
         # Cancel all timers
@@ -369,29 +442,28 @@ class ErlangEventLoop(asyncio.AbstractEventLoop):
         # This is important for the global capsule case where the capsule
         # persists but a new Python loop may be created.
         if self._loop_capsule is not None and hasattr(self._pel, '_clear_loop_ref'):
-            try:
-                self._pel._clear_loop_ref(self._loop_capsule)
-            except Exception:
-                pass
-
-        # Destroy loop capsule (not a shared one: the global capsule or a
-        # pool loop's, both owned by Erlang)
-        if getattr(self, '_owns_capsule', not self._uses_global_capsule):
-            try:
-                self._pel._loop_destroy(self._loop_capsule)
-            except Exception:
-                pass
+            self._pel._clear_loop_ref(self._loop_capsule, self, self._owns_capsule)
         self._loop_capsule = None
 
-    async def shutdown_asyncgens(self):
-        """Shutdown all active asynchronous generators.
+    def _asyncgen_firstiter_hook(self, generator: AsyncGenerator[object]) -> None:
+        self._asyncgens.add(generator)
 
-        Note: This is a no-op in ErlangEventLoop. Async generators are
-        managed by Python's garbage collector. For proper cleanup, ensure
-        async generators are explicitly closed or exhausted before loop shutdown.
-        """
-        # No-op: we don't track async generators to avoid global hook issues
-        pass
+    def _asyncgen_finalizer_hook(self, generator: AsyncGenerator[object]) -> None:
+        self._asyncgens.discard(generator)
+        if not self.is_closed():
+            self.call_soon_threadsafe(self.create_task, generator.aclose())
+
+    async def shutdown_asyncgens(self) -> None:
+        generators = tuple(self._asyncgens)
+        self._asyncgens.clear()
+        closing = [self.create_task(generator.aclose()) for generator in generators]
+        if not closing:
+            return
+        await asyncio.wait(closing)
+        errors = [task.exception() for task in closing if not task.cancelled()]
+        failures = [error for error in errors if error is not None]
+        if failures:
+            raise BaseExceptionGroup("Asynchronous generator cleanup failed", failures)
 
     async def shutdown_default_executor(self, timeout=None):
         """Shutdown the default executor."""
@@ -494,14 +566,14 @@ class ErlangEventLoop(asyncio.AbstractEventLoop):
         """Create a Future object attached to this loop."""
         return futures.Future(loop=self)
 
-    def create_task(self, coro, *, name=None, context=None):
+    def create_task(self, coro, *, name=None, context=None, eager_start=None):
         """Schedule a coroutine to be executed."""
         self._check_closed()
         if self._task_factory is None:
             if sys.version_info >= (3, 12):
-                # Python 3.12+: use eager_start=False to prevent eager execution
+                # Native admission retains the historical non-eager default.
                 task = tasks.Task(coro, loop=self, name=name, context=context,
-                                  eager_start=False)
+                                  eager_start=False if eager_start is None else eager_start)
             elif sys.version_info >= (3, 11):
                 task = tasks.Task(coro, loop=self, name=name, context=context)
             elif sys.version_info >= (3, 8):
@@ -511,12 +583,19 @@ class ErlangEventLoop(asyncio.AbstractEventLoop):
                 if name is not None:
                     task.set_name(name)
         else:
-            if sys.version_info >= (3, 11) and context is not None:
+            if eager_start is not None:
+                if context is None:
+                    task = self._task_factory(self, coro, eager_start=eager_start)
+                else:
+                    task = self._task_factory(self, coro, context=context, eager_start=eager_start)
+            elif sys.version_info >= (3, 11) and context is not None:
                 task = self._task_factory(self, coro, context=context)
             else:
                 task = self._task_factory(self, coro)
             if name is not None:
                 task.set_name(name)
+        if self._shutdown_observer is not None:
+            self._shutdown_observer.observe(task)
         return task
 
     def set_task_factory(self, factory):
@@ -1344,6 +1423,9 @@ class _MockLoopCapsule:
         self.writers = {}
         self.pending = []
         self._counter = 0
+        self.driver_lock = threading.Lock()
+        self.driver_token: object | None = None
+        self.driver_thread = 0
         self._fd_resources = {}  # fd_key -> {fd, read_active, write_active, read_cid, write_cid}
 
 
@@ -1355,6 +1437,27 @@ class _MockNifModule:
 
     def _is_initialized(self):
         return True
+
+    def _has_loop_ref(self, capsule):
+        return True
+
+    def _claim_driver_session(self, capsule, owner, allow_current=False):
+        thread = threading.get_ident()
+        with capsule.driver_lock:
+            if capsule.driver_token is not None:
+                if allow_current and capsule.driver_thread == thread:
+                    return capsule.driver_token, False
+                raise RuntimeError("Native loop driver session is already claimed or unavailable")
+            capsule.driver_token = object()
+            capsule.driver_thread = thread
+            return capsule.driver_token, True
+
+    def _release_driver_session(self, capsule, owner, token):
+        with capsule.driver_lock:
+            if capsule.driver_token is not token or capsule.driver_thread != threading.get_ident():
+                raise RuntimeError("Driver session release requires its stopped exact owner")
+            capsule.driver_token = None
+            capsule.driver_thread = 0
 
     def _loop_new(self):
         return _MockLoopCapsule()
@@ -1464,6 +1567,12 @@ async def _run_and_send(coro, caller_pid, ref):
     import erlang
     from . import atom  # Use cached version from _erlang_impl
 
+    loop = asyncio.get_running_loop()
+    observer = loop._shutdown_observer if isinstance(loop, ErlangEventLoop) else None
+    current = asyncio.current_task()
+    if observer is not None and current is not None:
+        observer.observe(current)
+
     # Create atoms for message keys (strings become binaries, await expects atoms)
     async_result = atom('async_result')
     ok = atom('ok')
@@ -1481,6 +1590,9 @@ async def _run_and_send(coro, caller_pid, ref):
         except erlang.ProcessError:
             pass  # Caller gone, nothing to do
     except Exception as e:
+        active_observer = loop._shutdown_observer if isinstance(loop, ErlangEventLoop) else None
+        if active_observer is not None:
+            active_observer.failed = True
         import traceback
         tb = traceback.format_exc()
         try:

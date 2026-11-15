@@ -68,6 +68,7 @@ init([]) ->
     ok = py_event_loop:register_callbacks(),
     ok = py_channel:register_callbacks(),
     ok = py_shm:register_callbacks(),
+    ok = py_task_group:register_callbacks(),
 
     %% Callback registry - must start before contexts
     CallbackSpec = #{

@@ -185,7 +185,7 @@ callback_overflow(_) -> with_context(fun(Ctx) ->
     {ok, _} = py_context:call(Ctx, py_test_actor_data, enqueue,
         [Actor, Gate, Warmup, {bytes, <<"1">>}], #{}),
     wait_empty(Gate, 1000),
-    {state, _, Writers, _} = sys:get_state(py_thread_handler),
+    {state, _, Writers, _, _NativeCounter} = sys:get_state(py_thread_handler),
     Counters = [Counter || {_, Counter} <- maps:values(Writers)],
     [wait_counter(Counter, 1000) || Counter <- Counters],
     %% Force the existing generic callback overflow branch without creating

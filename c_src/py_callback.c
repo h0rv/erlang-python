@@ -2493,6 +2493,170 @@ static PyObject *get_async_callback_fd(PyObject *self, PyObject *args) {
     return PyLong_FromLong(state->async_callback_pipe[0]);
 }
 
+/* Native loops use the same reserved readiness queue as Channel waiters.
+ * A reply owns no Python references and no FD. Its registration ID is globally
+ * unique and disjoint from a wrapper's positive, low-half callback IDs, so a
+ * queued notification cannot address a replacement wrapper after close/rebind.
+ * The Python owner removes its handler before abandoning the reply. A late
+ * writer then drops the term without decoding it or repeating its effects. */
+typedef struct {
+    pthread_mutex_t mutex;
+    erlang_event_loop_t *loop;
+    pending_event_t *event;
+    ErlNifEnv *env;
+    ERL_NIF_TERM response;
+    uint64_t id;
+    uint64_t owner_generation;
+    bool ready;
+    bool abandoned;
+    bool submitted;
+} native_async_reply_t;
+
+static ErlNifResourceType *NATIVE_ASYNC_REPLY_RESOURCE_TYPE = NULL;
+#define NATIVE_ASYNC_REPLY_CAPSULE "erlang_python.async_reply"
+
+static void native_async_reply_abandon(native_async_reply_t *reply) {
+    pthread_mutex_lock(&reply->mutex);
+    reply->abandoned = true;
+    if (reply->event != NULL) {
+        event_loop_cancel_reserved(reply->loop, reply->event);
+        reply->event = NULL;
+    }
+    ErlNifEnv *env = reply->env;
+    reply->env = NULL;
+    pthread_mutex_unlock(&reply->mutex);
+    if (env != NULL) enif_free_env(env);
+}
+
+static void native_async_reply_dtor(ErlNifEnv *env, void *object) {
+    (void)env;
+    native_async_reply_t *reply = object;
+    native_async_reply_abandon(reply);
+    if (reply->loop != NULL) enif_release_resource(reply->loop);
+    pthread_mutex_destroy(&reply->mutex);
+}
+
+static void native_async_reply_capsule_dtor(PyObject *capsule) {
+    native_async_reply_t *reply = PyCapsule_GetPointer(capsule, NATIVE_ASYNC_REPLY_CAPSULE);
+    if (reply != NULL) enif_release_resource(reply);
+    else PyErr_Clear();
+}
+
+static PyObject *prepare_native_async_reply(PyObject *self, PyObject *args) {
+    (void)self;
+    PyObject *capsule, *owner;
+    if (!PyArg_ParseTuple(args, "OO", &capsule, &owner)) return NULL;
+    erlang_event_loop_t *loop = PyCapsule_GetPointer(capsule, "erlang_python.event_loop");
+    if (loop == NULL) return NULL;
+    if (PyInterpreterState_GetID(PyInterpreterState_Get()) != loop->interp_id) {
+        PyErr_SetString(PyExc_RuntimeError, "Native loop belongs to another interpreter");
+        return NULL;
+    }
+    pthread_mutex_lock(&loop->mutex);
+    bool valid = loop->py_loop == owner && !loop->shutdown;
+    uint64_t generation = loop->py_owner_generation;
+    pthread_mutex_unlock(&loop->mutex);
+    if (!valid) {
+        PyErr_SetString(PyExc_RuntimeError, "Async callback requires the exact native loop owner");
+        return NULL;
+    }
+    native_async_reply_t *reply = enif_alloc_resource(NATIVE_ASYNC_REPLY_RESOURCE_TYPE, sizeof(*reply));
+    if (reply == NULL) return PyErr_NoMemory();
+    memset(reply, 0, sizeof(*reply));
+    pthread_mutex_init(&reply->mutex, NULL);
+    reply->loop = loop;
+    reply->owner_generation = generation;
+    enif_keep_resource(loop);
+    bool overloaded;
+    reply->event = event_loop_reserve_pending(loop, &overloaded);
+    reply->env = enif_alloc_env();
+    if (reply->event == NULL || reply->env == NULL) {
+        enif_release_resource(reply);
+        PyErr_SetString(PyExc_RuntimeError, overloaded ? "Native callback queue full" : "Native callback allocation failed");
+        return NULL;
+    }
+    reply->id = atomic_fetch_add(&g_callback_id_counter, 1) | (UINT64_C(1) << 63);
+    PyObject *handle = PyCapsule_New(reply, NATIVE_ASYNC_REPLY_CAPSULE, native_async_reply_capsule_dtor);
+    if (handle == NULL) {
+        enif_release_resource(reply);
+        return NULL;
+    }
+    PyObject *result = Py_BuildValue("(KO)", (unsigned long long)reply->id, handle);
+    Py_DECREF(handle);
+    return result;
+}
+
+static PyObject *abandon_native_async_reply(PyObject *self, PyObject *capsule) {
+    (void)self;
+    native_async_reply_t *reply = PyCapsule_GetPointer(capsule, NATIVE_ASYNC_REPLY_CAPSULE);
+    if (reply == NULL) return NULL;
+    native_async_reply_abandon(reply);
+    Py_RETURN_NONE;
+}
+
+static PyObject *take_native_async_reply(PyObject *self, PyObject *args) {
+    (void)self;
+    PyObject *capsule, *owner;
+    if (!PyArg_ParseTuple(args, "OO", &capsule, &owner)) return NULL;
+    native_async_reply_t *reply = PyCapsule_GetPointer(capsule, NATIVE_ASYNC_REPLY_CAPSULE);
+    if (reply == NULL) return NULL;
+    pthread_mutex_lock(&reply->loop->mutex);
+    bool valid = reply->loop->py_loop == owner &&
+        reply->loop->py_owner_generation == reply->owner_generation &&
+        PyInterpreterState_GetID(PyInterpreterState_Get()) == reply->loop->interp_id;
+    pthread_mutex_unlock(&reply->loop->mutex);
+    if (!valid) {
+        PyErr_SetString(PyExc_RuntimeError, "Native callback reply requires its exact loop owner");
+        return NULL;
+    }
+    pthread_mutex_lock(&reply->mutex);
+    ErlNifEnv *env = reply->ready && !reply->abandoned ? reply->env : NULL;
+    ERL_NIF_TERM response = reply->response;
+    if (env != NULL) {
+        reply->env = NULL;
+        reply->abandoned = true;
+    }
+    pthread_mutex_unlock(&reply->mutex);
+    if (env == NULL) {
+        PyErr_SetString(PyExc_RuntimeError, "Native callback reply is not available");
+        return NULL;
+    }
+    ErlNifBinary binary;
+    PyObject *result = NULL;
+    const ERL_NIF_TERM *parts;
+    int arity;
+    if (enif_inspect_binary(env, response, &binary)) {
+        result = parse_callback_response(binary.data, binary.size);
+    } else if (enif_get_tuple(env, response, &arity, &parts) && arity == 2 &&
+               enif_is_identical(parts[0], enif_make_atom(env, "native"))) {
+        result = term_to_py(env, parts[1]);
+    } else {
+        PyErr_SetString(PyExc_RuntimeError, "Invalid native callback response");
+    }
+    enif_free_env(env);
+    return result;
+}
+
+/* Runs without Python or its GIL, from the existing response NIF. The resource
+ * in the Erlang message keeps this state alive until its one writer completes. */
+static ERL_NIF_TERM respond_native_async_reply(ErlNifEnv *env, native_async_reply_t *reply,
+                                              uint64_t id, ERL_NIF_TERM response) {
+    pthread_mutex_lock(&reply->mutex);
+    if (reply->id != id) {
+        pthread_mutex_unlock(&reply->mutex);
+        return make_error(env, "invalid_callback_id");
+    }
+    if (!reply->abandoned && !reply->ready) {
+        reply->response = enif_make_copy(reply->env, response);
+        reply->ready = true;
+        pending_event_t *event = reply->event;
+        reply->event = NULL;
+        event_loop_dispatch_reserved(reply->loop, event, reply->id);
+    }
+    pthread_mutex_unlock(&reply->mutex);
+    return ATOM_OK;
+}
+
 /**
  * Send an async callback request to Erlang.
  * Returns the callback_id for tracking.
@@ -2502,8 +2666,10 @@ static PyObject *send_async_callback_request(PyObject *self, PyObject *args) {
 
     PyObject *name_obj;
     PyObject *call_args;
+    PyObject *reply_capsule = Py_None;
+    native_async_reply_t *reply = NULL;
 
-    if (!PyArg_ParseTuple(args, "OO", &name_obj, &call_args)) {
+    if (!PyArg_ParseTuple(args, "OO|O", &name_obj, &call_args, &reply_capsule)) {
         return NULL;
     }
 
@@ -2530,13 +2696,25 @@ static PyObject *send_async_callback_request(PyObject *self, PyObject *args) {
         return NULL;
     }
 
-    /* Get per-interpreter state for the pipe */
+    if (reply_capsule != Py_None) {
+        reply = PyCapsule_GetPointer(reply_capsule, NATIVE_ASYNC_REPLY_CAPSULE);
+        if (reply == NULL) return NULL;
+        pthread_mutex_lock(&reply->mutex);
+        bool valid = !reply->submitted && !reply->abandoned;
+        if (valid) reply->submitted = true;
+        pthread_mutex_unlock(&reply->mutex);
+        if (!valid) {
+            PyErr_SetString(PyExc_RuntimeError, "Native callback reply was already submitted or abandoned");
+            return NULL;
+        }
+    }
+    /* Non-native asyncio loops retain the existing pipe protocol. */
     erlang_module_state_t *state = get_erlang_module_state();
-    if (state == NULL || !state->pipe_initialized) {
+    if (reply == NULL && (state == NULL || !state->pipe_initialized)) {
         PyErr_SetString(PyExc_RuntimeError, "Async callback system not initialized");
         return NULL;
     }
-    if (state->pipe_broken) {
+    if (reply == NULL && state->pipe_broken) {
         PyErr_SetString(PyExc_RuntimeError,
             "async callback pipe broken; restart the erlang_python "
             "application to recover");
@@ -2544,7 +2722,8 @@ static PyObject *send_async_callback_request(PyObject *self, PyObject *args) {
     }
 
     /* Generate callback ID */
-    uint64_t callback_id = atomic_fetch_add(&g_callback_id_counter, 1);
+    uint64_t callback_id = reply != NULL ? reply->id
+        : atomic_fetch_add(&g_callback_id_counter, 1);
 
     /* Send callback request to Erlang via thread worker coordinator */
     ErlNifEnv *msg_env = enif_alloc_env();
@@ -2565,8 +2744,9 @@ static PyObject *send_async_callback_request(PyObject *self, PyObject *args) {
 
     /* Data actor credits cover this generic queue too. Transfer ownership
      * before copying payload bytes into the callback message environment. */
-    bool actor_data = strcmp(func_name, "_actor_data_call") == 0;
-    if (actor_data && actor_data_prepare(msg_env, call_args) < 0) {
+    bool task_start = strcmp(func_name, "_task_start") == 0;
+    bool actor_data = strcmp(func_name, "_actor_data_call") == 0 || task_start;
+    if (actor_data && actor_data_prepare(msg_env, call_args, task_start ? 5 : 4) < 0) {
         enif_free_env(msg_env);
         return NULL;
     }
@@ -2585,7 +2765,8 @@ static PyObject *send_async_callback_request(PyObject *self, PyObject *args) {
         id_term,
         func_term,
         args_term,
-        enif_make_int(msg_env, state->async_callback_pipe[1]));
+        reply != NULL ? enif_make_resource(msg_env, reply)
+                      : enif_make_int(msg_env, state->async_callback_pipe[1]));
 
     if (!enif_send(NULL, &g_thread_coordinator_pid, msg_env, msg)) {
         if (actor_data) actor_data_send_failed(call_args);
@@ -2697,6 +2878,28 @@ static PyObject *erlang_module_getattr(PyObject *module, PyObject *name) {
 
 #define CHANNEL_CAPSULE_NAME "erlang.channel_ref"
 
+static PyObject *raise_channel_error(const char *name, const char *message) {
+    PyObject *module = PyImport_ImportModule("_erlang_impl._channel");
+    if (module == NULL) return NULL;
+    PyObject *exception = PyObject_GetAttrString(module, name);
+    Py_DECREF(module);
+    if (exception == NULL) return NULL;
+    PyErr_SetString(exception, message);
+    Py_DECREF(exception);
+    return NULL;
+}
+
+static PyObject *raise_channel_closed(void) {
+    return raise_channel_error("ChannelClosed", "channel closed");
+}
+
+static bool channel_was_aborted(py_channel_t *channel) {
+    pthread_mutex_lock(&channel->mutex);
+    bool aborted = channel->aborted;
+    pthread_mutex_unlock(&channel->mutex);
+    return aborted;
+}
+
 /**
  * @brief Direct channel try_receive - non-blocking
  *
@@ -2752,13 +2955,11 @@ static PyObject *erlang_channel_try_receive_impl(PyObject *self, PyObject *args)
 
         return py_obj;  /* May be NULL if conversion failed */
     } else if (result == 1) {
-        /* Empty */
         Py_RETURN_NONE;
-    } else {
-        /* Closed */
-        PyErr_SetString(PyExc_RuntimeError, "channel closed");
-        return NULL;
+    } else if (result == -1) {
+        return raise_channel_closed();
     }
+    return PyErr_NoMemory();
 }
 
 /**
@@ -2804,8 +3005,9 @@ static PyObject *erlang_channel_receive_impl(PyObject *self, PyObject *args) {
         PyErr_SetString(PyExc_TimeoutError, "channel receive timeout");
         return NULL;
     } else if (result == -1) {
-        PyErr_SetString(PyExc_RuntimeError, "channel closed");
-        return NULL;
+        return raise_channel_closed();
+    } else if (result < 0) {
+        return PyErr_NoMemory();
     }
 
     /* Decode from Erlang external term format to Python */
@@ -2871,10 +3073,10 @@ static PyObject *erlang_channel_send_impl(PyObject *self, PyObject *args) {
     } else if (result == 1) {
         PyErr_SetString(PyExc_RuntimeError, "channel busy (backpressure)");
         return NULL;
-    } else {
-        PyErr_SetString(PyExc_RuntimeError, "channel closed");
-        return NULL;
+    } else if (result == -1) {
+        return raise_channel_closed();
     }
+    return PyErr_NoMemory();
 }
 
 /**
@@ -2902,11 +3104,10 @@ static PyObject *erlang_channel_is_closed_impl(PyObject *self, PyObject *args) {
         return NULL;
     }
 
-    if (channel->closed) {
-        Py_RETURN_TRUE;
-    } else {
-        Py_RETURN_FALSE;
-    }
+    pthread_mutex_lock(&channel->mutex);
+    bool closed = channel->closed;
+    pthread_mutex_unlock(&channel->mutex);
+    return PyBool_FromLong(closed);
 }
 
 /**
@@ -2982,13 +3183,11 @@ static PyObject *erlang_byte_channel_try_receive_bytes_impl(PyObject *self, PyOb
         enif_free(data);
         return bytes;  /* May be NULL if allocation failed */
     } else if (result == 1) {
-        /* Empty */
         Py_RETURN_NONE;
-    } else {
-        /* Closed */
-        PyErr_SetString(PyExc_RuntimeError, "channel closed");
-        return NULL;
+    } else if (result == -1) {
+        return raise_channel_closed();
     }
+    return PyErr_NoMemory();
 }
 
 /**
@@ -3034,8 +3233,9 @@ static PyObject *erlang_byte_channel_receive_bytes_impl(PyObject *self, PyObject
         PyErr_SetString(PyExc_TimeoutError, "channel receive timeout");
         return NULL;
     } else if (result == -1) {
-        PyErr_SetString(PyExc_RuntimeError, "channel closed");
-        return NULL;
+        return raise_channel_closed();
+    } else if (result < 0) {
+        return PyErr_NoMemory();
     }
 
     /* Return raw bytes (NO term decoding) */
@@ -3100,26 +3300,16 @@ static PyObject *erlang_channel_wait_impl(PyObject *self, PyObject *args) {
         return Py_BuildValue("(ss)", "error", "waiter_exists");
     }
 
-    /* Check if data available */
-    size_t queue_size = enif_ioq_size(channel->queue);
-    if (queue_size > 0) {
-        SysIOVec *iov;
-        int iovcnt;
-        iov = enif_ioq_peek(channel->queue, &iovcnt);
-
-        if (iovcnt > 0 && iov != NULL && iov[0].iov_len > 0) {
-            size_t msg_size = iov[0].iov_len;
-            unsigned char *data = enif_alloc(msg_size);
-            if (data == NULL) {
-                pthread_mutex_unlock(&channel->mutex);
-                PyErr_SetString(PyExc_MemoryError, "failed to allocate memory");
-                return NULL;
-            }
-
-            memcpy(data, iov[0].iov_base, msg_size);
-            enif_ioq_deq(channel->queue, msg_size, NULL);
-            channel->current_size -= msg_size;
-            pthread_mutex_unlock(&channel->mutex);
+    if (channel->message_count > 0) {
+        unsigned char *data = NULL;
+        size_t msg_size = 0;
+        int popped = channel_pop_locked(channel, &data, &msg_size);
+        pthread_mutex_unlock(&channel->mutex);
+        if (popped != 0) {
+            PyErr_SetString(PyExc_MemoryError, "failed to allocate memory");
+            return NULL;
+        }
+        {
 
             /* Decode term: binary -> Erlang term -> Python */
             ErlNifEnv *tmp_env = enif_alloc_env();
@@ -3258,30 +3448,18 @@ static PyObject *erlang_byte_channel_wait_impl(PyObject *self, PyObject *args) {
         return Py_BuildValue("(ss)", "error", "waiter_exists");
     }
 
-    /* Check if data available */
-    size_t queue_size = enif_ioq_size(channel->queue);
-    if (queue_size > 0) {
-        SysIOVec *iov;
-        int iovcnt;
-        iov = enif_ioq_peek(channel->queue, &iovcnt);
-
-        if (iovcnt > 0 && iov != NULL && iov[0].iov_len > 0) {
-            size_t msg_size = iov[0].iov_len;
-
-            /* Create Python bytes object */
-            PyObject *bytes = PyBytes_FromStringAndSize((char *)iov[0].iov_base, msg_size);
-            if (bytes == NULL) {
-                pthread_mutex_unlock(&channel->mutex);
-                return NULL;
-            }
-
-            enif_ioq_deq(channel->queue, msg_size, NULL);
-            channel->current_size -= msg_size;
-            pthread_mutex_unlock(&channel->mutex);
-
-            /* Return raw bytes (NO term decoding) */
-            return Py_BuildValue("(sO)", "ok", bytes);
-        }
+    if (channel->message_count > 0) {
+        unsigned char *data = NULL;
+        size_t size = 0;
+        int popped = channel_pop_locked(channel, &data, &size);
+        pthread_mutex_unlock(&channel->mutex);
+        if (popped != 0) return PyErr_NoMemory();
+        PyObject *bytes = PyBytes_FromStringAndSize((char *)data, size);
+        enif_free(data);
+        if (bytes == NULL) return NULL;
+        PyObject *result = Py_BuildValue("(sO)", "ok", bytes);
+        Py_DECREF(bytes);
+        return result;
     }
 
     /* No data - register waiter */
@@ -3367,8 +3545,156 @@ static PyObject *erlang_whereis_impl(PyObject *self, PyObject *args) {
     return result;
 }
 
+static void bounded_channel_capsule_destroy(PyObject *capsule) {
+    py_channel_t *channel = PyCapsule_GetPointer(capsule, CHANNEL_CAPSULE_NAME);
+    if (channel != NULL) enif_release_resource(channel);
+}
+
+static PyObject *erlang_channel_create_bounded(PyObject *self, PyObject *args) {
+    (void)self;
+    Py_ssize_t capacity, bytes;
+    if (!PyArg_ParseTuple(args, "nn", &capacity, &bytes)) return NULL;
+    if (capacity < 0 || bytes < 0) {
+        PyErr_SetString(PyExc_ValueError, "channel limits must be non-negative");
+        return NULL;
+    }
+    py_channel_t *channel = channel_alloc((size_t)bytes);
+    if (channel == NULL) return PyErr_NoMemory();
+    channel->max_messages = capacity;
+    PyObject *capsule = PyCapsule_New(channel, CHANNEL_CAPSULE_NAME, bounded_channel_capsule_destroy);
+    if (capsule == NULL) enif_release_resource(channel);
+    return capsule;
+}
+
+static PyObject *erlang_channel_ready(PyObject *self, PyObject *args) {
+    (void)self;
+    PyObject *capsule, *loop_capsule;
+    unsigned long long id, size;
+    int writing;
+    if (!PyArg_ParseTuple(args, "OOKpK", &capsule, &loop_capsule, &id, &writing, &size)) return NULL;
+    py_channel_t *channel = PyCapsule_GetPointer(capsule, CHANNEL_CAPSULE_NAME);
+    if (channel == NULL) return NULL;
+    erlang_event_loop_t *loop = PyCapsule_GetPointer(loop_capsule, "erlang_python.event_loop");
+    if (loop == NULL) return NULL;
+    int result = channel_wait_ready(channel, loop, id, writing, size);
+    if (result == -3) return raise_channel_error("ChannelOverloaded", "Native readiness capacity exhausted");
+    if (result < 0) return PyErr_NoMemory();
+    return PyBool_FromLong(result);
+}
+
+static PyObject *erlang_channel_cancel_ready(PyObject *self, PyObject *args) {
+    (void)self;
+    PyObject *capsule;
+    unsigned long long id;
+    if (!PyArg_ParseTuple(args, "OK", &capsule, &id)) return NULL;
+    py_channel_t *channel = PyCapsule_GetPointer(capsule, CHANNEL_CAPSULE_NAME);
+    if (channel == NULL) return NULL;
+    channel_cancel_ready(channel, id);
+    Py_RETURN_NONE;
+}
+
+static PyObject *erlang_channel_abort(PyObject *self, PyObject *args) {
+    (void)self;
+    PyObject *capsule;
+    if (!PyArg_ParseTuple(args, "O", &capsule)) return NULL;
+    py_channel_t *channel = PyCapsule_GetPointer(capsule, CHANNEL_CAPSULE_NAME);
+    if (channel == NULL) return NULL;
+    channel_abort(channel);
+    Py_RETURN_NONE;
+}
+
+static PyObject *erlang_channel_send_result(PyObject *self, PyObject *args) {
+    (void)self;
+    PyObject *capsule;
+    Py_buffer data;
+    if (!PyArg_ParseTuple(args, "Oy*", &capsule, &data)) return NULL;
+    py_channel_t *channel = PyCapsule_GetPointer(capsule, CHANNEL_CAPSULE_NAME);
+    if (channel == NULL) { PyBuffer_Release(&data); return NULL; }
+    int result = channel_send(channel, data.buf, data.len);
+    PyBuffer_Release(&data);
+    if (result == -2) return PyErr_NoMemory();
+    return PyUnicode_FromString(result == 0 ? "ok" : result == 1 ? "full" : "closed");
+}
+
+static PyObject *erlang_channel_receive_result(PyObject *self, PyObject *args) {
+    (void)self;
+    PyObject *capsule;
+    if (!PyArg_ParseTuple(args, "O", &capsule)) return NULL;
+    py_channel_t *channel = PyCapsule_GetPointer(capsule, CHANNEL_CAPSULE_NAME);
+    if (channel == NULL) return NULL;
+    unsigned char *data = NULL;
+    size_t size = 0;
+    int result = channel_try_receive(channel, &data, &size);
+    if (result == -2) return PyErr_NoMemory();
+    if (result != 0) return Py_BuildValue("(sO)", result == 1 ? "empty" :
+        channel_was_aborted(channel) ? "aborted" : "closed", Py_None);
+    PyObject *payload = PyBytes_FromStringAndSize((char *)data, size);
+    enif_free(data);
+    if (payload == NULL) return NULL;
+    PyObject *out = Py_BuildValue("(sO)", "ok", payload);
+    Py_DECREF(payload);
+    return out;
+}
+
+static PyObject *erlang_channel_term_result(PyObject *self, PyObject *args) {
+    (void)self;
+    PyObject *capsule;
+    if (!PyArg_ParseTuple(args, "O", &capsule)) return NULL;
+    py_channel_t *channel = PyCapsule_GetPointer(capsule, CHANNEL_CAPSULE_NAME);
+    if (channel == NULL) return NULL;
+    unsigned char *data = NULL;
+    size_t size = 0;
+    int result = channel_try_receive(channel, &data, &size);
+    if (result == -2) return PyErr_NoMemory();
+    if (result == -1) return channel_was_aborted(channel)
+        ? raise_channel_error("ChannelAborted", "Channel aborted; queued payloads discarded")
+        : raise_channel_closed();
+    if (result == 1) return Py_BuildValue("(iO)", 1, Py_None);
+    ErlNifEnv *env = enif_alloc_env();
+    if (env == NULL) { enif_free(data); return PyErr_NoMemory(); }
+    ERL_NIF_TERM term;
+    int decoded = enif_binary_to_term(env, data, size, &term, ERL_NIF_BIN2TERM_SAFE);
+    enif_free(data);
+    if (!decoded) {
+        enif_free_env(env);
+        PyErr_SetString(PyExc_ValueError, "invalid channel term");
+        return NULL;
+    }
+    PyObject *payload = term_to_py(env, term);
+    enif_free_env(env);
+    if (payload == NULL) return NULL;
+    PyObject *out = Py_BuildValue("(iO)", 0, payload);
+    Py_DECREF(payload);
+    return out;
+}
+
+static PyObject *erlang_channel_snapshot(PyObject *self, PyObject *args) {
+    (void)self;
+    PyObject *capsule;
+    if (!PyArg_ParseTuple(args, "O", &capsule)) return NULL;
+    py_channel_t *channel = PyCapsule_GetPointer(capsule, CHANNEL_CAPSULE_NAME);
+    if (channel == NULL) return NULL;
+    pthread_mutex_lock(&channel->mutex);
+    size_t waiters = 0;
+    for (channel_ready_waiter_t *w = channel->ready_waiters; w != NULL; w = w->next) waiters++;
+    PyObject *out = Py_BuildValue("(KKKKOK)", (unsigned long long)channel->message_count,
+        (unsigned long long)channel->current_size, (unsigned long long)channel->max_messages,
+        (unsigned long long)channel->max_size, channel->closed ? Py_True : Py_False,
+        (unsigned long long)waiters);
+    pthread_mutex_unlock(&channel->mutex);
+    return out;
+}
+
 /* Python method definitions for erlang module */
 static PyMethodDef ErlangModuleMethods[] = {
+    {"_channel_create_bounded", erlang_channel_create_bounded, METH_VARARGS, NULL},
+    {"_channel_ready", erlang_channel_ready, METH_VARARGS, NULL},
+    {"_channel_cancel_ready", erlang_channel_cancel_ready, METH_VARARGS, NULL},
+    {"_channel_abort", erlang_channel_abort, METH_VARARGS, NULL},
+    {"_channel_send_result", erlang_channel_send_result, METH_VARARGS, NULL},
+    {"_channel_receive_result", erlang_channel_receive_result, METH_VARARGS, NULL},
+    {"_channel_snapshot", erlang_channel_snapshot, METH_VARARGS, NULL},
+    {"_channel_term_result", erlang_channel_term_result, METH_VARARGS, NULL},
     {"_call_blocking", erlang_call_blocking_impl, METH_VARARGS,
      "Call an Erlang function on the blocking thread path (no suspension, no replay)"},
     {"call", erlang_call_impl, METH_VARARGS,
@@ -3409,6 +3735,16 @@ static PyMethodDef ErlangModuleMethods[] = {
     {"_actor_complete", python_actor_complete, METH_O, "Acknowledge actual data dispatch completion."},
     {"_actor_retain", python_actor_retain, METH_O, "Retain a main-interpreter object."},
     {"_actor_unwrap", python_actor_unwrap, METH_O, "Recover a retained Python object."},
+    {"_actor_retained_object_stats", python_actor_retained_object_stats, METH_NOARGS,
+     "Snapshot retained resources and their Python value, context and environment edges."},
+    {"_actor_take_exception", python_actor_take_exception, METH_O,
+     "Transfer a terminal task exception exactly once, without retaining its traceback."},
+    {"_prepare_native_async_reply", prepare_native_async_reply, METH_VARARGS,
+     "Reserve readiness on the exact Future owner's native loop"},
+    {"_take_native_async_reply", take_native_async_reply, METH_VARARGS,
+     "Consume a completed callback reply on its owner"},
+    {"_abandon_native_async_reply", abandon_native_async_reply, METH_O,
+     "Abandon reply delivery without cancelling callback effects"},
     {"_get_async_callback_fd", get_async_callback_fd, METH_NOARGS,
      "Get the file descriptor for async callback responses.\n"
      "Used internally by async_call() to register with asyncio."},
@@ -3750,8 +4086,11 @@ static int create_erlang_module(void) {
         "        The result from the Erlang function\n"
         "    '''\n"
         "    loop = asyncio.get_running_loop()\n"
+        "    from _erlang_impl._loop import ErlangEventLoop\n"
+        "    if isinstance(loop, ErlangEventLoop):\n"
+        "        return await loop._async_call(func_name, args)\n"
         "    \n"
-        "    # Ensure the reader is registered with this event loop\n"
+        "    # Non-native loops use the existing pipe reader\n"
         "    if loop not in _async_reader_registered:\n"
         "        fd = erlang._get_async_callback_fd()\n"
         "        loop.add_reader(fd, erlang._async_callback_reader)\n"
@@ -3974,6 +4313,7 @@ static int create_erlang_module(void) {
         "        erlang.server = _erlang_impl.server\n"
         "        erlang.supervision = _erlang_impl.supervision\n"
         "        erlang.actors = _erlang_impl.actors\n"
+        "        erlang.tasks = _erlang_impl.tasks\n"
         "        erlang._run_loop_forever = _erlang_impl._run_loop_forever\n"
         "        erlang._stop_loop = _erlang_impl._stop_loop\n"
         "        # Make erlang behave as a package for 'import erlang.reactor' syntax\n"
@@ -3984,6 +4324,7 @@ static int create_erlang_module(void) {
         "        sys.modules['erlang.server'] = erlang.server\n"
         "        sys.modules['erlang.supervision'] = erlang.supervision\n"
         "        sys.modules['erlang.actors'] = erlang.actors\n"
+        "        sys.modules['erlang.tasks'] = erlang.tasks\n"
         "        return True\n"
         "    except ImportError as e:\n"
         "        import sys\n"

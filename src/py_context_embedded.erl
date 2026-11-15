@@ -51,7 +51,7 @@
     loop_req :: reference() | undefined,
     loop_owner :: pid() | undefined,
     loop_owner_mon :: reference() | undefined,
-    loop_stop_waiters = [] :: [{pid(), reference()}]
+    loop_stop_waiters = [] :: [{pid(), reference(), integer()}]
 }).
 
 %% Time given to a running loop to exit after py_context:interrupt/1
@@ -107,7 +107,7 @@ init_started(Parent, Id, Ref, InterpId, Opts) ->
             end
     end,
     %% For subinterpreters, create a dedicated event worker
-    EventState = setup_event_worker(Ref, InterpId),
+    EventState = setup_event_worker(Ref, InterpId, Opts),
     %% For thread-model subinterpreters, spawn a dedicated callback handler
     %% because the main context process will be blocked in the NIF
     CallbackHandler = case maps:get(mode, EventState, normal) of
@@ -133,7 +133,7 @@ init_started(Parent, Id, Ref, InterpId, Opts) ->
     loop(State).
 
 %% @private Create event worker for subinterpreter contexts
-setup_event_worker(Ref, InterpId) ->
+setup_event_worker(Ref, InterpId, Opts) ->
     case py_nif:context_get_event_loop(Ref) of
         {ok, LoopRef} ->
             %% This is a subinterpreter - create dedicated event worker
@@ -151,8 +151,21 @@ setup_event_worker(Ref, InterpId) ->
                     #{}
             end;
         {error, not_subinterp} ->
-            %% Worker mode - uses shared router (lazy initialization)
-            #{};
+            case maps:get(managed_loop, Opts, shared) of
+                shared -> #{};
+                dedicated ->
+                    {ok, LoopRef} = py_nif:event_loop_new(),
+                    WorkerId = iolist_to_binary(["ctx_loop_", pid_to_list(self())]),
+                    case py_event_worker:start_link(WorkerId, LoopRef) of
+                        {ok, WorkerPid} ->
+                            ok = py_nif:event_loop_set_worker(LoopRef, WorkerPid),
+                            #{loop_ref => LoopRef, worker_pid => WorkerPid, dedicated => true};
+                        {error, Error} ->
+                            ok = py_nif:event_loop_destroy(LoopRef),
+                            error({dedicated_loop_worker, Error})
+                    end;
+                Other -> error({invalid_managed_loop, Other})
+            end;
         {error, event_loop_owned_by_thread} ->
             %% Thread-model subinterpreter: event loop is managed by dedicated thread.
             %% This is expected behavior, not a failure.
@@ -259,20 +272,15 @@ loop(#state{ref = Ref, interp_id = InterpId, loop_req = LoopReq} = State) ->
         {py_result, LoopReq, Result} when LoopReq =/= undefined ->
             loop(loop_exited(Result, State));
 
-        {loop_stop_deadline, LoopReq} when LoopReq =/= undefined ->
-            %% Cooperative stop did not land: interrupt the thread
-            _ = py_nif:context_interrupt(Ref),
-            erlang:send_after(?LOOP_INTERRUPT_GRACE_MS, self(),
-                              {loop_interrupt_deadline, LoopReq}),
-            loop(State);
+        {loop_stop_deadline, LoopReq, Request} when LoopReq =/= undefined ->
+            {Expired, Pending} = lists:partition(
+                fun({_, M, _}) -> M =:= Request end, State#state.loop_stop_waiters),
+            [W ! {M, {error, timeout}} || {W, M, _} <- Expired],
+            %% Leave the driver and its live work intact. Only actual quiescence
+            %% can close the loop and produce its exit acknowledgement.
+            loop(State#state{loop_stop_waiters = Pending});
 
-        {loop_interrupt_deadline, LoopReq} when LoopReq =/= undefined ->
-            [W ! {M, {error, timeout}} || {W, M} <- State#state.loop_stop_waiters],
-            loop(State#state{loop_stop_waiters = []});
-
-        {loop_stop_deadline, _} ->
-            loop(State);
-        {loop_interrupt_deadline, _} ->
+        {loop_stop_deadline, _, _} ->
             loop(State);
 
         {'DOWN', Mon, process, _Owner, _Reason}
@@ -403,7 +411,11 @@ loop(#state{ref = Ref, interp_id = InterpId, loop_req = LoopReq} = State) ->
                             error_logger:warning_msg(
                                 "py_context ~p: Event worker died: ~p~n",
                                 [InterpId, Reason]),
-                            NewState = State#state{event_state = #{}},
+                            EventState = case maps:get(dedicated, State#state.event_state, false) of
+                                true -> maps:remove(worker_pid, State#state.event_state);
+                                false -> #{}
+                            end,
+                            NewState = State#state{event_state = EventState},
                             loop(NewState);
                         _ when Reason =:= shutdown; Reason =:= kill ->
                             %% Supervisor shutdown or kill signal - clean exit
@@ -445,8 +457,12 @@ do_start_loop(Owner, #state{ref = Ref} = State) ->
     case context_loop_ref(State) of
         {ok, _} ->
             LoopReq = make_ref(),
+            Args = case State#state.event_state of
+                #{dedicated := true, loop_ref := Dedicated} -> [self(), Dedicated];
+                _ -> [self()]
+            end,
             case py_nif:context_call_async(Ref, self(), LoopReq, <<"erlang">>,
-                                           <<"_run_loop_forever">>, [self()], #{}) of
+                                           <<"_run_loop_forever">>, Args, #{}) of
                 {enqueued, LoopReq} ->
                     %% Wait for the loop to actually run before answering, so
                     %% a submit right after start_loop finds it
@@ -472,12 +488,13 @@ do_start_loop(Owner, #state{ref = Ref} = State) ->
             {{error, Reason}, State}
     end.
 
-%% @private Ask the running loop to stop from inside, arm the interrupt
-%% deadline, and remember who to answer once it has exited.
+%% @private Request managed cleanup and bound this caller's wait. A timeout
+%% does not interrupt or close a driver that still owns live Python work.
 begin_stop_loop(From, MRef, GraceMs, #state{loop_req = LoopReq} = State) ->
     Waiters = case From of
         undefined -> State#state.loop_stop_waiters;
-        _ -> [{From, MRef} | State#state.loop_stop_waiters]
+        _ -> [{From, MRef, erlang:monotonic_time(millisecond) + GraceMs}
+              | State#state.loop_stop_waiters]
     end,
     case context_loop_ref(State) of
         {ok, LoopRef} ->
@@ -486,7 +503,7 @@ begin_stop_loop(From, MRef, GraceMs, #state{loop_req = LoopReq} = State) ->
         _ ->
             ok
     end,
-    erlang:send_after(GraceMs, self(), {loop_stop_deadline, LoopReq}),
+    erlang:send_after(GraceMs, self(), {loop_stop_deadline, LoopReq, MRef}),
     State#state{loop_stop_waiters = Waiters}.
 
 %% @private The exec running the loop returned: tell the owner and the
@@ -501,7 +518,14 @@ loop_exited(Result, #state{loop_owner = Owner, loop_owner_mon = Mon,
         true -> Owner ! {py_loop_exit, self(), Result};
         false -> ok
     end,
-    [W ! {M, ok} || {W, M} <- Waiters],
+    Now = erlang:monotonic_time(millisecond),
+    [W ! {M, case Now > Deadline of
+        true -> {error, timeout};
+        false -> case Result of
+            {ok, <<"stopped">>} -> ok;
+            _ -> {error, {loop_exit, Result}}
+        end
+    end} || {W, M, Deadline} <- Waiters],
     State#state{loop_req = undefined, loop_owner = undefined,
                 loop_owner_mon = undefined, loop_stop_waiters = []}.
 
@@ -535,6 +559,11 @@ terminate(_Reason, #state{ref = Ref, event_state = EventState, callback_handler 
     end,
     %% Destroy the Python context
     try py_nif:context_destroy(Ref) catch _:_ -> ok end,
+    case EventState of
+        #{dedicated := true, loop_ref := LoopRef} ->
+            ok = py_nif:event_loop_destroy(LoopRef);
+        _ -> ok
+    end,
     ok.
 
 %% ============================================================================

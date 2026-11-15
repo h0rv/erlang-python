@@ -16,6 +16,7 @@
 -export([
     create_byte_channel_test/1,
     create_byte_channel_with_max_size_test/1,
+    message_count_and_empty_payload_test/1,
     erlang_send_bytes_test/1,
     erlang_receive_bytes_test/1,
     send_receive_multiple_bytes_test/1,
@@ -48,6 +49,7 @@
 all() -> [
     create_byte_channel_test,
     create_byte_channel_with_max_size_test,
+    message_count_and_empty_payload_test,
     erlang_send_bytes_test,
     erlang_receive_bytes_test,
     send_receive_multiple_bytes_test,
@@ -109,6 +111,25 @@ end_per_testcase(_TestCase, _Config) ->
 %%% ============================================================================
 %%% Test Cases
 %%% ============================================================================
+
+message_count_and_empty_payload_test(_Config) ->
+    {ok, Ch} = py_byte_channel:new(#{max_size => 3, max_messages => 2}),
+    ok = py_byte_channel:send(Ch, <<>>),
+    ok = py_byte_channel:send(Ch, <<>>),
+    #{size := 0, count := 2, max_messages := 2} = py_byte_channel:info(Ch),
+    busy = py_byte_channel:send(Ch, <<>>),
+    {ok, <<>>} = py_byte_channel:try_receive(Ch),
+    ok = py_byte_channel:send(Ch, <<"abc">>),
+    {ok, <<>>} = py_byte_channel:try_receive(Ch),
+    busy = py_byte_channel:send(Ch, <<"x">>),
+    #{size := 3, count := 1} = py_byte_channel:info(Ch),
+    ok = py_byte_channel:close(Ch),
+    {ok, <<"abc">>} = py_byte_channel:try_receive(Ch),
+    {error, closed} = py_byte_channel:try_receive(Ch),
+    #{size := 0, count := 0} = py_byte_channel:info(Ch),
+    {ok, Legacy} = py_byte_channel:new(),
+    #{max_size := 0, max_messages := 0} = py_byte_channel:info(Legacy),
+    ok = py_byte_channel:close(Legacy).
 
 %% @doc Test creating a byte channel with default settings
 create_byte_channel_test(_Config) ->
@@ -519,6 +540,8 @@ close_drain_bytes_python_async_test(_Config) ->
 import erlang
 from erlang import ByteChannel, ByteChannelClosed
 
+import asyncio
+
 async def async_drain_byte_channel(ch_ref):
     '''Async drain all chunks from byte channel, return as list.'''
     ch = ByteChannel(ch_ref)
@@ -528,8 +551,12 @@ async def async_drain_byte_channel(ch_ref):
     return chunks
 ">>),
 
+    %% Own this runner's resource rather than replacing create_task's cached owner.
+    {ok, DrainLoop} = py_nif:event_loop_new(),
     {ok, [<<"part1">>, <<"part2">>, <<"part3">>]} =
-        py:eval(Ctx, <<"erlang.run(async_drain_byte_channel(ch))">>, #{<<"ch">> => Ch}),
+        py:eval(Ctx, <<"asyncio.run(async_drain_byte_channel(ch), loop_factory=lambda loop=loop: erlang.ErlangEventLoop(loop))">>,
+                #{<<"ch">> => Ch, <<"loop">> => DrainLoop}),
+    ok = py_nif:event_loop_destroy(DrainLoop),
 
     ct:pal("Python async byte channel close+drain test passed").
 
