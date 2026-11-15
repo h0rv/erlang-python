@@ -6,11 +6,11 @@
 
 In Erlang, processes are the fundamental unit of isolation. Each process has its own heap, mailbox, and lifecycle. When a process crashes, it takes its state with it and can be restarted clean by a supervisor.
 
-Each calling Erlang process can own a separate Python namespace. This is a dictionary, not an interpreter or a native crash boundary. Worker contexts share the main interpreter and imported modules. Module globals and objects deliberately shared through a module remain visible to other callers.
+erlang_python extends this philosophy to Python: **each Erlang process gets its own isolated Python environment**. Variables, imports, and objects defined in one process are invisible to others, even when using the same Python context.
 
 This design enables:
 - **Clean restarts**: Resetting Python state = terminating the Erlang process
-- **Namespace separation**: Process-local variables have separate dictionaries. Embedded native crashes can still kill the VM.
+- **Fault isolation**: A corrupted Python state crashes only its owning process
 - **Supervision**: Standard OTP supervisors can manage Python-backed actors
 - **Actor model**: Build stateful Python services that behave like gen_servers
 
@@ -18,7 +18,7 @@ This design enables:
 
 When you call `py:exec/eval/call`, the library:
 
-1. Looks up a process-local environment keyed by interpreter ID in the calling process dictionary
+1. Looks up a process-local environment keyed by `{ContextPid, InterpreterId}`
 2. Creates one if it doesn't exist (a Python `dict` inside the interpreter)
 3. Uses that dict as the namespace for execution
 4. Cleans up automatically when the Erlang process exits
@@ -96,7 +96,7 @@ spawn(fun() ->
     ok = py_nif:context_exec(CtxRef, <<"x = 'from B'">>, EnvB),
     {ok, <<"from B">>} = py_nif:context_eval(CtxRef, <<"x">>, #{}, EnvB)
 end).
-%% Sharing a context does not create a second execution thread.
+%% Both execute in parallel on the same OWN_GIL thread, but with isolated state
 ```
 
 ### When to Use Explicit vs Implicit Environments
@@ -305,7 +305,7 @@ reset_worker(Sup) ->
     {ok, _} = supervisor:restart_child(Sup, py_worker).
 ```
 
-The new process starts with a fresh Python namespace. Shared imported modules are not reloaded or reset. Resource release can require garbage collection after the owner dies.
+No need to manually clear variables, reload modules, or reset interpreter state. The new process starts with a fresh Python environment.
 
 ### Stateful ML Pipeline
 

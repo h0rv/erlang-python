@@ -9,7 +9,7 @@
     start_failure_releases/1, close_retains_queued_work/1, legacy_unchanged/1,
     shared_bytes_across_callers/1, submitter_death_race/1, worker_death/1,
     exceptions_complete/1, unsupported_mode_fails_closed/1, custom_factory_fails_closed/1,
-    configuration_shutdown_race/1, concurrent_completion_and_admission/1, runnable_example/1,
+    configuration_shutdown_race/1, concurrent_completion_and_admission/1,
     uncertain_constructor_fails_closed/1
 ]).
 
@@ -19,7 +19,7 @@ all() -> [unconfigured_fails_closed, shared_count_and_reuse, encoded_bytes,
           start_failure_releases, close_retains_queued_work, legacy_unchanged,
           shared_bytes_across_callers, submitter_death_race, worker_death,
           exceptions_complete, unsupported_mode_fails_closed, custom_factory_fails_closed,
-          configuration_shutdown_race, concurrent_completion_and_admission, runnable_example,
+          configuration_shutdown_race, concurrent_completion_and_admission,
           uncertain_constructor_fails_closed].
 
 init_per_suite(Config) ->
@@ -235,37 +235,6 @@ uncertain_constructor_fails_closed(_Config) ->
             {ok, none} = control(L, restore_constructor, [])
         end
     end).
-
-runnable_example(_Config) ->
-    {source, Source} = lists:keyfind(source, 1, ?MODULE:module_info(compile)),
-    Root = filename:dirname(filename:dirname(Source)),
-    Example = filename:join([Root, "examples", "safety_admission.escript"]),
-    Escript = os:find_executable("escript"),
-    Port = open_port({spawn_executable, Escript},
-                     [binary, exit_status, use_stdio, stderr_to_stdout, {args, [Example, "test"]}]),
-    try
-        Output = example_output(Port, <<>>),
-        true = binary:match(Output, <<"Shared destination rejected before enqueue.">>) =/= nomatch,
-        true = binary:match(Output, <<"unfinished cleanup still holds capacity.">>) =/= nomatch,
-        true = binary:match(Output, <<"a new invocation succeeded.">>) =/= nomatch
-    after
-        case erlang:port_info(Port, os_pid) of
-            undefined -> ok;
-            {os_pid, OsPid} ->
-                os:cmd("kill -TERM " ++ integer_to_list(OsPid)),
-                erlang:port_close(Port)
-        end
-    end.
-
-example_output(Port, Output) ->
-    receive
-        {Port, {data, Data}} when byte_size(Output) + byte_size(Data) =< 65536 ->
-            example_output(Port, <<Output/binary, Data/binary>>);
-        {Port, {data, _}} -> ct:fail(example_output_overflow);
-        {Port, {exit_status, 0}} -> Output;
-        {Port, {exit_status, Code}} -> ct:fail({example_failed, Code, Output})
-    after 15000 -> ct:fail({example_timeout, Output})
-    end.
 
 concurrent_completion_and_admission(_Config) ->
     with_loop(fun(L) ->

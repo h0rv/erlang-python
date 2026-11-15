@@ -288,9 +288,18 @@ actor_policy(Config) ->
     {error, admission_unavailable} = py_object_actor:start_link(
         Ctx, Factory, [Method], #{capacity => 1, max_bytes => 1024}),
     Bad = ref(Ctx, Env, <<"lambda state: state.value">>),
+    %% Failed linked startup also sends an exit signal to the caller.
     %% Registration checks class membership, not just callable compatibility.
-    {error, {python_error, _}} = py_object_actor:start_link(Ctx, Factory, [Bad], unbounded),
-    ok.
+    Parent = self(),
+    {Pid, Mon} = spawn_monitor(fun() ->
+        process_flag(trap_exit, true),
+        Result = py_object_actor:start_link(Ctx, Factory, [Bad], unbounded),
+        Parent ! {registration_result, self(), Result}
+    end),
+    receive {registration_result, Pid, {error, {python_error, _}}} -> ok
+    after 5000 -> error(registration_timeout) end,
+    receive {'DOWN', Mon, process, Pid, normal} -> ok
+    after 5000 -> error(registration_owner_timeout) end.
 
 actor_death_cleanup(Config) ->
     Ctx = context(Config),
