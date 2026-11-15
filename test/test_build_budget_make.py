@@ -27,6 +27,8 @@ class RealMakeBudgetTests(unittest.TestCase):
             "GNUMAKEFLAGS",
             "MAKEOVERRIDES",
             "MAKEFILES",
+            "MAKE",
+            "MAKELEVEL",
             "IOMMAP_BUILDOPTS",
         ):
             self.environment.pop(key, None)
@@ -176,17 +178,59 @@ class RealMakeBudgetTests(unittest.TestCase):
                 self.assertFalse(self.argv.exists())
                 self.assertFalse(self.events.exists())
 
+    def test_direct_configure_strips_make_controls_before_cmake(self) -> None:
+        self.script = ROOT / "do_cmake.sh"
+        injection = self.root / "injected.mk"
+        injection.write_text("override MAKEFLAGS := -j10\n")
+        controls = {
+            "MAKEFLAGS": "-kj10 MAKEFLAGS=-j10",
+            "MFLAGS": "-kj",
+            "GNUMAKEFLAGS": "-kj10",
+            "MAKEOVERRIDES": "MAKEFLAGS=-j10",
+            "MAKEFILES": str(injection),
+            "MAKE": "/usr/bin/make -j10",
+            "MAKELEVEL": "99",
+        }
+        self.environment.update(controls, CFLAGS="preserved-toolchain-sentinel")
+        self.tool(
+            "cmake3",
+            "#!/bin/sh\nset -eu\n"
+            "for name in " + " ".join(controls) + "; do\n"
+            ' eval "present=\\${$name+x}"\n[ -z "$present" ] || exit 98\ndone\n'
+            '[ "$CFLAGS" = "preserved-toolchain-sentinel" ]\n'
+            'exec /usr/bin/make -rR -j "$CMAKE_BUILD_PARALLEL_LEVEL"\n',
+        )
+        for budget in ("1", "2"):
+            self.environment["CMAKE_BUILD_PARALLEL_LEVEL"] = budget
+            result = self.run_build(())
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Inherited make controls replaced", result.stderr)
+            self.assertLessEqual(self.peak(), int(budget))
+            for name, value in controls.items():
+                self.assertEqual(self.environment[name], value)
+        for budget in ("0", "3", "invalid"):
+            self.environment["CMAKE_BUILD_PARALLEL_LEVEL"] = budget
+            result = self.run_build(())
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("must be 1 or 2", result.stderr)
+            self.assertFalse(self.events.exists())
+
     def test_inherited_make_controls_do_not_escape_budget(self) -> None:
         # Exercise propagation through recursive make, not just the first argv.
         (self.build / "Makefile").rename(self.build / "assets.mk")
         (self.build / "Makefile").write_text(
             ".PHONY: all\nall:\n\t+$(MAKE) -rR -f assets.mk\n"
         )
+        injection = self.root / "injected.mk"
+        injection.write_text("override MAKEFLAGS := -j10\n")
         controls = {
             "MAKEFLAGS": "-kj10 MAKEFLAGS=-j10",
             "MFLAGS": "-kj",
             "GNUMAKEFLAGS": "-kj10",
             "MAKEOVERRIDES": "MAKEFLAGS=-j10",
+            "MAKEFILES": str(injection),
+            "MAKE": "/usr/bin/make -j10",
+            "MAKELEVEL": "99",
         }
         for budget in ("1", "2"):
             for name, value in controls.items():

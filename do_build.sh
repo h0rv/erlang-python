@@ -33,10 +33,10 @@ if [ "$#" -ne 0 ]; then
 fi
 # Inherited make controls can carry variable redefinitions into recursive make.
 # CMake's explicit parallel budget is the sole source of job control here.
-if [ -n "${MAKEFLAGS-}${MFLAGS-}${GNUMAKEFLAGS-}${MAKEOVERRIDES-}" ]; then
+if [ -n "${MAKEFLAGS+x}${MFLAGS+x}${GNUMAKEFLAGS+x}${MAKEOVERRIDES+x}${MAKEFILES+x}${MAKE+x}${MAKELEVEL+x}" ]; then
     echo 'Inherited make controls replaced by the compiler job budget' >&2
 fi
-unset MAKEFLAGS MFLAGS GNUMAKEFLAGS MAKEOVERRIDES
+unset MAKEFLAGS MFLAGS GNUMAKEFLAGS MAKEOVERRIDES MAKEFILES MAKE MAKELEVEL
 
 cd _build/cmake
 if command -v cmake3 > /dev/null 2>&1; then

@@ -64,15 +64,17 @@ class BuildBudgetTests(unittest.TestCase):
             timeout=60,
         )
 
-    def dependency(self) -> Path:
-        dep = self.root / "_checkouts/iommap"
+    def dependency(self, application: str = "iommap") -> Path:
+        dep = self.root / "_checkouts" / application
         (dep / "_build/cmake").mkdir(parents=True)
         shutil.copyfile(FIXTURE, dep / "do_iommap.sh")
         (dep / "do_iommap.sh").chmod(0o755)
+        (dep / "do_cmake.sh").write_text("#!/bin/sh\nexit 0\n")
+        (dep / "do_cmake.sh").chmod(0o755)
         (dep / "rebar.config").write_text(
             '{post_hooks, [{compile, "./do_iommap.sh $IOMMAP_BUILDOPTS"}]}.\n'
         )
-        self.app(dep, "iommap")
+        self.app(dep, application)
         return dep
 
     @staticmethod
@@ -84,15 +86,18 @@ class BuildBudgetTests(unittest.TestCase):
             + ', [{vsn, "1"}, {applications, [kernel, stdlib]}]}.\n'
         )
 
-    def project(self) -> None:
+    def project(
+        self, application: str = "iommap", configuration: Path = CONFIG
+    ) -> None:
         self.app(self.root, "budget_probe")
         expression = (
             '{ok, C} = file:consult(os:getenv("BUDGET_CONFIG")), '
             "O = proplists:get_value(overrides, C), "
             'ok = file:write_file("rebar.config", io_lib:format("~p.~n~p.~n", '
-            "[{deps, [iommap]}, {overrides, O}])), halt()."
+            '[{deps, [list_to_atom(os:getenv("BUDGET_DEP"))]}, {overrides, O}])), halt().'
         )
-        self.environment["BUDGET_CONFIG"] = str(CONFIG)
+        self.environment["BUDGET_CONFIG"] = str(configuration)
+        self.environment["BUDGET_DEP"] = application
         result = self.run_command(["erl", "-noshell", "-eval", expression], self.root)
         self.assertEqual(result.returncode, 0, result.stderr)
 
