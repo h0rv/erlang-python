@@ -63,6 +63,7 @@
 
 static ERL_NIF_TERM py_to_term_d(ErlNifEnv *env, PyObject *obj, int depth);
 static PyObject *term_to_py_d(ErlNifEnv *env, ERL_NIF_TERM term, int depth);
+static PyObject *make_loop_capsule(erlang_event_loop_t *loop);
 
 /**
  * @brief PyCapsule destructor for channel references
@@ -434,6 +435,11 @@ static ERL_NIF_TERM py_to_term_d(ErlNifEnv *env, PyObject *obj, int depth) {
     if (PyCapsule_IsValid(obj, "erlang.local_object"))
         return python_actor_to_term(env, obj);
 
+    if (PyCapsule_IsValid(obj, "erlang_python.event_loop")) {
+        void *loop = PyCapsule_GetPointer(obj, "erlang_python.event_loop");
+        return enif_make_resource(env, loop);
+    }
+
     /* Handle PyCapsule containing channel reference */
     if (PyCapsule_CheckExact(obj)) {
         void *ptr = PyCapsule_GetPointer(obj, CHANNEL_CAPSULE_NAME);
@@ -738,6 +744,15 @@ static PyObject *term_to_py_d(ErlNifEnv *env, ERL_NIF_TERM term, int depth) {
     if (enif_get_resource(env, term, PYOBJ_RESOURCE_TYPE, (void **)&wrapper)) {
         Py_INCREF(wrapper->obj);
         return wrapper->obj;
+    }
+
+    erlang_event_loop_t *loop;
+    if (enif_get_resource(env, term, EVENT_LOOP_RESOURCE_TYPE, (void **)&loop)) {
+        if (PyInterpreterState_GetID(PyInterpreterState_Get()) != loop->interp_id) {
+            PyErr_SetString(PyExc_ValueError, "Native loop belongs to another interpreter");
+            return NULL;
+        }
+        return make_loop_capsule(loop);
     }
 
     /* Check for channel resource - wrap in PyCapsule for round-trip */

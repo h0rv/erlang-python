@@ -78,7 +78,7 @@
 ]).
 
 %% Internal exports
--export([kill/1, pass_fd/2, child_info/1]).
+-export([kill/1, pass_fd/2, child_info/1, reap_dead/2]).
 
 -export([init/3, init/4, init_ref_tab/0]).
 %% Used by py_context_embedded
@@ -182,6 +182,10 @@ stop(Ctx) when is_pid(Ctx) ->
 %%
 %% Options:
 %% - `mode' - Context mode (worker | owngil | isolated), default: worker
+%% - `managed_loop' - `shared' (default) or `dedicated' for worker mode.
+%%   Dedicated binds start_loop/submit/stop_loop to a context-owned native loop
+%%   without replacing the interpreter's shared loop. Python objects still share
+%%   the main interpreter and GIL; this is not interpreter isolation.
 %% - `memory_limit' - Cap in bytes on memory allocated by this context.
 %%   Requires `mode => owngil' and the runtime started with
 %%   `enable_memory_limits'; see py_nif:context_set_memory_limit/2 for what
@@ -193,12 +197,31 @@ stop(Ctx) when is_pid(Ctx) ->
 new(Opts) when is_map(Opts) ->
     Mode = maps:get(mode, Opts, worker),
     Id = erlang:unique_integer([positive]),
-    start_link(Id, Mode, Opts).
+    case {maps:get(managed_loop, Opts, shared), Mode} of
+        {shared, _} -> start_link(Id, Mode, Opts);
+        {dedicated, worker} -> start_link(Id, Mode, Opts);
+        {dedicated, _} -> {error, {unsupported_managed_loop, Mode}};
+        {Other, _} -> {error, {invalid_managed_loop, Other}}
+    end.
 
 %% @doc Alias for stop/1 for API consistency.
 -spec destroy(context()) -> ok.
 destroy(Ctx) ->
     stop(Ctx).
+
+%% Internal owner cleanup after independent proof that Python work ended,
+%% or that an unstarted body was sealed against execution. A dead context PID
+%% alone does not authorize releasing its native state.
+reap_dead(Ctx, Ref) when is_pid(Ctx) ->
+    case is_process_alive(Ctx) of
+        true -> {error, context_alive};
+        false ->
+            ok = py_nif:context_destroy(Ref),
+            case py_nif:context_cleanup_status(Ref) of
+                clean -> ets:delete_object(?REF_TAB, {Ctx, Ref}), clean;
+                Status -> Status
+            end
+    end.
 
 %% @doc Call a Python function with empty kwargs.
 %%
@@ -595,10 +618,10 @@ start_loop(Ctx, Opts) when is_pid(Ctx), is_map(Opts) ->
 
 %% @doc Stop a loop started with start_loop/1,2.
 %%
-%% Asks the loop to stop from inside (a coroutine calling `loop.stop()'),
-%% then interrupts the thread if it has not exited after Grace ms (default
-%% 5000). Returns `ok' once the loop has exited, `{error, no_loop}' when none
-%% is running, `{error, timeout}' if it survived the interrupt too.
+%% Cancels and awaits this managed loop's tasks and resource cleanup before
+%% closing it. Returns `ok' only after a normal driver exit within Grace ms
+%% (default 5000), `{error, no_loop}' when none is running, or an error on
+%% timeout or failed cleanup. A timeout leaves live work and the loop intact.
 -spec stop_loop(context()) -> ok | {error, term()}.
 stop_loop(Ctx) ->
     stop_loop(Ctx, 5000).

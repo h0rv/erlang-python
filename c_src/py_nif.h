@@ -657,9 +657,9 @@ typedef struct {
  *
  * - Identity and lifecycle (interp_id, is_subinterp, has_thread,
  *   uses_own_gil): written once by nif_context_create before the thread
- *   starts, read-only afterwards. destroyed, leaked, thread_running,
+ *   starts, read-only afterwards. destroyed, cleanup_complete, leaked, thread_running,
  *   shutdown_requested and init_error are atomics; any thread may read
- *   them, the writers are nif_context_destroy (destroyed, leaked), the
+ *   them, the writers are nif_context_destroy (destroyed, cleanup_complete, leaked), the
  *   shutdown helpers (shutdown_requested) and the context thread
  *   (thread_running, init_error).
  *
@@ -720,6 +720,7 @@ struct py_context {
 
     /** @brief Flag indicating context has been destroyed (atomic for thread safety) */
     _Atomic bool destroyed;
+    _Atomic bool cleanup_complete;
 
     /** @brief Flag: context resources leaked due to unresponsive worker */
     _Atomic bool leaked;

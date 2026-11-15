@@ -77,10 +77,14 @@
     %% Async task queue NIFs (uvloop-inspired)
     submit_task/7,
     submit_task_with_env/8,
+    context_cleanup_status/1,
     actor_gate_new/2,
     actor_gate_info/1,
+    actor_gate_close/1,
+    actor_ticket_info/1,
     actor_ticket_commit/3,
     actor_ticket_reject/1,
+    task_ticket_reap/2,
     work_admission_configure/4,
     work_admission_info/1,
     work_admission_close/1,
@@ -196,6 +200,7 @@
     %% Channel API - bidirectional message passing
     channel_create/0,
     channel_create/1,
+    channel_create/2,
     channel_send/2,
     channel_receive/2,
     channel_try_receive/1,
@@ -499,9 +504,9 @@ thread_worker_signal_ready(_Fd) ->
 %% This is called when an async_callback message is processed.
 %% The response is written in the format:
 %%   callback_id (8 bytes) + response_len (4 bytes) + response_data
--spec async_callback_response(integer(), non_neg_integer(), binary() | {native, term()}) ->
+-spec async_callback_response(integer() | reference(), non_neg_integer(), binary() | {native, term()}) ->
     ok | {error, term()}.
-async_callback_response(_Fd, _CallbackId, _Response) ->
+async_callback_response(_Target, _CallbackId, _Response) ->
     ?NIF_STUB.
 
 %%% ============================================================================
@@ -624,10 +629,14 @@ event_loop_run_async(_LoopRef, _CallerPid, _Ref, _Module, _Func, _Args, _Kwargs)
 submit_task(_LoopRef, _CallerPid, _Ref, _Module, _Func, _Args, _Kwargs) ->
     ?NIF_STUB.
 
+context_cleanup_status(_Ctx) -> ?NIF_STUB.
 actor_gate_new(_Count, _Bytes) -> ?NIF_STUB.
 actor_gate_info(_Gate) -> ?NIF_STUB.
+actor_gate_close(_Gate) -> ?NIF_STUB.
+actor_ticket_info(_Ticket) -> ?NIF_STUB.
 actor_ticket_commit(_Ticket, _Gate, _Bytes) -> ?NIF_STUB.
 actor_ticket_reject(_Ticket) -> ?NIF_STUB.
+task_ticket_reap(_Ticket, _Ctx) -> ?NIF_STUB.
 
 %% @doc Configure one shared native gate for this LoopRef. Never reopens.
 -spec work_admission_configure(reference(), pid(), admission_limit(), admission_limit()) ->
@@ -1635,6 +1644,10 @@ channel_create() ->
 %% @returns {ok, ChannelRef} | {error, Reason}
 -spec channel_create(non_neg_integer()) -> {ok, reference()} | {error, term()}.
 channel_create(_MaxSize) ->
+    ?NIF_STUB.
+
+-spec channel_create(non_neg_integer(), non_neg_integer()) -> {ok, reference()} | {error, term()}.
+channel_create(_MaxSize, _MaxMessages) ->
     ?NIF_STUB.
 
 %% @doc Send a message to a channel.

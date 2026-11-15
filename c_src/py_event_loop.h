@@ -54,6 +54,9 @@ typedef struct _is PyInterpreterState;
 /** @brief Maximum pending events capacity (hard safety cap) */
 #define MAX_PENDING_CAPACITY 16384
 
+/* Idle channel waiters must leave capacity for ordinary I/O and timer events. */
+#define MAX_RESERVED_PENDING (MAX_PENDING_CAPACITY / 2)
+
 /** @brief Legacy alias for initial capacity */
 #define MAX_PENDING_EVENTS INITIAL_PENDING_CAPACITY
 
@@ -293,8 +296,10 @@ typedef struct {
  *   GIL first, then namespaces_mutex; the Python dicts in a namespace are
  *   touched only under the GIL.
  *
- * - py_loop, cached_* and callable_cache are Python objects owned by the
- *   loop thread and used only under its GIL. msg_env is allocated with the
+ * - py_loop is a strong, exclusive owner identity, not a replaceable callback
+ *   pointer. Claim and exact-owner release hold the interpreter GIL and mutex;
+ *   decrefs run after mutex release. cached_* and callable_cache are Python
+ *   objects used only under the interpreter GIL. msg_env is allocated with the
  *   loop and freed in the destructor; the notification paths do not use
  *   it (each builds a local env per message so they need no lock).
  *
@@ -347,6 +352,9 @@ typedef struct erlang_event_loop {
 
     /** @brief Current pending capacity (starts at INITIAL_PENDING_CAPACITY) */
     size_t pending_capacity;
+
+    /* Slots reserved by native readiness waiters, guarded by mutex. */
+    size_t reserved_pending;
 
     /** @brief Flag indicating shutdown requested */
     volatile bool shutdown;
@@ -415,6 +423,17 @@ typedef struct erlang_event_loop {
 
     /** @brief Python ErlangEventLoop instance (direct ref, no thread-local) */
     PyObject *py_loop;
+
+    /* Exact-owner claim generation, guarded by mutex. Native callback replies
+     * retain this number, not a Python owner reference. */
+    uint64_t py_owner_generation;
+
+    /* Driver execution is distinct from the retained wrapper claim. The
+     * session covers startup publication through finalization and rollback. */
+    PyObject *py_driver_session;
+    _Atomic bool py_driver_claimed;
+    unsigned long py_driver_thread;
+    uint64_t py_driver_generation;
 
     /** @brief Whether py_loop has been set */
     bool py_loop_valid;
@@ -848,6 +867,10 @@ ERL_NIF_TERM nif_loop_import_list(ErlNifEnv *env, int argc,
  */
 bool event_loop_add_pending(erlang_event_loop_t *loop, event_type_t type,
                             uint64_t callback_id, int fd);
+pending_event_t *event_loop_reserve_pending(erlang_event_loop_t *loop, bool *overloaded);
+void event_loop_cancel_reserved(erlang_event_loop_t *loop, pending_event_t *event);
+void event_loop_dispatch_reserved(erlang_event_loop_t *loop, pending_event_t *event,
+                                  uint64_t callback_id);
 
 /**
  * @brief Clear all pending events

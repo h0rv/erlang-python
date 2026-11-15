@@ -66,7 +66,8 @@
 -record(state, {
     handlers      = #{} :: #{non_neg_integer() => {pid(), integer()}},
     async_writers = #{} :: #{integer() => {pid(), atomics:atomics_ref()}},
-    writer_fds    = #{} :: #{pid() => integer()}
+    writer_fds    = #{} :: #{pid() => integer()},
+    native_inflight :: atomics:atomics_ref()
 }).
 
 %% Bound on admitted async callbacks: executing callbacks plus queued
@@ -96,7 +97,7 @@ init([]) ->
     %% Register ourselves as the thread worker coordinator
     case py_nif:thread_worker_set_coordinator(self()) of
         ok ->
-            {ok, #state{}};
+            {ok, #state{native_inflight = atomics:new(1, [{signed, false}])}};
         {error, Reason} ->
             {stop, Reason}
     end.
@@ -145,6 +146,28 @@ handle_info({thread_callback, WorkerId, CallbackId, FuncName, Args},
 %% from concurrent writers (issue #63), every response is funnelled
 %% through a single writer process per WriteFd: callback execution
 %% stays parallel, only the pipe write is serialised.
+handle_info({async_callback, CallbackId, FuncName, Args, Reply},
+            #state{native_inflight = Counter} = State) when is_reference(Reply) ->
+    %% Native loop replies have a reserved queue entry and one immutable
+    %% owner registration. They need neither a pipe nor a serial FD writer.
+    %% Keep the existing admission bound across all native loop owners.
+    case atomics:add_get(Counter, 1, 1) of
+        N when N > ?ASYNC_WRITER_MAX_QUEUE ->
+            atomics:sub(Counter, 1, 1),
+            reject_async_actor(FuncName, Args),
+            py_nif:async_callback_response(Reply, CallbackId,
+                                           <<1, "async callback queue full">>);
+        _ ->
+            spawn(fun() ->
+                try
+                    Response = run_async_callback(FuncName, Args),
+                    py_nif:async_callback_response(Reply, CallbackId, Response)
+                after
+                    atomics:sub(Counter, 1, 1)
+                end
+            end)
+    end,
+    {noreply, State};
 handle_info({async_callback, CallbackId, FuncName, Args, WriteFd}, State0) ->
     {Writer, Counter, State1} = ensure_async_writer(WriteFd, State0),
     %% Reserve a slot in the in-flight counter. atomics:add_get is
@@ -161,11 +184,7 @@ handle_info({async_callback, CallbackId, FuncName, Args, WriteFd}, State0) ->
             atomics:sub(Counter, 1, 1),
             %% No dispatch was started: the pre-enqueue actor reservation
             %% can be rejected here, never by caller cancellation.
-            case {FuncName, Args} of
-                {<<"_actor_data_call">>, {_, _, Ticket, _}} ->
-                    py_nif:actor_ticket_reject(Ticket);
-                _ -> ok
-            end,
+            reject_async_actor(FuncName, Args),
             Writer ! {overflow, CallbackId};
         _ ->
             spawn(fun() ->
@@ -206,6 +225,12 @@ terminate(_Reason, _State) ->
 %%% ============================================================================
 %%% Handler Process
 %%% ============================================================================
+
+reject_async_actor(<<"_actor_data_call">>, {_, _, Ticket, _}) ->
+    py_nif:actor_ticket_reject(Ticket);
+reject_async_actor(<<"_task_start">>, {_, _, Ticket, _, _}) ->
+    py_nif:actor_ticket_reject(Ticket);
+reject_async_actor(_, _) -> ok.
 
 %% Simple receive loop for handling callbacks from a specific Python thread.
 %% Each handler is dedicated to one Python thread and has its own response pipe.
@@ -266,7 +291,8 @@ handle_thread_callback(WriteFd, CallbackId, FuncName, Args) ->
 %% Used by async_writer_loop (and indirectly by handle_thread_callback
 %% via the same encoding shape — the sync path keeps its own copy
 %% close to the write call site).
-run_async_callback(<<"_actor_", _/binary>> = FuncName, Args) ->
+run_async_callback(<<Prefix:6/binary, _/binary>> = FuncName, Args)
+  when Prefix =:= <<"_actor">>; Prefix =:= <<"_task_">> ->
     ArgsList = case Args of
         T when is_tuple(T) -> tuple_to_list(T);
         L when is_list(L) -> L
