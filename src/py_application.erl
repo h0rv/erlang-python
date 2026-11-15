@@ -10,18 +10,18 @@ callback([Paths, Applications, ERTS]) when is_binary(ERTS), is_list(Paths), is_l
     compatible(erts, ERTS, list_to_binary(erlang:system_info(version))),
     Directories = [directory(Path) || Path <- Paths],
     Specs = [spec(Application, Directories) || Application <- Applications],
-    ok = code:add_paths(Directories),
-    lists:foreach(fun({Name, Version, Spec}) ->
+    lists:foreach(fun preflight/1, Specs),
+    ok = code:add_pathsa(Directories),
+    lists:foreach(fun({_, _, Spec, _}) ->
         case application:load(Spec) of
             ok -> ok;
             {error, {already_loaded, _}} -> ok
-        end,
-        {ok, Loaded} = application:get_key(Name, vsn),
-        compatible(Name, list_to_binary(Version), list_to_binary(Loaded))
+        end
     end, Specs),
-    lists:foreach(fun({Name, _, _}) ->
+    lists:foreach(fun({Name, _, _, _}) ->
         {ok, _} = application:ensure_all_started(Name)
     end, Specs),
+    lists:foreach(fun preflight/1, Specs),
     <<"ok">>.
 
 directory(Path) when is_binary(Path) ->
@@ -43,7 +43,48 @@ spec({Name, Expected}, Directories) when is_binary(Name), is_binary(Expected) ->
     Name = atom_to_binary(Atom),
     Version = proplists:get_value(vsn, Properties),
     compatible(Atom, Expected, unicode:characters_to_binary(Version)),
-    {Atom, Version, Spec}.
+    Modules = proplists:get_value(modules, Properties),
+    true = is_list(Modules) andalso length(Modules) > 0 andalso length(Modules) =< 1024,
+    true = length(Modules) =:= length(lists:usort(Modules)),
+    ExpectedFiles = lists:sort([atom_to_list(Module) ++ ".beam" || Module <- Modules]),
+    Directory = filename:dirname(File),
+    ActualFiles = lists:sort([filename:basename(Path) || Path <-
+                             filelib:wildcard(filename:join(Directory, "*.beam"))]),
+    case ActualFiles =:= ExpectedFiles of
+        true -> ok;
+        false -> error({invalid_application_modules, Atom})
+    end,
+    Identities = [identity(Module, Directory) || Module <- Modules],
+    {Atom, Version, Spec, Identities}.
+
+identity(Module, Directory) when is_atom(Module) ->
+    File = filename:join(Directory, atom_to_list(Module) ++ ".beam"),
+    {ok, Binary} = file:read_file(File),
+    {ok, {Module, MD5}} = beam_lib:md5(Binary),
+    {Module, MD5}.
+
+preflight({Name, Version, _, Modules}) ->
+    case application:get_key(Name, vsn) of
+        undefined -> ok;
+        {ok, Loaded} -> compatible(Name, list_to_binary(Version), list_to_binary(Loaded))
+    end,
+    lists:foreach(fun({Module, Expected}) ->
+        case code:is_loaded(Module) of
+            false -> ok;
+            {file, _} ->
+                case erlang:check_old_code(Module) of
+                    false -> ok;
+                    true -> error({incompatible_module, Module, unknown_old_code})
+                end,
+                Actual = try Module:module_info(md5) catch _:_ -> unknown end,
+                case Actual of
+                    Expected -> ok;
+                    Digest when is_binary(Digest), byte_size(Digest) =:= 16 ->
+                        error({incompatible_module, Module, Expected, Digest});
+                    _ -> error({incompatible_module, Module, unknown_identity})
+                end
+        end
+    end, Modules).
 
 compatible(_Application, Version, Version) -> ok;
 compatible(Application, Expected, Actual) ->
