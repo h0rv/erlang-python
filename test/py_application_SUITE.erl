@@ -2,11 +2,11 @@
 -export([all/0, standard_application/1, wrong_version/1, wrong_erts/1,
          relative_path/1, invalid_name/1, missing_application/1,
          stale_loaded_module/1, matching_loaded_module/1, lazy_module/1, extra_module/1,
-         unknown_old_code/1]).
+         unknown_old_code/1, old_only_module/1]).
 
 all() -> [standard_application, wrong_version, wrong_erts, relative_path, invalid_name,
           missing_application, stale_loaded_module, matching_loaded_module, lazy_module,
-          extra_module, unknown_old_code].
+          extra_module, unknown_old_code, old_only_module].
 
 arguments() ->
     {ok, Version} = application:get_key(stdlib, vsn),
@@ -80,6 +80,23 @@ unknown_old_code(_) -> fixture(fun(Directory, Expected) ->
     true = erlang:check_old_code(Module),
     Digest = Module:module_info(md5),
     expected = Module:marker(),
+    ok
+end).
+
+old_only_module(_) -> fixture(fun(Directory, _) ->
+    Module = py_application_fixture,
+    {module, Module} = code:load_binary(Module, "old-only-code.beam", binary(old)),
+    true = code:delete(Module),
+    false = code:is_loaded(Module),
+    true = erlang:check_old_code(Module),
+    Before = code:get_path(),
+    try py_application:callback(fixture_arguments(Directory)), error(unexpected_success)
+    catch error:{incompatible_module, Module, unknown_old_code} -> ok end,
+    false = code:is_loaded(Module),
+    true = erlang:check_old_code(Module),
+    Before = code:get_path(),
+    undefined = application:get_key(py_application_fixture_app, vsn),
+    false = lists:keymember(py_application_fixture_app, 1, application:which_applications()),
     ok
 end).
 

@@ -69,13 +69,13 @@ preflight({Name, Version, _, Modules}) ->
         {ok, Loaded} -> compatible(Name, list_to_binary(Version), list_to_binary(Loaded))
     end,
     lists:foreach(fun({Module, Expected}) ->
+        case erlang:check_old_code(Module) of
+            false -> ok;
+            true -> error({incompatible_module, Module, unknown_old_code})
+        end,
         case code:is_loaded(Module) of
             false -> ok;
             {file, _} ->
-                case erlang:check_old_code(Module) of
-                    false -> ok;
-                    true -> error({incompatible_module, Module, unknown_old_code})
-                end,
                 Actual = try Module:module_info(md5) catch _:_ -> unknown end,
                 case Actual of
                     Expected -> ok;
