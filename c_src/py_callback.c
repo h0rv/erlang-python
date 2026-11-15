@@ -2604,12 +2604,18 @@ static PyObject *register_async_future(PyObject *self, PyObject *args) {
     pthread_mutex_lock(&state->async_futures_mutex);
 
     PyObject *key = PyLong_FromUnsignedLongLong(callback_id);
-    Py_INCREF(future);
-    PyDict_SetItem(state->async_pending_futures, key, future);
+    if (key == NULL) {
+        pthread_mutex_unlock(&state->async_futures_mutex);
+        return NULL;
+    }
+    int result = PyDict_SetItem(state->async_pending_futures, key, future);
     Py_DECREF(key);
 
     pthread_mutex_unlock(&state->async_futures_mutex);
 
+    if (result < 0) {
+        return NULL;
+    }
     Py_RETURN_NONE;
 }
 

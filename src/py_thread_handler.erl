@@ -69,12 +69,10 @@
     writer_fds    = #{} :: #{pid() => integer()}
 }).
 
-%% Bound on combined async in-flight + writer-mailbox depth. The
-%% atomics counter covers BOTH executors that have spawned but not
-%% yet enqueued AND messages already sitting in the writer's mailbox,
-%% so the bound holds even when many parallel callbacks complete
-%% before the writer drains. Submissions beyond this point are failed
-%% inline with an "async callback queue full" error frame.
+%% Bound on admitted async callbacks: executing callbacks plus queued
+%% responses. Overflow error messages are not covered by this counter.
+%% Rejected submissions receive an "async callback queue full" error
+%% frame through the same serial writer.
 -define(ASYNC_WRITER_MAX_QUEUE, 10000).
 
 %%% ============================================================================
@@ -158,11 +156,10 @@ handle_info({async_callback, CallbackId, FuncName, Args, WriteFd}, State0) ->
             %% this callback with a queue-full error frame. The
             %% writer still serialises the error frame on the pipe
             %% (so the Future resolves with a clear RuntimeError
-            %% rather than hanging), and we use the same atomics ref
-            %% so the queued overflow message stays accounted for
-            %% until the writer drains it.
+            %% rather than hanging). Overflow replies are not reserved
+            %% slots and do not decrement the counter in the writer.
             atomics:sub(Counter, 1, 1),
-            Writer ! {overflow, CallbackId, Counter};
+            Writer ! {overflow, CallbackId};
         _ ->
             spawn(fun() ->
                 Response = run_async_callback(FuncName, Args),
