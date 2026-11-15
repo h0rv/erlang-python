@@ -5,8 +5,6 @@ from collections.abc import Callable, Coroutine
 from importlib import import_module
 from typing import Literal
 
-from _erlang_impl._loop import ErlangEventLoop
-
 type ServiceState = Literal["running", "completed", "cancelled", "failed"]
 
 
@@ -111,6 +109,8 @@ class ServiceSlot:
         Lambdas, closures, bound methods, and callable objects are unsupported.
         This local API passes Python arguments directly, without serialization.
         """
+        from _erlang_impl._loop import ErlangEventLoop
+
         loop = asyncio.get_running_loop()
         if not isinstance(loop, ErlangEventLoop):
             raise RuntimeError("services require a running ErlangEventLoop")
