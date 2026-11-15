@@ -9,6 +9,7 @@ start() ->
         application:set_env(erlang_python, num_contexts, 1),
         application:set_env(erlang_python, event_loop_pool_size, 1),
         {ok, _} = application:ensure_all_started(erlang_python),
+        ok = py_distribution:start(),
         Services = start_services(),
         Ctx = py:context(1),
         ok = py_context:exec(Ctx,
