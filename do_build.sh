@@ -13,7 +13,7 @@ case "$@" in
         ${CMAKE} --build . -- "$@" || exit 1
         ;;
     *)
-        CORES=$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null)
+        CORES=${CMAKE_BUILD_PARALLEL_LEVEL:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null)}
 
         if [ "x$CORES" = "x" ]; then
             PAR=""

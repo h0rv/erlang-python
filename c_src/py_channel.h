@@ -21,7 +21,7 @@
  *
  * This module provides a Channel abstraction for efficient bidirectional
  * communication between Erlang processes and Python code. Channels use
- * enif_ioq for zero-copy message buffering and integrate with the existing
+ * framed enif_ioq message buffering and integrate with the existing
  * suspension/resume mechanism for non-blocking receives.
  *
  * @par Architecture
@@ -66,18 +66,31 @@ extern ErlNifResourceType *CHANNEL_RESOURCE_TYPE;
  * @struct py_channel_t
  * @brief Channel resource for bidirectional message passing
  *
- * Channels provide a message queue backed by enif_ioq for efficient
- * buffering. When Python tries to receive from an empty queue, execution
- * suspends and resumes when Erlang sends a message.
+ * Channels use framed enif_ioq buffering. When Python receives from an empty
+ * queue, execution suspends and resumes when Erlang sends a message.
  */
+typedef struct channel_ready_waiter {
+    struct channel_ready_waiter *next;
+    struct erlang_event_loop *loop;
+    uint64_t callback_id;
+    bool writing;
+    size_t requested_size;
+    struct pending_event *reserved_event;
+} channel_ready_waiter_t;
+
 typedef struct {
-    /** @brief Message queue (enif_ioq for zero-copy buffering) */
+    bool mutex_initialized;
+    bool condition_initialized;
+    size_t max_messages;
+    size_t message_count;
+    channel_ready_waiter_t *ready_waiters;
+    /** @brief Message queue (length-prefixed payloads in enif_ioq) */
     ErlNifIOQueue *queue;
 
     /** @brief Maximum queue size in bytes for backpressure */
     size_t max_size;
 
-    /** @brief Current total size of queued data */
+    /** @brief Queued payload bytes, excluding native framing and allocation overhead */
     size_t current_size;
 
     /** @brief Owner process PID */
@@ -106,6 +119,7 @@ typedef struct {
 
     /** @brief Flag: channel is closed */
     bool closed;
+    bool aborted;
 
     /** @brief Unique channel ID for debugging */
     uint64_t channel_id;
@@ -149,11 +163,10 @@ py_channel_t *channel_alloc(size_t max_size);
 int channel_send(py_channel_t *channel, const unsigned char *data, size_t size);
 
 /**
- * @brief Send an owned binary to a channel (zero-copy fast path)
+ * @brief Send an owned binary to a channel
  *
- * Takes ownership of the binary and directly enqueues it to the IOQueue
- * without an additional copy. The binary is either consumed by the queue
- * or released on error.
+ * Copies the payload into a length-prefixed IOQueue binary and releases the
+ * supplied binary on every return path. This does not serialize the payload.
  *
  * @param channel Channel to send to
  * @param bin Binary to send (ownership transferred, do not release after call)
@@ -167,9 +180,14 @@ int channel_send_owned_binary(py_channel_t *channel, ErlNifBinary *bin);
  * @param channel Channel to receive from
  * @param out_data Output: message data (caller must free with enif_free)
  * @param out_size Output: message size
- * @return 0 on success, 1 if empty, -1 if closed
+ * @return 0 on success, 1 if empty, -1 if closed, -2 on allocation failure
  */
 int channel_try_receive(py_channel_t *channel, unsigned char **out_data, size_t *out_size);
+int channel_pop_locked(py_channel_t *channel, unsigned char **out_data, size_t *out_size);
+int channel_wait_ready(py_channel_t *channel, struct erlang_event_loop *loop,
+                       uint64_t callback_id, bool writing, size_t requested_size);
+void channel_cancel_ready(py_channel_t *channel, uint64_t callback_id);
+void channel_abort(py_channel_t *channel);
 
 /**
  * @brief Receive a message from a channel (blocking with timeout)
@@ -181,7 +199,7 @@ int channel_try_receive(py_channel_t *channel, unsigned char **out_data, size_t 
  * @param out_data Output: message data (caller must free with enif_free)
  * @param out_size Output: message size
  * @param timeout_ms Timeout in milliseconds (-1 for infinite, 0 for non-blocking)
- * @return 0 on success, 1 if timeout, -1 if closed
+ * @return 0 on success, 1 if timeout, -1 if closed, -2 on allocation failure
  */
 int channel_receive_blocking(py_channel_t *channel, unsigned char **out_data,
                              size_t *out_size, long timeout_ms);

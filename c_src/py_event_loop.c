@@ -4678,40 +4678,51 @@ static inline void pending_hash_clear(erlang_event_loop_t *loop) {
     }
 }
 
-bool event_loop_add_pending(erlang_event_loop_t *loop, event_type_t type,
-                            uint64_t callback_id, int fd) {
-    int current_count = atomic_load(&loop->pending_count);
-
-    /* Backpressure: check if we need to grow capacity */
-    if ((size_t)current_count >= loop->pending_capacity) {
-        /* Try to grow capacity (up to MAX_PENDING_CAPACITY) */
-        if (loop->pending_capacity < MAX_PENDING_CAPACITY) {
-            size_t new_capacity = loop->pending_capacity * 2;
-            if (new_capacity > MAX_PENDING_CAPACITY) {
-                new_capacity = MAX_PENDING_CAPACITY;
-            }
-            loop->pending_capacity = new_capacity;
-            /* Note: Linked list doesn't need realloc, just the capacity limit */
-        } else {
-            /* At hard cap - warn and reject */
-            fprintf(stderr, "event_loop_add_pending: queue at maximum capacity (%zu), rejecting event\n",
-                    (size_t)MAX_PENDING_CAPACITY);
-            return false;
-        }
-    }
-
+pending_event_t *event_loop_reserve_pending(erlang_event_loop_t *loop, bool *overloaded) {
     pthread_mutex_lock(&loop->mutex);
+    pending_event_t *event = NULL;
+    *overloaded = loop->reserved_pending >= MAX_RESERVED_PENDING ||
+        (size_t)atomic_load(&loop->pending_count) + loop->reserved_pending >= MAX_PENDING_CAPACITY;
+    if (!*overloaded) {
+        event = get_pending_event(loop);
+        if (event != NULL) loop->reserved_pending++;
+    }
+    pthread_mutex_unlock(&loop->mutex);
+    return event;
+}
+
+void event_loop_cancel_reserved(erlang_event_loop_t *loop, pending_event_t *event) {
+    pthread_mutex_lock(&loop->mutex);
+    loop->reserved_pending--;
+    return_pending_event(loop, event);
+    pthread_mutex_unlock(&loop->mutex);
+}
+
+static bool add_pending_impl(erlang_event_loop_t *loop, event_type_t type,
+                            uint64_t callback_id, int fd, pending_event_t *reserved) {
+    pthread_mutex_lock(&loop->mutex);
+    size_t current_count = atomic_load(&loop->pending_count);
+    if (reserved == NULL && current_count + loop->reserved_pending >= MAX_PENDING_CAPACITY) {
+        pthread_mutex_unlock(&loop->mutex);
+        return false;
+    }
+    if (current_count >= loop->pending_capacity && loop->pending_capacity < MAX_PENDING_CAPACITY) {
+        loop->pending_capacity *= 2;
+        if (loop->pending_capacity > MAX_PENDING_CAPACITY) loop->pending_capacity = MAX_PENDING_CAPACITY;
+    }
+    if (reserved != NULL) loop->reserved_pending--;
 
     /* O(1) duplicate check using hash set */
     if (pending_hash_contains(loop, callback_id, type)) {
         /* Already have this event pending - this counts as success since
          * the event will be delivered */
+        if (reserved != NULL) return_pending_event(loop, reserved);
         pthread_mutex_unlock(&loop->mutex);
         return true;
     }
 
     /* Get event from freelist or allocate new (Phase 7 optimization) */
-    pending_event_t *event = get_pending_event(loop);
+    pending_event_t *event = reserved != NULL ? reserved : get_pending_event(loop);
     if (event == NULL) {
         pthread_mutex_unlock(&loop->mutex);
         return false;  /* Allocation failed */
@@ -4764,6 +4775,17 @@ bool event_loop_add_pending(erlang_event_loop_t *loop, event_type_t type,
     }
 
     return true;
+}
+
+bool event_loop_add_pending(erlang_event_loop_t *loop, event_type_t type,
+                            uint64_t callback_id, int fd) {
+    return add_pending_impl(loop, type, callback_id, fd, NULL);
+}
+
+void event_loop_dispatch_reserved(erlang_event_loop_t *loop, pending_event_t *event,
+                                  uint64_t callback_id) {
+    /* Registration already allocated and admitted this event. */
+    add_pending_impl(loop, EVENT_TYPE_TIMER, callback_id, -1, event);
 }
 
 void event_loop_clear_pending(erlang_event_loop_t *loop) {
