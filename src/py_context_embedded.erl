@@ -44,6 +44,7 @@
     interp_id :: non_neg_integer(),
     event_state = #{} :: map(),  %% #{loop_ref => ref(), worker_pid => pid()}
     callback_handler :: pid() | undefined,  %% For thread-model callback handling
+    context_owner_mon :: reference() | undefined,
     %% Worker loop (start_loop/1): request id of the run_forever exec, the
     %% owner that gets {py_loop_exit, Ctx, Result}, its monitor, and the
     %% callers waiting in stop_loop/2
@@ -123,7 +124,11 @@ init_started(Parent, Id, Ref, InterpId, Opts) ->
         id = Id,
         interp_id = InterpId,
         event_state = EventState,
-        callback_handler = CallbackHandler
+        callback_handler = CallbackHandler,
+        context_owner_mon = case maps:get(context_owner, Opts, undefined) of
+            undefined -> undefined;
+            Owner when is_pid(Owner) -> erlang:monitor(process, Owner)
+        end
     },
     loop(State).
 
@@ -220,6 +225,16 @@ create_context(owngil) ->
 %% Main context loop. Handles requests and uses suspension-based callback support.
 loop(#state{ref = Ref, interp_id = InterpId, loop_req = LoopReq} = State) ->
     receive
+        %% Owner death is deliberately received only here, after any in-flight
+        %% request and its nested callbacks have completed. Destroying earlier
+        %% could release native objects still in use by the Python thread.
+        {'DOWN', Mon, process, _Owner, Reason}
+                when Mon =:= State#state.context_owner_mon ->
+            terminate(Reason, case LoopReq of
+                undefined -> State;
+                _ -> stop_running_loop(State)
+            end);
+
         %% ---- worker loop management (start_loop/stop_loop/loop_ref) ----
         {start_loop, From, MRef, _Owner} when LoopReq =/= undefined ->
             From ! {MRef, {error, already_running}},
@@ -335,12 +350,7 @@ loop(#state{ref = Ref, interp_id = InterpId, loop_req = LoopReq} = State) ->
             loop(State);
 
         {local_object, From, MRef, Request, Env} ->
-            Req = make_ref(),
-            Result = case py_nif:local_object_async(Ref, self(), Req, Request, Env) of
-                {enqueued, Req} -> wait_for_async_result(Ref, Req, Env, infinity);
-                Error -> Error
-            end,
-            From ! {MRef, Result},
+            dispatch_retained_request(Ref, From, MRef, Request, Env),
             loop(State);
 
         {call_method, From, MRef, ObjRef, Method, Args} ->
@@ -407,6 +417,15 @@ loop(#state{ref = Ref, interp_id = InterpId, loop_req = LoopReq} = State) ->
                     end
             end
     end.
+
+%% One retained-object dispatch path for ordinary and reentrant requests.
+dispatch_retained_request(Ref, From, MRef, Request, Env) ->
+    Req = make_ref(),
+    Result = case py_nif:local_object_async(Ref, self(), Req, Request, Env) of
+        {enqueued, Req} -> wait_for_async_result(Ref, Req, Env, infinity);
+        Error -> Error
+    end,
+    From ! {MRef, Result}.
 
 %% ============================================================================
 %% Worker loop helpers
@@ -810,6 +829,10 @@ wait_for_callback(Ref, CallbackPid) ->
     receive
         {callback_result, CallbackPid, Result} ->
             Result;
+
+        {local_object, From, MRef, Request, Env} ->
+            dispatch_retained_request(Ref, From, MRef, Request, Env),
+            wait_for_callback(Ref, CallbackPid);
 
         %% Handle nested py:call while waiting for callback
         {call, From, MRef, Module, Func, Args, Kwargs} ->

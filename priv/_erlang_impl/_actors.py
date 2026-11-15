@@ -1,8 +1,20 @@
 import asyncio
+import inspect
 from collections.abc import Awaitable, Callable
+from types import FunctionType
 from typing import Literal
 
 import erlang
+
+
+def _validate_method(state: object, method: object) -> None:
+    if type(method) is not FunctionType or not inspect.iscoroutinefunction(method):
+        raise ValueError("Not an async actor member")
+    members: dict[str, object] = {}
+    for base in reversed(type(state).__mro__):
+        members.update(vars(base))
+    if not any(member is method for member in members.values()):
+        raise ValueError("Not an async actor member")
 
 
 async def _outcome(awaitable: Awaitable[object]) -> tuple[bool, object]:

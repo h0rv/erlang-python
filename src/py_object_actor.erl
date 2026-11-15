@@ -38,7 +38,7 @@ call(Pid, Method, Args, Kwargs, Timeout) ->
 stop(Pid) -> gen_server:stop(Pid).
 
 init({owned, Factory, Methods}) ->
-    {ok, Ctx} = py_context:new(#{mode => worker}),
+    {ok, Ctx} = py_context:new(#{mode => worker, context_owner => self()}),
     case init({Ctx, Factory, Methods}) of
         {ok, State} -> {ok, State#{owned => true}};
         Error -> py_context:destroy(Ctx), Error
@@ -60,14 +60,13 @@ init({Ctx, Factory, Methods}) ->
 
 register_methods(_Ctx, _Env, _Object, []) -> ok;
 register_methods(Ctx, Env, Object, [Method | Rest]) ->
-    Code = <<"(lambda state, method: None if ("
-             "type(method) is __import__('types').FunctionType and "
-             "__import__('inspect').iscoroutinefunction(method) and "
-             "any(value is method for value in "
-             "{name: value for base in reversed(type(state).__mro__) "
-             "for name, value in vars(base).items()}.values())) "
-             "else (_ for _ in ()).throw(ValueError('Not an async actor member')))(state, method)">>,
-    case py_context:eval_ref(Ctx, Code, #{<<"state">> => Object, <<"method">> => Method}, Env) of
+    {ok, Validate} = py_context:eval_ref(Ctx,
+        <<"__import__('_erlang_impl._actors', fromlist=['_validate_method'])._validate_method">>,
+        #{}, Env),
+    {ok, Args} = py_context:eval_ref(Ctx, <<"(state, method)">>,
+        #{<<"state">> => Object, <<"method">> => Method}, Env),
+    {ok, Kwargs} = py_context:eval_ref(Ctx, <<"{}">>, #{}, Env),
+    case py_context:apply_ref(Ctx, Validate, Args, Kwargs, Env) of
         {ok, _} -> register_methods(Ctx, Env, Object, Rest);
         Error -> Error
     end.
