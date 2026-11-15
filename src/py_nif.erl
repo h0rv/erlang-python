@@ -145,6 +145,7 @@
     context_exec/3,
     %% Async dispatch (non-blocking)
     context_call_async/7,
+    local_object_async/5,
     context_eval_async/5,
     context_exec_async/4,
     context_call_with_env_async/8,
@@ -1178,6 +1179,12 @@ context_eval_with_env_async(_CtxRef, _CallerPid, _RequestId,
     {enqueued, term()} | {error, term()}.
 context_exec_with_env_async(_CtxRef, _CallerPid, _RequestId,
                              _Code, _EnvRef) ->
+    ?NIF_STUB.
+
+%% @private Dispatch retained local object work to the existing context queue.
+-spec local_object_async(reference(), pid(), reference(), tuple(), reference()) ->
+    {enqueued, reference()} | {error, term()}.
+local_object_async(_Ctx, _Caller, _Ref, _Request, _Env) ->
     ?NIF_STUB.
 
 %% @doc Call a method on a Python object in a context.

@@ -283,6 +283,8 @@ loop(#state{ref = Ref, interp_id = InterpId, loop_req = LoopReq} = State) ->
             From ! {MRef, {error, loop_running}}, loop(State);
         {exec, From, MRef, _, _} when LoopReq =/= undefined ->
             From ! {MRef, {error, loop_running}}, loop(State);
+        {local_object, From, MRef, _, _} when LoopReq =/= undefined ->
+            From ! {MRef, {error, loop_running}}, loop(State);
         {call_method, From, MRef, _, _, _} when LoopReq =/= undefined ->
             From ! {MRef, {error, loop_running}}, loop(State);
 
@@ -329,6 +331,15 @@ loop(#state{ref = Ref, interp_id = InterpId, loop_req = LoopReq} = State) ->
         %% Async dispatch with sync fallback (mirrors call/eval).
         {exec, From, MRef, Code, EnvRef} ->
             Result = handle_exec_with_async_and_env(Ref, Code, EnvRef),
+            From ! {MRef, Result},
+            loop(State);
+
+        {local_object, From, MRef, Request, Env} ->
+            Req = make_ref(),
+            Result = case py_nif:local_object_async(Ref, self(), Req, Request, Env) of
+                {enqueued, Req} -> wait_for_async_result(Ref, Req, Env, infinity);
+                Error -> Error
+            end,
             From ! {MRef, Result},
             loop(State);
 
@@ -631,6 +642,9 @@ handle_exec_with_async(Ref, Code) ->
 %% wait_for_callback/2) and its result goes back with
 %% context_callback_reply/3.
 wait_for_async_result(Ref, RequestId, EnvRef) ->
+    wait_for_async_result(Ref, RequestId, EnvRef, 300000).
+
+wait_for_async_result(Ref, RequestId, EnvRef, Timeout) ->
     drain_stale_async_results(RequestId),
     receive
         {py_result, RequestId, Result} ->
@@ -638,8 +652,8 @@ wait_for_async_result(Ref, RequestId, EnvRef) ->
         {py_callback, CallbackId, FuncName, CallbackArgs} ->
             CallbackResult = handle_callback_with_nested_receive(Ref, FuncName, CallbackArgs, EnvRef),
             reply_inline_callback(Ref, CallbackId, CallbackResult),
-            wait_for_async_result(Ref, RequestId, EnvRef)
-    after 300000 ->  %% 5 minute timeout
+            wait_for_async_result(Ref, RequestId, EnvRef, Timeout)
+    after Timeout ->
         {error, async_timeout}
     end.
 
