@@ -99,6 +99,14 @@ static const char *EVENT_LOOP_CAPSULE_NAME = "erlang_python.event_loop";
  * capsule helpers below). */
 static PyObject *make_loop_capsule(erlang_event_loop_t *loop);
 
+static void close_loop_work_admission(erlang_event_loop_t *loop) {
+    if (!loop->task_queue_initialized) return;
+    pthread_mutex_lock(&loop->task_queue_mutex);
+    loop->work_admission_closed = true;
+    work_admission_close(loop->work_admission);
+    pthread_mutex_unlock(&loop->task_queue_mutex);
+}
+
 /* Timer refs are keyed in the receiving worker's map. Loops without a
  * worker of their own share the global worker, so the ids must be unique
  * across loops, not per loop. */
@@ -413,6 +421,16 @@ void event_loop_destructor(ErlNifEnv *env, void *obj) {
 #ifdef HAVE_SUBINTERPRETERS
 cleanup_native:
 #endif
+    /* No running ticket owns the loop: it owns the independent gate. Queued
+     * tickets here cannot execute and may be acknowledged stopped. */
+    work_admission_close(loop->work_admission);
+    while (loop->queued_work_tickets != NULL) {
+        work_ticket_t *ticket = loop->queued_work_tickets;
+        loop->queued_work_tickets = ticket->next;
+        work_ticket_dispose(ticket);
+    }
+    if (loop->work_admission != NULL) enif_release_resource(loop->work_admission);
+
     /* Signal shutdown */
     loop->shutdown = true;
 
@@ -925,6 +943,8 @@ static PyObject *get_function_for_task(
  * ============================================================================ */
 
 int event_loop_init(ErlNifEnv *env) {
+    if (work_admission_init(env) != 0) return -1;
+
     /* Create event loop resource type with down callback for process monitors */
     ErlNifResourceTypeInit loop_init = {
         .dtor = event_loop_destructor,
@@ -1213,7 +1233,8 @@ ERL_NIF_TERM nif_event_loop_destroy(ErlNifEnv *env, int argc,
         return make_error(env, "invalid_loop");
     }
 
-    /* Signal shutdown */
+    /* Closing does not prove Python or native execution has stopped. */
+    close_loop_work_admission(loop);
     loop->shutdown = true;
 
     /* Wake up any waiting threads */
@@ -2526,6 +2547,135 @@ static void callable_cache_clear(erlang_event_loop_t *loop) {
 /** Atom for task_ready wakeup message */
 static ERL_NIF_TERM ATOM_TASK_READY;
 
+/* One configuration per native loop identity. Reconfiguration cannot create
+ * independent budgets for aliases or reopen a closed destination. */
+static ERL_NIF_TERM nif_work_admission_configure(ErlNifEnv *env, int argc,
+                                                const ERL_NIF_TERM argv[]) {
+    (void)argc;
+    erlang_event_loop_t *loop;
+    ErlNifPid owner;
+    ErlNifUInt64 capacity, max_bytes;
+    if (!enif_get_resource(env, argv[0], EVENT_LOOP_RESOURCE_TYPE, (void **)&loop) ||
+        !enif_get_local_pid(env, argv[1], &owner) ||
+        !enif_get_uint64(env, argv[2], &capacity) || capacity == 0 ||
+        !enif_get_uint64(env, argv[3], &max_bytes) || max_bytes == 0)
+        return enif_make_badarg(env);
+    if (!loop->task_queue_initialized) return make_error(env, "task_queue_not_initialized");
+    /* Restrict the initial enforced contract to the tested conventional main
+     * interpreter path. Other execution backends must not silently bypass it. */
+#ifdef Py_GIL_DISABLED
+    return make_error(env, "unsupported_admission_mode");
+#endif
+    if (loop->interp_id != 0) return make_error(env, "unsupported_admission_mode");
+    pthread_mutex_lock(&loop->task_queue_mutex);
+    const char *error = NULL;
+    if (loop->work_admission != NULL) error = "already_configured";
+    else if (loop->work_admission_closed || loop->shutdown || !runtime_is_running()) {
+        loop->work_admission_closed = true;
+        error = "admission_closed";
+    }
+    else {
+        loop->work_admission = work_admission_new(env, &owner, capacity, max_bytes);
+        if (loop->work_admission == NULL) error = "alloc_failed";
+        else if (!enif_is_process_alive(env, &owner)) {
+            work_admission_close(loop->work_admission);
+            error = "admission_closed";
+        }
+    }
+    pthread_mutex_unlock(&loop->task_queue_mutex);
+    return error == NULL ? ATOM_OK : make_error(env, error);
+}
+
+static ERL_NIF_TERM nif_work_admission_info(ErlNifEnv *env, int argc,
+                                           const ERL_NIF_TERM argv[]) {
+    (void)argc;
+    erlang_event_loop_t *loop;
+    if (!enif_get_resource(env, argv[0], EVENT_LOOP_RESOURCE_TYPE, (void **)&loop))
+        return enif_make_badarg(env);
+    if (!loop->task_queue_initialized) return make_error(env, "task_queue_not_initialized");
+    pthread_mutex_lock(&loop->task_queue_mutex);
+    ERL_NIF_TERM result = loop->work_admission == NULL
+        ? make_error(env, "admission_not_configured") : work_admission_info(env, loop->work_admission);
+    pthread_mutex_unlock(&loop->task_queue_mutex);
+    return result;
+}
+
+static ERL_NIF_TERM nif_work_admission_close(ErlNifEnv *env, int argc,
+                                            const ERL_NIF_TERM argv[]) {
+    (void)argc;
+    erlang_event_loop_t *loop;
+    if (!enif_get_resource(env, argv[0], EVENT_LOOP_RESOURCE_TYPE, (void **)&loop))
+        return enif_make_badarg(env);
+    if (!loop->task_queue_initialized) return make_error(env, "task_queue_not_initialized");
+    pthread_mutex_lock(&loop->task_queue_mutex);
+    bool configured = loop->work_admission != NULL;
+    if (configured) {
+        loop->work_admission_closed = true;
+        work_admission_close(loop->work_admission);
+    }
+    pthread_mutex_unlock(&loop->task_queue_mutex);
+    return configured ? ATOM_OK : make_error(env, "admission_not_configured");
+}
+
+/* This NIF owns a reservation before enqueue; no Erlang continuation or live
+ * submitter is needed to complete the handoff. Cancellation cannot interrupt
+ * the native critical section between reservation and enqueue/rollback. */
+static ERL_NIF_TERM nif_submit_task_bounded(ErlNifEnv *env, int argc,
+                                          const ERL_NIF_TERM argv[]) {
+    (void)argc;
+    erlang_event_loop_t *loop;
+    ErlNifPid caller;
+    ErlNifBinary name;
+    if (!enif_get_resource(env, argv[0], EVENT_LOOP_RESOURCE_TYPE, (void **)&loop) ||
+        !enif_get_local_pid(env, argv[1], &caller) || !enif_is_ref(env, argv[2]) ||
+        !enif_inspect_binary(env, argv[3], &name) ||
+        !enif_inspect_binary(env, argv[4], &name) ||
+        !enif_is_list(env, argv[5]) || !enif_is_map(env, argv[6]))
+        return enif_make_badarg(env);
+    if (!loop->task_queue_initialized) return make_error(env, "task_queue_not_initialized");
+    pthread_mutex_lock(&loop->task_queue_mutex);
+    const char *error = NULL;
+    work_ticket_t *ticket = NULL;
+    ErlNifBinary encoded;
+    bool serialized = false;
+    if (loop->work_admission == NULL) error = "admission_not_configured";
+    else if (!runtime_is_running() ||
+             (loop->has_worker && !enif_is_process_alive(env, &loop->worker_pid))) {
+        work_admission_close(loop->work_admission);
+        error = "admission_closed";
+    }
+    else if (loop->next_work_ticket == UINT64_MAX) error = "ticket_ids_exhausted";
+    else {
+        uint64_t id = ++loop->next_work_ticket;
+        ERL_NIF_TERM fields[] = {argv[1], argv[2], argv[3], argv[4], argv[5], argv[6],
+                                enif_make_uint64(env, id)};
+        ERL_NIF_TERM request = enif_make_tuple_from_array(env, fields, 7);
+        serialized = enif_term_to_binary(env, request, &encoded);
+        if (!serialized) error = "serialization_failed";
+        else error = work_admission_reserve(env, loop->work_admission, id, encoded.size, &ticket);
+        if (error == NULL) {
+            if (enif_ioq_enq_binary(loop->task_queue, &encoded, 0) != 1) {
+                work_ticket_dispose(ticket);
+                error = "enqueue_failed";
+            } else {
+                serialized = false; /* Queue owns the binary. */
+                ticket->next = loop->queued_work_tickets;
+                loop->queued_work_tickets = ticket;
+                atomic_fetch_add(&loop->task_count, 1);
+            }
+        }
+    }
+    if (serialized) enif_release_binary(&encoded);
+    pthread_mutex_unlock(&loop->task_queue_mutex);
+    if (error != NULL) return make_error(env, error);
+    if (loop->has_worker && !atomic_exchange(&loop->task_wake_pending, true))
+        enif_send(env, &loop->worker_pid, NULL, enif_make_atom(env, "task_ready"));
+    pthread_mutex_lock(&loop->mutex);
+    pthread_cond_broadcast(&loop->event_cond);
+    pthread_mutex_unlock(&loop->mutex);
+    return ATOM_OK;
+}
+
 /**
  * submit_task(LoopRef, CallerPid, Ref, Module, Func, Args, Kwargs) -> ok | {error, Reason}
  *
@@ -2780,6 +2930,29 @@ typedef struct {
     ERL_NIF_TERM task_term;
 } dequeued_task_t;
 
+/* Scope cleanup covers EVERY failure after dequeue, including failed GIL
+ * acquisition and Python import/loop setup. No user work has started there.
+ * GCC and Clang both support cleanup; these are the supported NIF compilers. */
+typedef struct { work_ticket_t *tickets[MAX_TASK_BATCH]; } work_batch_t;
+
+static void work_batch_cleanup(work_batch_t *batch) {
+    for (int i = 0; i < MAX_TASK_BATCH; i++) work_ticket_dispose(batch->tickets[i]);
+}
+
+static work_ticket_t *take_queued_work(erlang_event_loop_t *loop, uint64_t id) {
+    work_ticket_t **entry = &loop->queued_work_tickets;
+    while (*entry != NULL) {
+        if ((*entry)->id == id) {
+            work_ticket_t *ticket = *entry;
+            *entry = ticket->next;
+            ticket->next = NULL;
+            return ticket;
+        }
+        entry = &(*entry)->next;
+    }
+    return NULL;
+}
+
 /**
  * Get a pooled ErlNifEnv or allocate a new one.
  * This amortizes allocation overhead by reusing cleared environments.
@@ -2889,6 +3062,7 @@ ERL_NIF_TERM nif_event_loop_release_python_loop(ErlNifEnv *env, int argc,
                            (void **)&loop)) {
         return make_error(env, "invalid_loop");
     }
+    close_loop_work_admission(loop);
     if (loop->py_loop == NULL) {
         return ATOM_OK;
     }
@@ -2910,6 +3084,7 @@ void event_loop_detach_interpreter(erlang_event_loop_t *loop) {
     if (loop == NULL) {
         return;
     }
+    close_loop_work_admission(loop);
     pthread_mutex_lock(&loop->mutex);
     loop->interp = NULL;
     /* Teardown is rare: poll rather than add a condvar to the loop struct. */
@@ -3010,6 +3185,7 @@ ERL_NIF_TERM nif_process_ready_tasks(ErlNifEnv *env, int argc,
      * ======================================================================== */
 
     dequeued_task_t tasks[MAX_TASK_BATCH];
+    work_batch_t work_batch __attribute__((cleanup(work_batch_cleanup))) = {0};
     int num_tasks = 0;
 
     pthread_mutex_lock(&loop->task_queue_mutex);
@@ -3039,10 +3215,28 @@ ERL_NIF_TERM nif_process_ready_tasks(ErlNifEnv *env, int argc,
                                               &task_term, ERL_NIF_BIN2TERM_SAFE);
         if (consumed == 0) {
             return_pooled_env(loop, term_env);
-            /* Dequeue and skip this malformed task */
-            enif_ioq_deq(loop->task_queue, iov[0].iov_len, NULL);
-            atomic_fetch_sub(&loop->task_count, 1);
-            continue;
+            /* No boundary is trustworthy after decoding fails. Fail closed,
+             * discard the still-queued work, and acknowledge only that work
+             * stopped. Already-dequeued/running tickets are unaffected. */
+            work_admission_close(loop->work_admission);
+            enif_ioq_deq(loop->task_queue, enif_ioq_size(loop->task_queue), NULL);
+            atomic_store(&loop->task_count, 0);
+            while (loop->queued_work_tickets != NULL) {
+                work_ticket_t *ticket = loop->queued_work_tickets;
+                loop->queued_work_tickets = ticket->next;
+                work_ticket_dispose(ticket);
+            }
+            break;
+        }
+
+        /* Atomically transfer ticket ownership from queue to this native batch.
+         * Legacy six-element tuples have no ticket and remain unchanged. */
+        int task_arity;
+        const ERL_NIF_TERM *task_fields;
+        ErlNifUInt64 ticket_id;
+        if (enif_get_tuple(term_env, task_term, &task_arity, &task_fields) &&
+            task_arity == 7 && enif_get_uint64(term_env, task_fields[6], &ticket_id)) {
+            work_batch.tickets[num_tasks] = take_queued_work(loop, ticket_id);
         }
 
         /* Store for later processing */
@@ -3279,7 +3473,12 @@ ERL_NIF_TERM nif_process_ready_tasks(ErlNifEnv *env, int argc,
         int arity;
         const ERL_NIF_TERM *tuple_elems;
         if (!enif_get_tuple(term_env, task_term, &arity, &tuple_elems) ||
-            arity != 6) {
+            (arity != 6 && arity != 7)) {
+            return_pooled_env(loop, term_env);
+            continue;
+        }
+        if (arity == 7 && work_batch.tickets[task_idx] == NULL) {
+            work_admission_close(loop->work_admission);
             return_pooled_env(loop, term_env);
             continue;
         }
@@ -3427,20 +3626,52 @@ ERL_NIF_TERM nif_process_ready_tasks(ErlNifEnv *env, int argc,
         }
 
         if (is_coro) {
-            /* Wrap with _run_and_send and schedule */
-            PyObject *wrapped_coro = PyObject_CallFunction(run_and_send, "OOO",
-                                                            coro, (PyObject *)pid_obj, py_ref);
-            Py_DECREF(coro);
+            /* Allocate the completion owner BEFORE Python can start the task.
+             * Ownership leaves work_batch only when a callback owns it. */
+            bool admitted = work_batch.tickets[task_idx] != NULL;
+            PyObject *completion = admitted
+                ? work_completion_new(&work_batch.tickets[task_idx], coro) : NULL;
+            PyObject *wrapped_coro = (!admitted || completion != NULL)
+                ? PyObject_CallFunction(run_and_send, "OOO", coro, (PyObject *)pid_obj, py_ref)
+                : NULL;
 
             if (wrapped_coro != NULL) {
-                /* Schedule on py_loop */
-                PyObject *task = PyObject_CallMethod(loop->py_loop, "create_task", "O", wrapped_coro);
-                Py_DECREF(wrapped_coro);
+                bool construction_attempted = false;
+                PyObject *task = admitted
+                    ? work_admission_create_task(loop->py_loop, wrapped_coro, &construction_attempted)
+                    : PyObject_CallMethod(loop->py_loop, "create_task", "O", wrapped_coro);
+                if (task != NULL) {
+                    if (completion != NULL) {
+                        PyObject *attached = PyObject_CallMethod(task, "add_done_callback", "O", completion);
+                        /* If attachment fails, capsule destruction closes the
+                         * gate and retains the unresolved charge. Never return
+                         * credits for a task which might already be executing. */
+                        Py_XDECREF(attached);
+                    }
+                    coros_scheduled++;
+                } else {
+                    if (admitted)
+                        send_task_failure(term_env, &caller_pid, tuple_elems[1], "task_creation_failed");
+                    if (!construction_attempted) {
+                        if (completion != NULL) work_completion_not_started(completion);
+                        PyObject *closed = PyObject_CallMethod(wrapped_coro, "close", NULL);
+                        Py_XDECREF(closed);
+                        closed = PyObject_CallMethod(coro, "close", NULL);
+                        Py_XDECREF(closed);
+                    }
+                }
                 Py_XDECREF(task);
-                coros_scheduled++;
+                Py_DECREF(wrapped_coro);
             } else {
-                PyErr_Clear();
+                if (admitted)
+                    send_task_failure(term_env, &caller_pid, tuple_elems[1], "task_wrapper_failed");
+                if (completion != NULL) work_completion_not_started(completion);
+                PyObject *closed = PyObject_CallMethod(coro, "close", NULL);
+                Py_XDECREF(closed);
             }
+            Py_XDECREF(completion);
+            Py_DECREF(coro);
+            PyErr_Clear();
         } else {
             /* Not a coroutine - send result immediately via enif_send */
             /* Use enif_send directly so we can use proper Erlang atoms */
@@ -7289,6 +7520,7 @@ static void loop_capsule_destructor(PyObject *capsule) {
     erlang_event_loop_t *loop = (erlang_event_loop_t *)PyCapsule_GetPointer(
         capsule, LOOP_CAPSULE_NAME);
     if (loop != NULL) {
+        close_loop_work_admission(loop);
         /* Signal shutdown */
         loop->shutdown = true;
 
@@ -7459,6 +7691,7 @@ static PyObject *py_loop_destroy(PyObject *self, PyObject *args) {
         return NULL;
     }
 
+    close_loop_work_admission(loop);
     /* Signal shutdown */
     loop->shutdown = true;
 
@@ -8626,6 +8859,10 @@ int init_subinterpreter_event_loop(ErlNifEnv *env) {
     {"event_loop_set_id", 2, nif_event_loop_set_id, 0}, \
     {"event_loop_wakeup", 1, nif_event_loop_wakeup, 0}, \
     {"event_loop_run_async", 7, nif_event_loop_run_async, ERL_NIF_DIRTY_JOB_IO_BOUND}, \
+    {"work_admission_configure", 4, nif_work_admission_configure, 0}, \
+    {"work_admission_info", 1, nif_work_admission_info, 0}, \
+    {"work_admission_close", 1, nif_work_admission_close, 0}, \
+    {"submit_task_bounded", 7, nif_submit_task_bounded, 0}, \
     {"submit_task", 7, nif_submit_task, 0}, \
     {"submit_task_with_env", 8, nif_submit_task_with_env, 0}, \
     {"process_ready_tasks", 1, nif_process_ready_tasks, ERL_NIF_DIRTY_JOB_CPU_BOUND}, \

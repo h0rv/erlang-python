@@ -77,6 +77,10 @@
     %% Async task queue NIFs (uvloop-inspired)
     submit_task/7,
     submit_task_with_env/8,
+    work_admission_configure/4,
+    work_admission_info/1,
+    work_admission_close/1,
+    submit_task_bounded/7,
     process_ready_tasks/1,
     event_loop_set_py_loop/2,
     %% Per-process namespace NIFs
@@ -214,6 +218,16 @@
 ]).
 
 -on_load(load_nif/0).
+
+-type admission_limit() :: 1..16#ffffffffffffffff.
+-type admission_error() :: admission_closed | admission_not_configured | already_configured |
+    unsupported_admission_mode | task_queue_not_initialized | overloaded | alloc_failed |
+    serialization_failed | enqueue_failed | ticket_ids_exhausted.
+-type admission_status() :: #{
+    capacity := admission_limit(), max_bytes := admission_limit(),
+    count := non_neg_integer(), bytes := non_neg_integer(), closed := boolean()
+}.
+-export_type([admission_limit/0, admission_error/0, admission_status/0]).
 
 -define(NIF_STUB, erlang:nif_error(nif_not_loaded)).
 
@@ -603,6 +617,29 @@ event_loop_run_async(_LoopRef, _CallerPid, _Ref, _Module, _Func, _Args, _Kwargs)
 -spec submit_task(reference(), pid(), reference(), binary(), binary(), list(), map()) ->
     ok | {error, term()}.
 submit_task(_LoopRef, _CallerPid, _Ref, _Module, _Func, _Args, _Kwargs) ->
+    ?NIF_STUB.
+
+%% @doc Configure one shared native gate for this LoopRef. Never reopens.
+-spec work_admission_configure(reference(), pid(), admission_limit(), admission_limit()) ->
+    ok | {error, admission_error()}.
+work_admission_configure(_LoopRef, _Owner, _Capacity, _MaxBytes) ->
+    ?NIF_STUB.
+
+%% @doc Counts accepted queued and running invocations, not just queue entries.
+-spec work_admission_info(reference()) -> admission_status() | {error, admission_error()}.
+work_admission_info(_LoopRef) ->
+    ?NIF_STUB.
+
+%% @doc Close admission without asserting that outstanding work has stopped.
+-spec work_admission_close(reference()) -> ok | {error, admission_error()}.
+work_admission_close(_LoopRef) ->
+    ?NIF_STUB.
+
+%% @doc Reserve encoded request bytes and count before enqueue in one native call.
+%% No reservation is returned to a submitter. Completion owns its release.
+-spec submit_task_bounded(reference(), pid(), reference(), binary(), binary(), list(), map()) ->
+    ok | {error, admission_error()}.
+submit_task_bounded(_LoopRef, _CallerPid, _Ref, _Module, _Func, _Args, _Kwargs) ->
     ?NIF_STUB.
 
 %% @doc Submit an async task with process-local env.

@@ -266,6 +266,7 @@ static PyObject *ctx_call_erlang_inline(py_context_t *ctx, const char *func_name
                                         size_t func_name_len, PyObject *call_args);
 #include "py_callback.c"
 #include "py_thread_worker.c"
+#include "py_work_admission.c"
 #include "py_event_loop.c"
 #include "py_subinterp_thread.c"
 #include "py_reactor_buffer.c"
