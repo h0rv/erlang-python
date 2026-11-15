@@ -68,6 +68,7 @@ from . import _byte_channel as byte_channel
 from . import _server as server
 from _erlang_impl import _supervision as supervision
 from . import _actors as actors
+from _erlang_impl import _tasks as tasks
 from ._channel import Channel, reply, ChannelClosed
 from ._byte_channel import ByteChannel, ByteChannelClosed
 

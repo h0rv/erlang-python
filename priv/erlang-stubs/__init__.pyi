@@ -3,6 +3,7 @@ import asyncio
 from erlang import actors as actors
 from erlang import channel as channel
 from erlang import supervision as supervision
+from erlang import tasks as tasks
 from erlang.channel import Channel as Channel
 from erlang.channel import ChannelClosed as ChannelClosed
 
