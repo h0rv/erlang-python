@@ -1,8 +1,25 @@
 -module(py_object_actor).
 -behaviour(gen_server).
 
--export([start_link/4, call/5, stop/1]).
--export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
+-export([start_link/4, call/5, stop/1, register_callbacks/0]).
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
+
+register_callbacks() ->
+    py_callback:register('_actor_spawn', fun
+        ([Factory, Methods, <<"unbounded">>]) when is_list(Methods), Methods =/= [] ->
+            gen_server:start(?MODULE, {owned, Factory, Methods}, []);
+        (_) -> {error, admission_unavailable}
+    end),
+    py_callback:register('_actor_call', fun([Pid, Method, Args, Kwargs]) ->
+        call(Pid, Method, Args, Kwargs, infinity)
+    end),
+    py_callback:register('_actor_stop', fun([Pid]) ->
+        case is_process_alive(Pid) of
+            true -> stop(Pid);
+            false -> ok
+        end
+    end),
+    ok.
 
 %% Deliberately unbounded native prototype. No default policy and no claim of
 %% bounded admission. A separate native admission implementation owns tickets.
@@ -20,6 +37,12 @@ call(Pid, Method, Args, Kwargs, Timeout) ->
 
 stop(Pid) -> gen_server:stop(Pid).
 
+init({owned, Factory, Methods}) ->
+    {ok, Ctx} = py_context:new(#{mode => worker}),
+    case init({Ctx, Factory, Methods}) of
+        {ok, State} -> {ok, State#{owned => true}};
+        Error -> py_context:destroy(Ctx), Error
+    end;
 init({Ctx, Factory, Methods}) ->
     Mon = erlang:monitor(process, Ctx),
     {ok, Env} = py_context:create_local_env(Ctx),
@@ -63,6 +86,10 @@ handle_call({invoke, Method, Args, Kwargs}, _From,
     {reply, Result, State};
 handle_call(_Request, _From, State) ->
     {reply, {error, invalid_request}, State}.
+
+terminate(_Reason, #{owned := true, ctx := Ctx}) ->
+    py_context:destroy(Ctx);
+terminate(_Reason, _State) -> ok.
 
 handle_cast(_Message, State) -> {noreply, State}.
 

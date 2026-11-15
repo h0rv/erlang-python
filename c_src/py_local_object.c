@@ -9,6 +9,63 @@ typedef struct {
 
 static ErlNifResourceType *LOCAL_OBJECT_RESOURCE_TYPE;
 
+#define LOCAL_OBJECT_CAPSULE "erlang.local_object"
+
+static void python_actor_capsule_destroy(PyObject *capsule) {
+    void *ref = PyCapsule_GetPointer(capsule, LOCAL_OBJECT_CAPSULE);
+    if (ref != NULL) enif_release_resource(ref);
+}
+
+/* Main-interpreter objects are portable across worker contexts, never across
+ * interpreters. The capsule and every queued term own independent references. */
+static PyObject *python_actor_retain(PyObject *self, PyObject *value) {
+    (void)self;
+    if (PyInterpreterState_GetID(PyInterpreterState_Get()) != 0) {
+        PyErr_SetString(PyExc_RuntimeError, "Actors require the main interpreter");
+        return NULL;
+    }
+    local_object_t *ref = enif_alloc_resource(LOCAL_OBJECT_RESOURCE_TYPE, sizeof(*ref));
+    if (ref == NULL) return PyErr_NoMemory();
+    ref->value = Py_NewRef(value);
+    ref->ctx = NULL;
+    ref->env = NULL;
+    PyObject *capsule = PyCapsule_New(ref, LOCAL_OBJECT_CAPSULE,
+                                    python_actor_capsule_destroy);
+    if (capsule == NULL) enif_release_resource(ref);
+    return capsule;
+}
+
+static PyObject *python_actor_unwrap(PyObject *self, PyObject *value) {
+    (void)self;
+    if (PyInterpreterState_GetID(PyInterpreterState_Get()) != 0) {
+        PyErr_SetString(PyExc_RuntimeError, "Actors require the main interpreter");
+        return NULL;
+    }
+    local_object_t *ref = PyCapsule_GetPointer(value, LOCAL_OBJECT_CAPSULE);
+    return ref == NULL ? NULL : Py_NewRef(ref->value);
+}
+
+static ERL_NIF_TERM python_actor_to_term(ErlNifEnv *env, PyObject *value) {
+    void *ref = PyCapsule_GetPointer(value, LOCAL_OBJECT_CAPSULE);
+    return enif_make_resource(env, ref);
+}
+
+static PyObject *python_actor_from_term(ErlNifEnv *env, ERL_NIF_TERM term) {
+    local_object_t *ref;
+    if (LOCAL_OBJECT_RESOURCE_TYPE == NULL ||
+        !enif_get_resource(env, term, LOCAL_OBJECT_RESOURCE_TYPE, (void **)&ref))
+        return NULL;
+    if (PyInterpreterState_GetID(PyInterpreterState_Get()) != 0) {
+        PyErr_SetString(PyExc_RuntimeError, "Actors require the main interpreter");
+        return NULL;
+    }
+    enif_keep_resource(ref);
+    PyObject *capsule = PyCapsule_New(ref, LOCAL_OBJECT_CAPSULE,
+                                    python_actor_capsule_destroy);
+    if (capsule == NULL) enif_release_resource(ref);
+    return capsule;
+}
+
 static void local_object_destructor(ErlNifEnv *env, void *resource) {
     (void)env;
     local_object_t *ref = resource;
@@ -49,7 +106,7 @@ static local_object_t *local_object_get(py_context_t *ctx, ERL_NIF_TERM term) {
         PyErr_SetString(PyExc_TypeError, "Expected a retained local object reference");
         return NULL;
     }
-    if (ref->ctx != ctx) {
+    if (ref->ctx != NULL && ref->ctx != ctx) {
         PyErr_SetString(PyExc_ValueError, "Local object belongs to another context");
         return NULL;
     }
@@ -116,11 +173,48 @@ static PyObject *local_object_apply(py_context_t *ctx, const ERL_NIF_TERM *parts
 
     erlang_event_loop_t *loop = get_interpreter_event_loop();
     if (loop != NULL && atomic_load(&loop->py_running)) {
-        PyObject *closed = PyObject_CallMethod(value, "close", NULL);
-        Py_XDECREF(closed);
+        /* The owning context worker waits while the existing interpreter
+         * driver executes the body. Future.result releases the GIL while
+         * waiting; the OTP actor retains serialization and all input refs. */
+        /* A successful task carrying an outcome preserves even an original
+         * CancelledError/SystemExit object; Future cancellation translation
+         * would otherwise replace it or stop the shared interpreter driver. */
+        PyObject *module = PyImport_ImportModule("_erlang_impl._actors");
+        PyObject *wrapped = module == NULL ? NULL
+            : PyObject_CallMethod(module, "_outcome", "O", value);
+        Py_XDECREF(module);
+        PyObject *asyncio = wrapped == NULL ? NULL : PyImport_ImportModule("asyncio");
+        PyObject *future = asyncio == NULL ? NULL : PyObject_CallMethod(
+            asyncio, "run_coroutine_threadsafe", "OO", wrapped, loop->py_loop);
+        Py_XDECREF(asyncio);
+        PyObject *outcome = future == NULL ? NULL
+            : PyObject_CallMethod(future, "result", NULL);
+        Py_XDECREF(future);
+        PyObject *result = NULL;
+        if (outcome != NULL && PyTuple_Check(outcome) && PyTuple_Size(outcome) == 2) {
+            PyObject *item = PyTuple_GetItem(outcome, 1);
+            if (PyTuple_GetItem(outcome, 0) == Py_True) result = Py_NewRef(item);
+            else if (PyExceptionInstance_Check(item)) PyErr_SetRaisedException(Py_NewRef(item));
+            else PyErr_SetString(PyExc_RuntimeError, "Invalid actor exception outcome");
+        } else if (outcome != NULL) {
+            PyErr_SetString(PyExc_RuntimeError, "Invalid actor outcome");
+        }
+        Py_XDECREF(outcome);
+        if (future == NULL && wrapped != NULL) {
+            PyObject *error = PyErr_GetRaisedException();
+            PyObject *closed = PyObject_CallMethod(wrapped, "close", NULL);
+            Py_XDECREF(closed);
+            PyErr_SetRaisedException(error);
+        }
+        Py_XDECREF(wrapped);
+        if (result == NULL) {
+            PyObject *error = PyErr_GetRaisedException();
+            PyObject *closed = PyObject_CallMethod(value, "close", NULL);
+            Py_XDECREF(closed);
+            PyErr_SetRaisedException(error);
+        }
         Py_DECREF(value);
-        PyErr_SetString(PyExc_RuntimeError, "An interpreter worker loop is already running");
-        return NULL;
+        return result;
     }
     /* Reuse the interpreter's existing driver. Closing a fresh asyncio.Runner
      * after each call would invalidate loop-bound objects in actor state. */
