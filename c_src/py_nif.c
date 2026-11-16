@@ -720,12 +720,17 @@ static ERL_NIF_TERM nif_py_init(ErlNifEnv *env, int argc, const ERL_NIF_TERM arg
     {
         void *handle = NULL;
 
-#ifdef PYTHON_LIBRARY_PATH
+#if defined(__linux__)
+        Dl_info library;
+        if (dladdr((void *)Py_Initialize, &library) && library.dli_fname) {
+            handle = dlopen(library.dli_fname, RTLD_NOW | RTLD_GLOBAL | RTLD_NOLOAD);
+        }
+#elif defined(PYTHON_LIBRARY_PATH)
         /* Use CMake-discovered library path (most reliable) */
         handle = dlopen(PYTHON_LIBRARY_PATH, RTLD_NOW | RTLD_GLOBAL);
 #endif
 
-        /* Fallback: try pattern-based discovery if CMake path didn't work */
+        /* Fallback: try pattern-based discovery if promotion didn't work */
         if (!handle) {
             char libpython[256];
 #ifdef Py_GIL_DISABLED
