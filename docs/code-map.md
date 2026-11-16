@@ -92,6 +92,10 @@ suites are `test/py_test_*.py`. `test/coverage_audit.md` maps public APIs to
 cases and every module to its suites; `make check-code-map` verifies this
 page and that table against the tree. `test/test.config` holds node-wide settings (memory limits flag).
 
+`py_threadsafe_wakeup_SUITE` and `py_test_threadsafe_wakeup.py` cover Python-only
+wakeups on default, pooled and independent native loops, late wakeups after
+shutdown, and the isolated interpreter's standard asyncio loop.
+
 ## Build and docs
 
 `rebar.config` runs `do_cmake.sh` / `do_build.sh` (CMake in `c_src/`) as
