@@ -27,7 +27,7 @@ suite is visible. `scripts/check_code_map.sh` requires a row per module.
 | `py_thread_handler` | `py_thread_callback_SUITE`, `py_reentrant_SUITE` |
 | `py_event_loop` | `py_event_loop_SUITE`, `py_async_task_SUITE` |
 | `py_event_loop_pool` | `py_event_loop_pool_SUITE` |
-| `py_event_worker` | `py_event_loop_SUITE`, `py_fd_ops_SUITE` |
+| `py_event_worker` | `py_event_loop_SUITE`, `py_fd_ops_SUITE`, `py_threadsafe_wakeup_SUITE` |
 | `py_event_worker_sup` | `py_event_loop_SUITE` |
 | `py_event_worker_registry` | `py_event_loop_SUITE` |
 | `py_reactor_context` | `py_reactor_SUITE` |
