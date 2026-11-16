@@ -4,12 +4,8 @@
 
 ### Fixed
 
-- Native `Channel.async_receive()` returns a queued `None` payload instead of
-  treating it as an empty queue. Readiness callbacks no longer dequeue data:
-  cancelling a receiver after notification leaves the delivery queued, and a
-  competing receiver draining the queue re-arms native waiting rather than
-  starting an executor receive.
-
+- Native `Channel.async_receive()` no longer drops a queued `None` or a
+  delivery whose receiver is cancelled after notification.
 - A task on a native event worker waiting for `call_soon_threadsafe`,
   `run_in_executor` or `asyncio.to_thread` could remain pending until an unrelated
   timer or file descriptor woke the worker. Python-only callbacks now wake the
