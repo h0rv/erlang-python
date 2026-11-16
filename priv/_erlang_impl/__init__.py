@@ -49,6 +49,8 @@ import sys
 import asyncio
 import time
 import warnings
+from importlib import import_module
+from types import ModuleType
 
 # Install sandbox when running inside Erlang VM
 # This must happen before any other imports to block subprocess/fork
@@ -66,9 +68,6 @@ from . import _reactor as reactor
 from . import _channel as channel
 from . import _byte_channel as byte_channel
 from . import _server as server
-from _erlang_impl import _supervision as supervision
-from . import _actors as actors
-from _erlang_impl import _tasks as tasks
 from ._channel import Channel, reply, ChannelClosed
 from ._byte_channel import ByteChannel, ByteChannelClosed
 
@@ -106,6 +105,14 @@ _atom_cache = {}
 
 # Re-export for uvloop API compatibility
 EventLoopPolicy = ErlangEventLoopPolicy
+
+
+def __getattr__(name: str) -> ModuleType:
+    if name not in ('supervision', 'actors', 'tasks'):
+        raise AttributeError(name)
+    module = import_module('._' + name, __name__)
+    globals()[name] = module
+    return module
 
 
 def atom(name):
