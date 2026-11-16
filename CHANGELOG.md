@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- Native `Channel.async_receive()` no longer drops a queued `None` or a
+  delivery whose receiver is cancelled after notification.
 - A task on a native event worker waiting for `call_soon_threadsafe`,
   `run_in_executor` or `asyncio.to_thread` could remain pending until an unrelated
   timer or file descriptor woke the worker. Python-only callbacks now wake the
