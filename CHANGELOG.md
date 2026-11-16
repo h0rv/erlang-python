@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Native `Channel.async_receive()` returns a queued `None` payload instead of
+  treating it as an empty queue. Readiness callbacks no longer dequeue data:
+  cancelling a receiver after notification leaves the delivery queued, and a
+  competing receiver draining the queue re-arms native waiting rather than
+  starting an executor receive.
+
 ## 5.0.1 (2026-09-22)
 
 ### Fixed
