@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- A task on a native event worker waiting for `call_soon_threadsafe`,
+  `run_in_executor` or `asyncio.to_thread` could remain pending until an unrelated
+  timer or file descriptor woke the worker. Python-only callbacks now wake the
+  worker as well as a `run_forever` driver, and callbacks left by the processing
+  budget keep the worker running until the ready queue drains.
+
 ## 5.0.1 (2026-09-22)
 
 ### Fixed

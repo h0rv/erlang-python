@@ -2955,7 +2955,7 @@ static void send_task_failure(ErlNifEnv *term_env, ErlNifPid *caller_pid,
  * - Dequeue ALL tasks BEFORE acquiring GIL (NIF ops don't need GIL)
  * - Acquire GIL once, process entire batch, release
  * - Cache Python imports (asyncio, _run_and_send) across calls
- * - Only call _run_once if coroutines were actually scheduled
+ * - Skip the GIL only when native queues and the Python wakeup hint are empty
  */
 ERL_NIF_TERM nif_process_ready_tasks(ErlNifEnv *env, int argc,
                                       const ERL_NIF_TERM argv[]) {
@@ -2983,7 +2983,7 @@ ERL_NIF_TERM nif_process_ready_tasks(ErlNifEnv *env, int argc,
      * - task_count == 0 (already processed), but wake_pending still true!
      * - Early return leaves wake_pending true, blocking future wakeups
      */
-    atomic_store(&loop->task_wake_pending, false);
+    bool python_wakeup = atomic_exchange(&loop->task_wake_pending, false);
 
     /* OPTIMIZATION: Check if there's any work BEFORE acquiring GIL
      * This avoids expensive GIL acquisition when there's nothing to do.
@@ -2992,10 +2992,11 @@ ERL_NIF_TERM nif_process_ready_tasks(ErlNifEnv *env, int argc,
      * - task_count: new tasks submitted via submit_task
      * - pending_count: timer/FD events dispatched via dispatch_timer/handle_fd_event
      *
-     * If either has work, we need to proceed and call _run_once. */
+     * A coalesced wakeup can also represent Python-only ready callbacks
+     * (call_soon_threadsafe), with neither native queue populated. */
     uint_fast64_t task_count = atomic_load(&loop->task_count);
     int pending_count = atomic_load(&loop->pending_count);
-    if (task_count == 0 && pending_count == 0) {
+    if (task_count == 0 && pending_count == 0 && !python_wakeup) {
         return ATOM_OK;  /* Nothing to process, skip GIL entirely */
     }
 
@@ -3060,9 +3061,9 @@ ERL_NIF_TERM nif_process_ready_tasks(ErlNifEnv *env, int argc,
     pthread_mutex_unlock(&loop->task_queue_mutex);
 
     /* NOTE: We do NOT return early here even if num_tasks == 0.
-     * We may have pending timer/FD events that need _run_once to process.
-     * The first check (task_count == 0 && pending_count == 0) at the start
-     * of this function already handles the case where there's truly no work.
+     * Pending timer/FD events or a Python-only wakeup may need _run_once.
+     * The queue and wakeup-hint check at the start already handles the case
+     * where there's truly no work.
      *
      * Exception: a loop driven by run_forever on its own thread consumes
      * pending events itself. With no tasks to schedule there is nothing for
@@ -3520,7 +3521,7 @@ ERL_NIF_TERM nif_process_ready_tasks(ErlNifEnv *env, int argc,
      * We loop until both pending_count AND Python's _ready queue are empty.
      * Pass timeout_hint=0 so we don't block. */
     int current_pending = atomic_load(&loop->pending_count);
-    int py_ready = 0;
+    int py_ready = python_wakeup ? 1 : 0;
     int iterations = 0;
     const int max_iterations = 100;  /* Safety limit */
 
@@ -3553,6 +3554,14 @@ ERL_NIF_TERM nif_process_ready_tasks(ErlNifEnv *env, int argc,
         coros_scheduled = 0;  /* Already processed on first iteration */
     }
 
+    /* Preserve Python-only work across the worker's 'more' handoff. The
+     * worker queues its own task_ready on 'more'; keeping the coalescing
+     * flag set supplies the next pass's work hint and coalesces producers. */
+    bool python_more = iterations == max_iterations && py_ready > 0;
+    if (python_more) {
+        atomic_store(&loop->task_wake_pending, true);
+    }
+
     /* Restore original event loop context before releasing GIL.
      * Note: events_module is cached, so we don't DECREF it here. */
     PyObject *restore = PyObject_CallMethod(events_module, "_set_running_loop", "O",
@@ -3563,11 +3572,10 @@ ERL_NIF_TERM nif_process_ready_tasks(ErlNifEnv *env, int argc,
     loop_gil_release(loop, &gil);
 
     /*
-     * Check if there are more tasks remaining (we hit MAX_TASK_BATCH limit).
-     * Return 'more' so the Erlang side can loop immediately without waiting
-     * for a new task_ready message.
+     * Continue native task batches and Python callbacks left by the iteration
+     * budget without waiting for an unrelated timer, FD event or submission.
      */
-    if (atomic_load(&loop->task_count) > 0) {
+    if (python_more || atomic_load(&loop->task_count) > 0) {
         return ATOM_MORE;
     }
 
@@ -6687,6 +6695,34 @@ static PyObject *py_get_pending(PyObject *self, PyObject *args) {
     return build_failed ? NULL : list;
 }
 
+/* Wake both loop drivers: run_forever waits on event_cond, while a
+ * worker-driven loop needs task_ready even for Python-only callbacks.
+ * Callers hold a live loop resource (directly or through its capsule). */
+static void wake_python_loop(erlang_event_loop_t *loop) {
+    if (loop->shutdown) {
+        return;
+    }
+
+    pthread_mutex_lock(&loop->mutex);
+    pthread_cond_broadcast(&loop->event_cond);
+    pthread_mutex_unlock(&loop->mutex);
+
+    if (loop->has_worker && !atomic_load(&loop->py_running)) {
+        /* Allocate before claiming the wakeup so allocation failure cannot
+         * leave task_wake_pending set without a corresponding message. */
+        ErlNifEnv *msg_env = enif_alloc_env();
+        if (msg_env != NULL) {
+            if (!atomic_exchange(&loop->task_wake_pending, true)) {
+                if (!enif_send(NULL, &loop->worker_pid, msg_env,
+                               enif_make_atom(msg_env, "task_ready"))) {
+                    atomic_store(&loop->task_wake_pending, false);
+                }
+            }
+            enif_free_env(msg_env);
+        }
+    }
+}
+
 /* Python function: _wakeup() -> None */
 static PyObject *py_wakeup(PyObject *self, PyObject *args) {
     (void)self;
@@ -6698,9 +6734,7 @@ static PyObject *py_wakeup(PyObject *self, PyObject *args) {
         Py_RETURN_NONE;
     }
 
-    pthread_mutex_lock(&loop->mutex);
-    pthread_cond_broadcast(&loop->event_cond);
-    pthread_mutex_unlock(&loop->mutex);
+    wake_python_loop(loop);
 
     Py_RETURN_NONE;
 }
@@ -8220,18 +8254,11 @@ static PyObject *py_set_running_for(PyObject *self, PyObject *args) {
         Py_RETURN_NONE;
     }
     atomic_store(&loop->py_running, running ? true : false);
-    if (!running && loop->has_worker && !loop->shutdown) {
-        /* Events queued while we were running but not yet consumed must
-         * now be handled by the worker path again */
-        if (atomic_load(&loop->pending_count) > 0 &&
-            !atomic_exchange(&loop->task_wake_pending, true)) {
-            ErlNifEnv *msg_env = enif_alloc_env();
-            if (msg_env != NULL) {
-                enif_send(NULL, &loop->worker_pid, msg_env,
-                          enif_make_atom(msg_env, "task_ready"));
-                enif_free_env(msg_env);
-            }
-        }
+    if (!running) {
+        /* Hand back native events AND Python callbacks left by run_forever.
+         * A callback can have been queued while py_running suppressed the
+         * worker notification, so pending_count alone is not sufficient. */
+        wake_python_loop(loop);
     }
     Py_RETURN_NONE;
 }
@@ -8251,16 +8278,7 @@ static PyObject *py_wakeup_for(PyObject *self, PyObject *args) {
         Py_RETURN_NONE;
     }
 
-    /* Check shutdown flag before accessing mutex - loop may be in teardown.
-     * This is a safety net for any stray executor callbacks that might
-     * arrive after loop destruction has begun. */
-    if (loop->shutdown) {
-        Py_RETURN_NONE;
-    }
-
-    pthread_mutex_lock(&loop->mutex);
-    pthread_cond_broadcast(&loop->event_cond);
-    pthread_mutex_unlock(&loop->mutex);
+    wake_python_loop(loop);
 
     Py_RETURN_NONE;
 }
