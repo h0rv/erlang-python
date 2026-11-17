@@ -50,6 +50,7 @@ init([]) ->
     %% Initialize callback registry ETS table (owned by supervisor for resilience)
     ok = py_callback:init_tab(),
     ok = py_actor_group:register_callbacks(),
+    ok = py_actor_state:register_callbacks(),
 
     %% Initialize shared state ETS table (owned by supervisor for resilience)
     ok = py_state:init_tab(),

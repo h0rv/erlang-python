@@ -237,26 +237,7 @@ ensure_store(Dir, Nodes) ->
         _ -> error(replica_set_mismatch)
     end,
     Seed = hd(Nodes),
-    case mnesia:system_info(is_running) of
-        no ->
-            ok = filelib:ensure_dir(filename:join(Dir, "schema.DAT")),
-            ok = application:set_env(mnesia, dir, Dir),
-            case node() =:= Seed of
-                true ->
-                    case mnesia:create_schema([node()]) of
-                        ok -> ok;
-                        {error, {_, {already_exists, _}}} -> ok;
-                        Other -> error({schema, Other})
-                    end;
-                false -> ok
-            end,
-            ok = application:start(mnesia);
-        yes -> ok;
-        OtherState -> error({mnesia_state, OtherState})
-    end,
-    case filename:absname(mnesia:system_info(directory)) of
-        Dir -> ok; _ -> error(mnesia_directory_mismatch)
-    end,
+    ok = py_mnesia:ensure_started(Dir, node() =:= Seed),
     [net_kernel:connect_node(N) || N <- Nodes, N =/= node()],
     {ok, _} = mnesia:change_config(extra_db_nodes, Nodes -- [node()]),
     Deadline = erlang:monotonic_time(millisecond) + 30000,

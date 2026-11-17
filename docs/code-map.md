@@ -36,6 +36,8 @@ exercised by suites). Guides are in `docs/`, suites in `test/`. Start with
 | `py_import` | Registry of imports and `sys.path` entries applied to every interpreter | live | imports | `py_import_SUITE` |
 | `py_preload` | Code run once per interpreter at start | live | preload | `py_preload_SUITE` |
 | `py_state` | Shared key/value store visible from Python as `erlang.state_get/set/delete/keys` | live | README (shared state) | `py_state_SUITE` |
+| `py_actor_state` | Explicit versioned actor snapshots, local disk transactions and log sync | live | | `py_actor_state_SUITE` |
+| `py_mnesia` | Shared directory-checked Mnesia schema startup | live | | `py_actor_state_SUITE`, `py_durable_queue_SUITE` |
 | `py_semaphore` | ETS counting semaphore for rate limiting | live | scalability | (through `py_SUITE`) |
 | `py_logger`, `py_tracer` | Python `logging` into Erlang logger; tracing hooks | live | logging | `py_logging_SUITE` |
 | `erlang_python_app`, `erlang_python_sup` | Application start and the supervision tree | live | architecture | all |

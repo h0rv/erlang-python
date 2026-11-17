@@ -158,6 +158,8 @@ drain_tasks_loop(LoopRef) ->
             ok;
         {error, py_loop_not_set} ->
             ok;
+        {error, loop_stopped} ->
+            ok;
         {error, task_queue_not_initialized} ->
             %% Loop is being destroyed, ignore
             ok;

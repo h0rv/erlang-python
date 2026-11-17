@@ -4,6 +4,10 @@
 
 ### Added
 
+- Explicit version-checked actor snapshots in local Mnesia `disc_copies` tables.
+  Writes synchronize the transaction log before acknowledgement; stale versions
+  cannot replace a newer snapshot. Queue and snapshot storage share startup.
+
 - Isolated named tasks accept plain top-level async byte functions with
   `erlang.tasks.start(..., mode="isolated")`. Each task owns a child process
   that is never restarted or retried. Exceptions and lookup/import failures
@@ -26,6 +30,11 @@
   logical CPU count, grows on demand up to `worker_pool_max` (default four times
   that count), and queues checkouts FIFO at the cap. Killing an actor drains its
   running body before restart without destroying its worker.
+
+- Worker contexts retain one Python thread state for the lifetime of their
+  dedicated thread instead of creating one per call. Thread-local values
+  persist between calls on that context, while each call starts with a fresh
+  `contextvars` context so bindings do not leak between calls.
 
 - `ErlangSocketTransport` implements `set_protocol()` and `get_protocol()`.
   Uvicorn's WebSocket upgrade swaps the HTTP protocol for a WebSocket

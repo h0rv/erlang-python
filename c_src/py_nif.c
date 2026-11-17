@@ -2379,6 +2379,8 @@ static void ctx_execute_request(py_context_t *ctx) {
  * requiring subinterpreter support.
  * ============================================================================ */
 
+static __thread PyThreadState *worker_thread_state = NULL;
+
 /**
  * @brief Serve one dequeued request on the context thread
  *
@@ -2443,9 +2445,21 @@ static void ctx_serve_request(py_context_t *ctx, ctx_request_t *req, bool nested
          * exec_enter before / exec_leave after the GIL (see the locking
          * invariant on py_context::interrupt_mutex). */
         py_context_exec_enter(ctx);
-        PyGILState_STATE gstate = PyGILState_Ensure();
-        ctx_execute_request(ctx);  /* Reuse execute functions */
-        PyGILState_Release(gstate);
+        PyEval_RestoreThread(worker_thread_state);
+        PyObject *context = PyContext_New();
+        if (context == NULL || PyContext_Enter(context) < 0) {
+            ctx->response_term = make_py_error(ctx->shared_env);
+            ctx->response_ok = false;
+        } else {
+            ctx_execute_request(ctx);  /* Reuse execute functions */
+            PyErr_Clear();
+            if (PyContext_Exit(context) < 0) {
+                ctx->response_term = make_py_error(ctx->shared_env);
+                ctx->response_ok = false;
+            }
+        }
+        Py_XDECREF(context);
+        worker_thread_state = PyEval_SaveThread();
         py_context_exec_leave(ctx);
     }
 
@@ -2612,7 +2626,7 @@ static PyObject *ctx_call_erlang_inline(py_context_t *ctx, const char *func_name
  * @brief Main loop for worker context thread (main interpreter mode)
  *
  * This function runs in a dedicated pthread. It processes requests from the
- * request queue, acquiring the GIL for each request using PyGILState_Ensure.
+ * request queue, attaching the same Python thread state for each request.
  *
  * Unlike owngil mode, worker mode uses the main interpreter and shares the GIL
  * with other Python threads. The benefit is stable thread affinity and
@@ -2621,7 +2635,7 @@ static PyObject *ctx_call_erlang_inline(py_context_t *ctx, const char *func_name
 static void *ctx_thread_main_worker(void *arg) {
     py_context_t *ctx = (py_context_t *)arg;
 
-    /* Create namespace dictionaries on the worker thread under GIL */
+    /* Keep the GILState attachment until exit so nested callbacks reuse it. */
     PyGILState_STATE gstate = PyGILState_Ensure();
 
     /* Create namespace dictionaries if not already created */
@@ -2651,7 +2665,7 @@ static void *ctx_thread_main_worker(void *arg) {
         }
     }
 
-    PyThreadState *worker_state = PyEval_SaveThread();
+    worker_thread_state = PyEval_SaveThread();
 
     /* Signal that we're ready */
     atomic_store(&ctx->thread_running, true);
@@ -2680,7 +2694,8 @@ static void *ctx_thread_main_worker(void *arg) {
     }
 
     /* Cleanup: release namespace dictionaries under GIL */
-    PyEval_RestoreThread(worker_state);
+    PyEval_RestoreThread(worker_thread_state);
+    worker_thread_state = NULL;
     PyObject *actor_name = PyUnicode_FromString("_erlang_impl._actor_data");
     PyObject *actor_module = actor_name == NULL ? NULL : PyImport_GetModule(actor_name);
     Py_XDECREF(actor_name);
