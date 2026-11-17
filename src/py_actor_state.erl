@@ -1,3 +1,4 @@
+%%% @doc Versioned local-disk actor snapshots with explicit log-synced writes.
 -module(py_actor_state).
 -export([register_callbacks/0, open/1, read/1, write/3]).
 -record(py_actor_snapshot, {key, version, payload}).

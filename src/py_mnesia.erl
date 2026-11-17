@@ -1,3 +1,4 @@
+%%% @doc Directory-checked Mnesia startup shared by durable runtime services.
 -module(py_mnesia).
 -export([ensure_started/2]).
 
