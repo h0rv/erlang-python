@@ -70,6 +70,7 @@ init([]) ->
     ok = py_shm:register_callbacks(),
     ok = py_task_group:register_callbacks(),
     ok = py_durable_queue:register_callbacks(),
+    ok = py_durable_tasks:register_callbacks(),
 
     %% Callback registry - must start before contexts
     CallbackSpec = #{
@@ -193,7 +194,9 @@ init([]) ->
                 WorkerRegistrySpec, WorkerSupSpec, EventLoopSpec,
                 EventLoopPoolSpec, ActorRegistrySpec, ActorRootSpec,
                 #{id => py_durable_queue_sync, start => {py_durable_queue_sync, start_link, []}},
-                #{id => py_durable_queue, start => {py_durable_queue, start_link, []}}],
+                #{id => py_durable_queue, start => {py_durable_queue, start_link, []}},
+                #{id => py_durable_tasks, start => {py_durable_tasks, start_link, []},
+                  type => supervisor, shutdown => infinity}],
 
     {ok, {
         #{strategy => one_for_all, intensity => 5, period => 10},
