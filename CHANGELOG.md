@@ -4,6 +4,10 @@
 
 ### Added
 
+- Explicit version-checked actor snapshots in local Mnesia `disc_copies` tables.
+  Writes synchronize the transaction log before acknowledgement; stale versions
+  cannot replace a newer snapshot. Queue and snapshot storage share startup.
+
 - Isolated named tasks accept plain top-level async byte functions with
   `erlang.tasks.start(..., mode="isolated")`. Each task owns a child process
   that is never restarted or retried. Exceptions and lookup/import failures
