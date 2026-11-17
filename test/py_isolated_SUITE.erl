@@ -21,6 +21,8 @@
 ]).
 
 -export([
+    test_child_bootstrap_imports/1,
+    test_embedded_api_imports/1,
     test_call_eval_exec/1,
     test_state_persists/1,
     test_kwargs/1,
@@ -89,6 +91,8 @@ groups() ->
         test_timeout_interrupts_sleep
     ],
     Isolation = [
+        test_child_bootstrap_imports,
+        test_embedded_api_imports,
         test_pool_of_isolated_contexts,
         test_child_info,
         test_sleep_is_interrupted,
@@ -151,6 +155,51 @@ end_per_testcase(_TestCase, _Config) ->
 %%% ============================================================================
 %%% Round-trip cases (both modes)
 %%% ============================================================================
+
+test_child_bootstrap_imports(_Config) ->
+    {ok, C} = py_context:new(#{mode => isolated}),
+    try
+        {ok, 3} = py_context:call(C, operator, add, [1, 2]),
+        {ok, true} = py_context:eval(C, <<"__import__('erlang').is_isolated()">>),
+        ok = py_context:exec(C, <<
+            "import sys\n"
+            "assert '_erlang_impl' not in sys.modules\n"
+            "from _erlang_isolated import _isolated, _etf, _shm, _server\n"
+            "import erlang\n"
+            "assert erlang.Atom is _etf.Atom\n"
+            "assert erlang.SharedMemory is _shm.SharedMemory\n"
+            "assert erlang.server is _server\n"
+        >>)
+    after py_context:stop(C) end.
+
+test_embedded_api_imports(_Config) ->
+    lists:foreach(fun(Mode) ->
+        {ok, C} = py_context:new(#{mode => Mode}),
+        try
+            ok = py_context:exec(C, <<
+                "import erlang\n"
+                "import _erlang_impl\n"
+                "from _erlang_impl import supervision, actors, tasks\n"
+                "assert erlang.supervision is supervision\n"
+                "assert erlang.actors is actors\n"
+                "assert erlang.tasks is tasks\n"
+                "assert _erlang_impl.supervision is supervision\n"
+                "assert supervision.NativeSupervisor.__module__ == '_erlang_impl._supervision'\n"
+                "assert actors.OwnedActor.__module__ == '_erlang_impl._actors'\n"
+                "assert tasks.Body.__module__ == '_erlang_impl._tasks'\n"
+                "assert getattr(_erlang_impl, 'missing', None) is None\n"
+                "from _erlang_impl import _etf, _shm, _server, _isolated\n"
+                "from _erlang_isolated import _etf as child_etf\n"
+                "from _erlang_isolated import _shm as child_shm\n"
+                "from _erlang_isolated import _server as child_server\n"
+                "from _erlang_isolated import _isolated as child_runtime\n"
+                "assert _etf.Atom is child_etf.Atom\n"
+                "assert _shm.SharedMemory is child_shm.SharedMemory\n"
+                "assert _server.serve is child_server.serve\n"
+                "assert _isolated.Runtime is child_runtime.Runtime\n"
+            >>)
+        after py_context:stop(C) end
+    end, [worker, owngil]).
 
 test_call_eval_exec(Config) ->
     C = new_ctx(Config),

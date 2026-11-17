@@ -33,7 +33,7 @@ def _server_module():
             return erlang.server
     except ImportError:
         pass
-    from _erlang_impl import _server
+    from _erlang_isolated import _server
     return _server
 
 

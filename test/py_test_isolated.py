@@ -12,6 +12,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 import erlang
 
+from _erlang_isolated._isolated import Runtime
+
 # ---------------------------------------------------------------------------
 # basics
 # ---------------------------------------------------------------------------
@@ -63,12 +65,10 @@ def close_control_socket():
     """Break the control socket from inside the child (mid-conversation),
     to exercise the fail-loud discipline."""
     import os
-    import sys
-    rt = sys.modules['_erlang_impl._isolated']
     # The runtime installed in this process
     import gc
     for obj in gc.get_objects():
-        if isinstance(obj, rt.Runtime):
+        if isinstance(obj, Runtime):
             os.close(obj.sock.fileno())
             break
     time.sleep(5)
