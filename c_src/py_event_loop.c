@@ -3731,7 +3731,9 @@ ERL_NIF_TERM nif_process_ready_tasks(ErlNifEnv *env, int argc,
         Py_DECREF(args);
         Py_XDECREF(kwargs);
 
-        if (processing_loop_stopped(loop, py_loop, owner_generation)) {
+        /* A completed synchronous call needs no live event loop. */
+        if ((coro == NULL || PyCoro_CheckExact(coro)) &&
+            processing_loop_stopped(loop, py_loop, owner_generation)) {
             if (coro != NULL && PyCoro_CheckExact(coro)) {
                 PyObject *closed = PyObject_CallMethod(coro, "close", NULL);
                 Py_XDECREF(closed);
