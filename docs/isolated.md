@@ -31,6 +31,7 @@ plain, importable top-level `async def fn(payload: bytes) -> bytes` contract as
 `mode="owngil"`. The default `worker` mode still requires a factory returning
 `Body`. Entry modules must be on the configured Python paths. Named tasks
 validate the entry before admission and resolve it inside the child.
+Isolated entry modules must not import `erlang.tasks` or submit nested tasks, because the child has no actor-gate/NIF hooks.
 
 Each isolated task owns one child with `restart => false`; losing the child
 never retries the task. Exceptions and import/lookup failures return

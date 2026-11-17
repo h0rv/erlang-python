@@ -234,6 +234,7 @@ async def start(
     CPU/native-blocked bodies delay it. Remote errors transfer type/message text only.
     Isolated tasks never restart. A child exit without a terminal reply is TaskCrashed,
     even after a cancel request; only a cancelled reply acknowledges cancellation.
+    Isolated entry modules must not import erlang.tasks or submit nested tasks.
     """
     if mode != "worker":
         if not isinstance(factory, FunctionType) or not iscoroutinefunction(factory):
