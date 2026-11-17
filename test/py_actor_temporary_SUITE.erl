@@ -24,7 +24,7 @@ with_group(Fun) ->
 child(Group, Factory, Id) ->
     {ok, {Actor, Generation, Gate}} = gen_server:call(Group,
         {spawn, Id, Factory, 1, 4, <<"temporary">>}, infinity),
-    [{_, Actor, Generation, Gate, Owned}] = ets:lookup(py_actor_generations, {Group, Id}),
+    [{_, Actor, Generation, Gate, Owned, _}] = ets:lookup(py_actor_generations, {Group, Id}),
     {Actor, Generation, Gate, Owned}.
 
 reserve(Ctx, Gate, Bytes) ->
@@ -73,7 +73,7 @@ stale_generation(_) -> with_group(fun(_Ctx, Group, Factory) ->
     Group ! {{temporary, <<"x">>, Generation}, make_ref(), process, Old, killed},
     Group ! {reap_temporary, <<"x">>, Generation},
     #{ids := [<<"x">>]} = sys:get_state(Group),
-    [{_, New, Current, Gate, NewCtx}] = ets:lookup(py_actor_generations, {Group, <<"x">>}),
+    [{_, New, Current, Gate, NewCtx, _}] = ets:lookup(py_actor_generations, {Group, <<"x">>}),
     {ok, {New, Current, Gate}} = gen_server:call(Group, {resolve, <<"x">>}),
     blocked(Group, Factory)
 end).

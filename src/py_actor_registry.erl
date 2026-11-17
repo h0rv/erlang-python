@@ -15,7 +15,7 @@ handle_info({'DOWN', Mon, process, Group, _}, State) ->
         {Group, Rest} ->
             %% Keyed by group identity, never by a reused logical child ID or
             %% old actor monitor. A late DOWN cannot erase a new generation.
-            ets:match_delete(py_actor_generations, {{Group, '_'}, '_', '_', '_', '_'}),
+            ets:match_delete(py_actor_generations, {{Group, '_'}, '_', '_', '_', '_', '_'}),
             {noreply, Rest};
         error -> {noreply, State}
     end;
