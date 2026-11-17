@@ -228,8 +228,10 @@ async def start(
     if mode != "worker":
         if not isinstance(factory, FunctionType) or not iscoroutinefunction(factory):
             raise TypeError("owngil tasks require an async Python function")
-        if not factory.__qualname__.isidentifier() or not all(
-            part.isidentifier() for part in factory.__module__.split(".")
+        if (
+            not isinstance(factory.__module__, str)
+            or not factory.__qualname__.isidentifier()
+            or not all(part.isidentifier() for part in factory.__module__.split("."))
         ):
             raise TypeError("owngil tasks require importable top-level functions")
         ticket = erlang._actor_reserve(gate, len(payload))

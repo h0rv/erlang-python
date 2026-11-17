@@ -180,6 +180,16 @@ async def api() -> bool:
             assert "owngil tasks require" in str(error)
         else:
             raise AssertionError("Non-importable entry was accepted")
+    original_module = echo.__module__
+    setattr(echo, "__module__", None)
+    try:
+        await start(group, gate, echo, b"", mode="owngil")
+    except TypeError as error:
+        assert "top-level functions" in str(error)
+    else:
+        raise AssertionError("A function without a module was accepted")
+    finally:
+        echo.__module__ = original_module
     await shutdown(group, 1000)
     await dispose(group)
     return True
