@@ -1,15 +1,25 @@
 -module(py_actor_state_SUITE).
--export([all/0, init_per_suite/1, end_per_suite/1,
-         explicit_versions/1, concurrent_writers/1, disk_restart/1, bounds/1]).
+-export([all/0, groups/0, init_per_group/2, end_per_group/2,
+         init_per_suite/1, end_per_suite/1, explicit_versions/1,
+         concurrent_writers/1, disk_restart/1, bounds/1, callback_round_trip/1]).
 
-all() -> [explicit_versions, concurrent_writers, disk_restart, bounds].
+all() -> [explicit_versions, concurrent_writers, disk_restart, bounds,
+          {group, worker}, {group, isolated}].
+
+groups() -> [{worker, [], [callback_round_trip]}, {isolated, [], [callback_round_trip]}].
+
+init_per_group(Mode, Config) -> [{mode, Mode} | Config].
+end_per_group(_, _) -> ok.
 
 init_per_suite(Config) ->
+    {ok, _} = application:ensure_all_started(erlang_python),
     Dir = filename:join(proplists:get_value(priv_dir, Config), "actor-state"),
     ok = py_actor_state:open(list_to_binary(Dir)),
     [{store, Dir} | Config].
 
-end_per_suite(_) -> application:stop(mnesia).
+end_per_suite(_) ->
+    ok = application:stop(erlang_python),
+    application:stop(mnesia).
 
 explicit_versions(_) ->
     missing = py_actor_state:read(<<"counter">>),
@@ -46,3 +56,24 @@ bounds(_) ->
     {error, invalid_argument} = py_actor_state:write(<<"x">>, 0, binary:copy(<<0>>, 1048577)),
     {error, invalid_argument} = py_actor_state:read(binary:copy(<<0>>, 4097)),
     missing = py_actor_state:read(<<"x">>).
+
+callback_round_trip(Config) ->
+    Mode = proplists:get_value(mode, Config),
+    {ok, Context} = py_context:new(#{mode => Mode}),
+    Dir = proplists:get_value(store, Config),
+    Code = iolist_to_binary([
+        "import erlang\n",
+        "assert erlang.call('_actor_state_open', ", io_lib:format("~p", [Dir]), ") == 'ok'\n",
+        "key = b'callback-", atom_to_list(Mode), "'\n",
+        "payload = bytes([0, 255, 128, 10])\n",
+        "assert erlang.call('_actor_state_read', key) == 'missing'\n",
+        "assert erlang.call('_actor_state_write', key, 0, payload) == ('ok', 1)\n",
+        "assert erlang.call('_actor_state_read', key) == ('ok', 1, payload)\n",
+        "assert erlang.call('_actor_state_write', key, 0, b'stale') == "
+        "('error', ('version_conflict', 0, 1))\n"
+    ]),
+    try
+        ok = py_context:exec(Context, Code)
+    after
+        py_context:stop(Context)
+    end.
