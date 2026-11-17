@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+### Fixed
+
+- Worker-local actor loops run between requests, waking for queued work through
+  a nonblocking pipe. Actor generations own their descendant tasks even when
+  factories share a container or calls fall back to another worker. Teardown
+  cancels and awaits those tasks before releasing references; worker shutdown
+  also awaits task, async generator and executor cleanup.
+
+- Worker pool overlap regressions use rendezvous barriers and distinct thread
+  identities instead of sleep deadlines and CPU speed ratios.
+
+- Data actor calls preserve the original Python exception object and type on
+  pooled workers instead of serializing it into a `RuntimeError`.
+
+- Holder-death barriers wait for factory callbacks to finish before pool worker
+  reuse and actor-object release.
+
+- Worker-local actor loops bypass the installed event loop policy, including
+  Erlang-backed policies on Python 3.12–3.13. Loop creation failures settle tickets.
+
 ### Added
 
 - Pooled actor regression for per-call context variable isolation and recovery
@@ -30,6 +50,9 @@
   sampling profiler attach to it.
 
 ### Changed
+
+- Busy preferred workers receive a bounded 100 ms affinity wait before fallback;
+  timed-out checkouts keep their original FIFO position.
 
 - Data actors share a node-wide worker pool instead of owning a thread each.
   Actor coroutines run on worker-local loops. The pool starts at the available

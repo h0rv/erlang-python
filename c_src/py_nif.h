@@ -759,6 +759,8 @@ struct py_context {
     /** @brief Condition variable: work available in queue */
     pthread_cond_t queue_not_empty;
 
+    int worker_wakeup[2];
+
     /** @brief Head of request queue (dequeue from here) */
     ctx_request_t *queue_head;
 

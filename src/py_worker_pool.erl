@@ -3,6 +3,7 @@
 -behaviour(gen_server).
 -export([start_link/0, checkout/1, checkin/1, drain/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
+-define(PREFERRED_WAIT_MS, 100).
 
 start_link() -> gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 checkout(Preferred) -> gen_server:call(?MODULE, {checkout, Preferred}, infinity).
@@ -25,17 +26,19 @@ new_worker() ->
     monitor(process, Ctx),
     Ctx.
 
-handle_call({checkout, Preferred}, From, #{free := Free, workers := Workers, max := Max} = State) ->
-    case Free of
-        [] when length(Workers) < Max ->
-            Ctx = new_worker(),
-            lease(Ctx, From, State#{workers := [Ctx | Workers]});
-        [] ->
-            Mon = monitor(process, element(1, From)),
-            {noreply, State#{queue := queue:in({From, Mon}, maps:get(queue, State))}};
-        _ ->
-            Ctx = case lists:member(Preferred, Free) of true -> Preferred; false -> hd(Free) end,
-            lease(Ctx, From, State#{free := lists:delete(Ctx, Free)})
+handle_call({checkout, Preferred}, From, #{busy := Busy, queue := Queue} = State) ->
+    Mon = monitor(process, element(1, From)),
+    {Affinity, Timer} = case maps:is_key(Preferred, Busy) of
+        true -> {Preferred, erlang:send_after(?PREFERRED_WAIT_MS, self(), {preferred_timeout, Mon})};
+        false -> {undefined, undefined}
+    end,
+    Entry = {From, Mon, Affinity, Timer},
+    Next = State#{queue := queue:in(Entry, Queue)},
+    %% A free preferred worker is eligible immediately, without a timer.
+    Free = maps:get(free, State),
+    case lists:member(Preferred, Free) of
+        true -> {noreply, dispatch(Next#{free := [Preferred | lists:delete(Preferred, Free)]})};
+        false -> {noreply, dispatch(Next)}
     end;
 handle_call({checkin, Ctx}, {Pid, _}, #{busy := Busy} = State) ->
     case maps:find(Ctx, Busy) of
@@ -56,7 +59,7 @@ lease(Ctx, From, #{busy := Busy} = State) ->
     gen_server:reply(From, Ctx),
     {noreply, State#{busy := Busy#{Ctx => {Pid, Mon}}}}.
 
-release(Ctx, Pid, #{busy := Busy, drains := Drains, queue := Queue, free := Free} = State) ->
+release(Ctx, Pid, #{busy := Busy, drains := Drains, free := Free} = State) ->
     Remaining = maps:remove(Ctx, Busy),
     NextDrains = case lists:any(fun({Holder, _}) -> Holder =:= Pid end, maps:values(Remaining)) of
         true -> Drains;
@@ -64,16 +67,38 @@ release(Ctx, Pid, #{busy := Busy, drains := Drains, queue := Queue, free := Free
             [gen_server:reply(From, ok) || From <- maps:get(Pid, Drains, [])],
             maps:remove(Pid, Drains)
     end,
-    Next = State#{busy := Remaining, drains := NextDrains},
-    case queue:out(Queue) of
-        {empty, _} -> Next#{free := [Ctx | Free]};
-        {{value, {From, Mon}}, Rest} ->
+    dispatch(State#{busy := Remaining, drains := NextDrains, free := [Ctx | Free]}).
+
+dispatch(#{queue := Queue, free := Free, workers := Workers, max := Max} = State) ->
+    Eligible = fun({_, _, Preferred, _}) ->
+        case Preferred of
+            undefined -> Free =/= [] orelse length(Workers) < Max;
+            _ -> lists:member(Preferred, Free)
+        end
+    end,
+    {Before, After} = lists:splitwith(fun(Entry) -> not Eligible(Entry) end, queue:to_list(Queue)),
+    case After of
+        [] -> State;
+        [{From, Mon, Preferred, Timer} | Rest] ->
+            cancel_timer(Timer),
             demonitor(Mon, [flush]),
+            Next = State#{queue := queue:from_list(Before ++ Rest)},
             case is_process_alive(element(1, From)) of
-                true -> {noreply, Leased} = lease(Ctx, From, Next#{queue := Rest}), Leased;
-                false -> release(Ctx, Pid, Next#{queue := Rest})
+                false -> dispatch(Next);
+                true ->
+                    {Ctx, Available, All} = case Free of
+                        [] -> New = new_worker(), {New, [], [New | Workers]};
+                        _ ->
+                            Chosen = case Preferred of undefined -> hd(Free); _ -> Preferred end,
+                            {Chosen, lists:delete(Chosen, Free), Workers}
+                    end,
+                    {noreply, Leased} = lease(Ctx, From, Next#{free := Available, workers := All}),
+                    dispatch(Leased)
             end
     end.
+
+cancel_timer(undefined) -> ok;
+cancel_timer(Timer) -> erlang:cancel_timer(Timer), ok.
 
 handle_info({'DOWN', Mon, process, Pid, _}, #{busy := Busy, workers := Workers} = State) ->
     case lists:member(Pid, Workers) of
@@ -84,16 +109,29 @@ handle_info({'DOWN', Mon, process, Pid, _}, #{busy := Busy, workers := Workers} 
                     Pool = self(),
                     spawn(fun() ->
                         %% This message follows every request sent by the dead holder.
-                        _ = py_context:call(Ctx, builtins, id, [0], #{}, infinity),
+                        MRef = monitor(process, Ctx),
+                        Ctx ! {pool_barrier, self(), MRef},
+                        receive
+                            {MRef, ok} -> demonitor(MRef, [flush]);
+                            {'DOWN', MRef, process, Ctx, Reason} -> exit(Reason)
+                        end,
                         Pool ! {drained, Ctx, Pid}
                     end),
                     {noreply, State};
                 [] ->
-                    Queue = queue:filter(fun({_, M}) -> M =/= Mon end, maps:get(queue, State)),
+                    Queue = queue:filter(fun({_, M, _, Timer}) ->
+                        case M =:= Mon of true -> cancel_timer(Timer), false; false -> true end
+                    end, maps:get(queue, State)),
                     {noreply, State#{queue := Queue}}
             end
     end;
 handle_info({drained, Ctx, Pid}, State) -> {noreply, release(Ctx, Pid, State)};
+handle_info({preferred_timeout, Mon}, #{queue := Queue} = State) ->
+    Entries = [case Entry of
+        {From, Mon, _, Timer} -> cancel_timer(Timer), {From, Mon, undefined, undefined};
+        _ -> Entry
+    end || Entry <- queue:to_list(Queue)],
+    {noreply, dispatch(State#{queue := queue:from_list(Entries)})};
 handle_info(_, State) -> {noreply, State}.
 handle_cast(_, State) -> {noreply, State}.
 terminate(_, #{workers := Workers}) -> [py_context:destroy(Ctx) || Ctx <- Workers], ok.

@@ -238,6 +238,11 @@ create_context(owngil) ->
 %% Main context loop. Handles requests and uses suspension-based callback support.
 loop(#state{ref = Ref, interp_id = InterpId, loop_req = LoopReq} = State) ->
     receive
+        %% Never receive this barrier in a nested callback wait.
+        {pool_barrier, From, MRef} ->
+            From ! {MRef, ok},
+            loop(State);
+
         %% Owner death is deliberately received only here, after any in-flight
         %% request and its nested callbacks have completed. Destroying earlier
         %% could release native objects still in use by the Python thread.

@@ -258,6 +258,7 @@ static int is_inline_schedule_marker(PyObject *obj);
 #include "py_mem_limit.c"
 static PyObject *python_actor_retain(PyObject *self, PyObject *value);
 static PyObject *python_actor_construct(PyObject *self, PyObject *args);
+static PyObject *python_actor_owner(PyObject *self, PyObject *value);
 static PyObject *python_actor_unwrap(PyObject *self, PyObject *value);
 static PyObject *python_actor_take_exception(PyObject *self, PyObject *value);
 static PyObject *python_actor_retained_object_stats(PyObject *self, PyObject *unused);
@@ -347,6 +348,7 @@ static void context_destructor(ErlNifEnv *env, void *obj) {
 
     /* Close callback pipes if open */
     close_pipe_pair(ctx->callback_pipe);
+    close_pipe_pair(ctx->worker_wakeup);
 
     /* Refcount is zero here, so no interrupt can be in flight. Contexts that
      * leaked an unresponsive thread keep a reference and never reach this. */
@@ -1290,6 +1292,15 @@ static PyObject *context_get_module(py_context_t *ctx, const char *module_name);
  * Available for all Python versions to support worker thread mode.
  * ============================================================================ */
 
+static void ctx_wake_worker(py_context_t *ctx) {
+    if (ctx->has_thread && ctx->worker_wakeup[1] >= 0) {
+        unsigned char wake = 1;
+        ssize_t written;
+        do { written = write(ctx->worker_wakeup[1], &wake, 1); }
+        while (written < 0 && errno == EINTR);
+    }
+}
+
 /**
  * @brief Enqueue a request to a context's request queue
  *
@@ -1312,6 +1323,7 @@ static void ctx_queue_enqueue(py_context_t *ctx, ctx_request_t *req) {
     }
 
     pthread_cond_signal(&ctx->queue_not_empty);
+    ctx_wake_worker(ctx);
     pthread_mutex_unlock(&ctx->queue_mutex);
 }
 
@@ -2672,7 +2684,26 @@ static void *ctx_thread_main_worker(void *arg) {
 
     /* Main request loop - uses queue instead of single-slot */
     while (!atomic_load(&ctx->shutdown_requested)) {
-        /* Dequeue next request (blocks until available or shutdown) */
+        pthread_mutex_lock(&ctx->queue_mutex);
+        bool idle = ctx->queue_head == NULL;
+        pthread_mutex_unlock(&ctx->queue_mutex);
+        if (idle) {
+            PyEval_RestoreThread(worker_thread_state);
+            PyObject *name = PyUnicode_FromString("_erlang_impl._actor_data");
+            PyObject *module = name == NULL ? NULL : PyImport_GetModule(name);
+            Py_XDECREF(name);
+            PyObject *waiter = module == NULL ? NULL :
+                PyDict_GetItemString(PyModule_GetDict(module), "wait_worker");
+            PyObject *waited = waiter == NULL ? NULL :
+                PyObject_CallFunction(waiter, "i", ctx->worker_wakeup[0]);
+            bool woke = waited != NULL;
+            Py_XDECREF(waited);
+            Py_XDECREF(module);
+            if (PyErr_Occurred()) log_and_clear_python_error("worker queue wait");
+            worker_thread_state = PyEval_SaveThread();
+            if (woke) continue;
+        }
+        /* The selector wakeup and condvar share the queue predicate. */
         ctx_request_t *req = ctx_queue_dequeue(ctx);
 
         if (req == NULL) {
@@ -2725,6 +2756,15 @@ static void *ctx_thread_main_worker(void *arg) {
  */
 static int worker_context_init(py_context_t *ctx) {
     ctx->has_thread = true;
+    if (pipe(ctx->worker_wakeup) < 0) return -1;
+    for (int i = 0; i < 2; i++) {
+        int flags = fcntl(ctx->worker_wakeup[i], F_GETFL, 0);
+        if (flags < 0 || fcntl(ctx->worker_wakeup[i], F_SETFL, flags | O_NONBLOCK) < 0 ||
+            fcntl(ctx->worker_wakeup[i], F_SETFD, FD_CLOEXEC) < 0) {
+            close_pipe_pair(ctx->worker_wakeup);
+            return -1;
+        }
+    }
 
     /* Initialize worker thread state */
     atomic_store(&ctx->thread_running, false);
@@ -2855,6 +2895,8 @@ static void ctx_thread_shutdown_worker(py_context_t *ctx) {
     pthread_cond_broadcast(&ctx->queue_not_empty);
     pthread_mutex_unlock(&ctx->queue_mutex);
 
+    ctx_wake_worker(ctx);
+
     /* Wait for thread to exit with timeout */
     bool join_succeeded = false;
 
@@ -2905,6 +2947,7 @@ static void ctx_thread_shutdown_worker(py_context_t *ctx) {
     pthread_mutex_destroy(&ctx->queue_mutex);
 
     ctx->has_thread = false;
+    close_pipe_pair(ctx->worker_wakeup);
 }
 
 /**
@@ -3607,6 +3650,8 @@ static ERL_NIF_TERM nif_context_create(ErlNifEnv *env, int argc, const ERL_NIF_T
     ctx->has_callback_handler = false;
     ctx->callback_pipe[0] = -1;
     ctx->callback_pipe[1] = -1;
+    ctx->worker_wakeup[0] = -1;
+    ctx->worker_wakeup[1] = -1;
     ctx->has_current_caller = false;
     ctx->cb_reply_id = 0;
     ctx->cb_reply_data = NULL;

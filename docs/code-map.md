@@ -81,7 +81,7 @@ loop, channels and servers.
 | `_erlang_impl/__init__.py` | Public surface of `erlang` in embedded modes: `run`, `sleep`, `spawn_task`, loop policy, `atom`, channels, `server` | embedded |
 | `_erlang_impl/_loop.py`, `_policy.py`, `_transport.py` | `ErlangEventLoop` (uvloop-compatible) over `enif_select` | embedded |
 | `_erlang_impl/_supervision.py` | Supervisor facade; event-loop import compatibility covered by `py_import_SUITE` | embedded |
-| `_erlang_impl/_actor_data.py` | Byte actor facade and worker-local coroutine dispatch | embedded |
+| `_erlang_impl/_actor_data.py` | Byte actor facade, worker-local loops and generation-owned task cleanup | embedded |
 | `_erlang_impl/_reactor.py` | Protocol-based reactor over fds Erlang owns | embedded |
 | `_erlang_impl/_channel.py`, `_byte_channel.py` | Python side of channels | embedded |
 | `_erlang_impl/_server.py` | `serve`, `adopt`, `stop_serving` on fds handed over by Erlang; plain asyncio, works in every mode | all |
