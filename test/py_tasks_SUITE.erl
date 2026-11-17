@@ -5,13 +5,13 @@
          owngil_prestart_cancel/1, owngil_running_cancel/1, owngil_killed_context/1,
          owngil_missing_envelope/1, unsupported_named_mode/1, owngil_surrogate_error/1,
          owngil_unicode_identifiers/1, owngil_import_failure/1,
-         owngil_missing_attribute/1, owngil_non_entry/1]).
+         owngil_missing_attribute/1, owngil_non_entry/1, worker_rejects_async/1]).
 all() -> [killed_child, killed_context, killed_group, queued_ticket, killed_before_execution,
           retained_exception_lifecycle, owngil_api, owngil_parallel,
           owngil_prestart_cancel, owngil_running_cancel, owngil_killed_context,
           owngil_missing_envelope, unsupported_named_mode, owngil_surrogate_error,
           owngil_unicode_identifiers, owngil_import_failure,
-          owngil_missing_attribute, owngil_non_entry].
+          owngil_missing_attribute, owngil_non_entry, worker_rejects_async].
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(erlang_python),
     ok = py_import:add_path(filename:dirname(code:which(?MODULE))),
@@ -170,6 +170,14 @@ wait_contexts(Baseline, N) ->
         Baseline -> ok;
         _ -> receive after 5 -> wait_contexts(Baseline, N - 1) end
     end.
+
+worker_rejects_async(_) ->
+    {ok, Ctx} = py_context:new(#{mode => worker, managed_loop => dedicated}),
+    try
+        ok = py_context:start_loop(Ctx),
+        {ok, true} = py_context:submit_await(Ctx, py_test_task_entries, worker_rejects_async,
+                                           [], #{}, 15000)
+    after py_context:destroy(Ctx) end.
 
 owngil_api(_) ->
     {ok, Ctx} = py_context:new(#{mode => worker, managed_loop => dedicated}),

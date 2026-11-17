@@ -249,6 +249,10 @@ async def start(
             )
         finally:
             erlang._actor_abort(ticket)
+    if iscoroutinefunction(factory):
+        raise TypeError(
+            'worker tasks require a factory returning Body; async functions require mode="owngil"'
+        )
     ticket = erlang._actor_reserve(gate, len(payload))
     try:
         return result(

@@ -5,6 +5,7 @@ from collections.abc import Awaitable
 import erlang
 from _erlang_impl._tasks import _entries
 from erlang.tasks import (
+    Body,
     RemoteTaskError,
     cancel,
     dispose,
@@ -126,6 +127,28 @@ async def resolution_failure(module: str, name: str, type_name: str, message: st
 
 async def sealed(token: int) -> bool:
     return _entries[token].sealed
+
+
+async def worker_rejects_async() -> bool:
+    group, gate = await open_group(1, 100)
+
+    def factory() -> Body:
+        return Body(echo)
+
+    try:
+        for payload in (b"", b"work"):
+            try:
+                await start(group, gate, echo, payload)
+            except TypeError as error:
+                assert 'async functions require mode="owngil"' in str(error)
+            else:
+                raise AssertionError("An async function was accepted as a worker factory")
+            pid = await start(group, gate, factory, payload)
+            assert await outcome(group, pid) == (True, payload)
+        await shutdown(group, 1000)
+    finally:
+        await dispose(group)
+    return True
 
 
 async def api() -> bool:
