@@ -2,10 +2,14 @@
 -include_lib("common_test/include/ct.hrl").
 -export([all/0,init_per_suite/1,end_per_suite/1,guard_shared/1,guard_dedicated/1,
          release_and_initialization/1,concurrent_claims/1,foreign_interpreter/1,
-         owner_exit_during_processing/1]).
+         owner_exit_during_processing/1,completed_sync_during_processing/1,
+         completed_coroutine_during_processing/1,completed_empty_during_processing/1,
+         completed_error_during_processing/1]).
 
 all() -> [guard_shared,guard_dedicated,release_and_initialization,concurrent_claims,
-          foreign_interpreter,owner_exit_during_processing].
+          foreign_interpreter,owner_exit_during_processing,completed_sync_during_processing,
+          completed_coroutine_during_processing,completed_empty_during_processing,
+          completed_error_during_processing].
 init_per_suite(Config) ->
     {ok,_}=application:ensure_all_started(erlang_python),
     ok=py_callback:register(<<"owner_echo">>,fun([Value])->Value end),
@@ -55,6 +59,37 @@ foreign_interpreter(Config) ->
     stop_loop(A), ok=py_context:stop(A), ok=py_context:stop(S).
 
 owner_exit_during_processing(Config) ->
+    {error,loop_stopped}=retiring_call(Config,retiring_factory).
+
+completed_sync_during_processing(Config) ->
+    {ok,<<"completed">>}=retiring_call(Config,retiring_result).
+
+completed_coroutine_during_processing(Config) ->
+    B=context(Config,#{mode=>worker}),
+    {ok,Loop}=py_nif:event_loop_new(),
+    ok=py_callback:register(<<"owner_destroy_loop">>,fun([])->
+        py_nif:event_loop_destroy(Loop)
+    end),
+    try
+        Ref=make_ref(),
+        ok=py_nif:submit_task(Loop,self(),Ref,<<"py_test_loop_teardown">>,
+                              <<"retiring_completed">>,[],#{}),
+        {error,loop_stopped}=py_nif:process_ready_tasks(Loop),
+        {ok,<<"completed">>}=py_event_loop:await(Ref,2000)
+    after
+        py_callback:unregister(<<"owner_destroy_loop">>),
+        py_nif:event_loop_release_python_loop(Loop),
+        py_nif:event_loop_destroy(Loop),
+        py_context:stop(B)
+    end.
+
+completed_empty_during_processing(Config) ->
+    {ok,<<>>}=retiring_call(Config,retiring_empty).
+
+completed_error_during_processing(Config) ->
+    {error,{'ValueError',"completed failure"}}=retiring_call(Config,retiring_error).
+
+retiring_call(Config,Function) ->
     A=context(Config,#{mode=>worker,managed_loop=>dedicated}),
     B=context(Config,#{mode=>worker}),
     {Owner,Mon}=spawn_monitor(fun()->
@@ -65,10 +100,10 @@ owner_exit_during_processing(Config) ->
         receive {'DOWN',Mon,process,Owner,normal}->ok
         after 7000->ct:fail(owner_did_not_exit) end,
         {ok,<<"closing">>}=py_context:call(B,py_test_loop_teardown,wait_closing,[]),
-        {ok,Ref}=py_context:submit(A,py_test_loop_teardown,retiring_factory,[],#{}),
+        {ok,Ref}=py_context:submit(A,py_test_loop_teardown,Function,[],#{}),
         Outcome=py_event_loop:await(Ref,2000),
         {ok,<<"no-system-error">>}=py_context:call(B,py_test_loop_teardown,finish,[]),
-        {error,loop_stopped}=Outcome
+        Outcome
     after
         py_context:call(B,py_test_loop_teardown,finish,[]),
         py_context:stop(A), py_context:stop(B)
