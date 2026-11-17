@@ -21,6 +21,11 @@
 
 ### Changed
 
+- Worker contexts retain one Python thread state for the lifetime of their
+  dedicated thread instead of creating one per call. Thread-local values and
+  synchronous context-variable bindings now persist between calls on that
+  context; callers that need request isolation must reset them explicitly.
+
 - `ErlangSocketTransport` implements `set_protocol()` and `get_protocol()`.
   Uvicorn's WebSocket upgrade swaps the HTTP protocol for a WebSocket
   protocol on the same transport and previously raised `NotImplementedError`.

@@ -24,6 +24,7 @@
     exec_eval_call_share_thread/1,
     multi_process_share_context_thread/1,
     distinct_contexts_distinct_threads/1,
+    worker_thread_state_persists/1,
     owngil_thread_affinity/1
 ]).
 
@@ -32,6 +33,7 @@ all() ->
         exec_eval_call_share_thread,
         multi_process_share_context_thread,
         distinct_contexts_distinct_threads,
+        worker_thread_state_persists,
         owngil_thread_affinity
     ].
 
@@ -111,6 +113,45 @@ distinct_contexts_distinct_threads(_Config) ->
             ok;
         _ ->
             {skip, "needs at least 2 contexts"}
+    end.
+
+worker_thread_state_persists(_Config) ->
+    {ok, First} = py_context:new(#{mode => worker}),
+    {ok, Second} = py_context:new(#{mode => worker}),
+    try
+        ok = py_context:exec(First, <<
+            "import contextvars, sys, threading, types\n"
+            "_state_probe = types.ModuleType('_worker_state_probe')\n"
+            "_state_probe.local = threading.local()\n"
+            "_state_probe.var = contextvars.ContextVar('worker_state', default='empty')\n"
+            "sys.modules['_worker_state_probe'] = _state_probe\n"
+            "_state_probe.local.value = 'first'\n"
+            "_state_probe.var.set('first')\n"
+            "_state_native_id = threading.get_native_id()\n"
+        >>),
+        {ok, FirstId} = py_context:call(First, threading, get_native_id, []),
+        {ok, true} = py_context:eval(First, <<"_state_native_id == threading.get_native_id()">>, #{}),
+        ok = py_context:exec(Second, <<
+            "import _worker_state_probe as _state_probe\n"
+            "assert not hasattr(_state_probe.local, 'value')\n"
+            "assert _state_probe.var.get() == 'empty'\n"
+            "_state_probe.local.value = 'second'\n"
+            "_state_probe.var.set('second')\n"
+        >>),
+        {ok, SecondId} = py_context:call(Second, threading, get_native_id, []),
+        true = FirstId =/= SecondId,
+        {error, _} = py_context:eval(First, <<"1 / 0">>, #{}),
+        ok = py_context:exec(First, <<"pass">>),
+        {ok, [<<"first">>, <<"first">>, true]} = py_context:eval(First, <<
+            "[_state_probe.local.value, _state_probe.var.get(), sys.exception() is None]"
+        >>, #{}),
+        {ok, [<<"second">>, <<"second">>]} = py_context:eval(Second, <<
+            "[_state_probe.local.value, _state_probe.var.get()]"
+        >>, #{})
+    after
+        py_context:exec(First, <<"sys.modules.pop('_worker_state_probe', None)">>),
+        py_context:stop(First),
+        py_context:stop(Second)
     end.
 
 owngil_thread_affinity(_Config) ->
