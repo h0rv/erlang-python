@@ -4,6 +4,9 @@
 
 ### Added
 
+- Pooled actor regression for per-call context variable isolation and recovery
+  after exceptions while reusing the same worker thread and event loop.
+
 - Pooled actor snapshot regression covering asynchronous state callbacks,
   serialized versioned writes, stale-write rejection and restoration after restart.
 

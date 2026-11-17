@@ -1,8 +1,9 @@
 -module(py_worker_pool_SUITE).
 -export([all/0, init_per_suite/1, end_per_suite/1,
-         sleeping/1, cpu_parallel/1, reuse/1, capacity/1, portable_env/1, callbacks/1]).
+         sleeping/1, cpu_parallel/1, reuse/1, capacity/1, portable_env/1, callbacks/1,
+         isolated_state/1]).
 
-all() -> [reuse, portable_env, capacity, callbacks, sleeping, cpu_parallel].
+all() -> [reuse, portable_env, capacity, callbacks, sleeping, cpu_parallel, isolated_state].
 init_per_suite(Config) ->
     application:load(erlang_python),
     application:set_env(erlang_python, worker_pool_max, 16),
@@ -25,6 +26,10 @@ sleeping(_) -> with_context(fun(Ctx) ->
     {ok, Elapsed} = py_context:call(Ctx, py_test_worker_pool, sleeping, [], #{}, 30000),
     ct:pal("16 sleeping actors: ~.3f s (serial 3.200 s)", [Elapsed]),
     true = Elapsed < 1.6
+end).
+
+isolated_state(_) -> with_context(fun(Ctx) ->
+    {ok, none} = py_context:call(Ctx, py_test_worker_pool, isolated_state, [], #{}, 30000)
 end).
 
 callbacks(_) -> with_context(fun(Ctx) ->

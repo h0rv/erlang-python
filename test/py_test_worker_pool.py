@@ -2,6 +2,7 @@ import asyncio
 import sys
 import threading
 import time
+from contextvars import ContextVar
 
 import erlang
 from _erlang_impl._actor_data import _worker_loop
@@ -73,6 +74,45 @@ class _ThreadState(threading.local):
 
 
 _thread_state = _ThreadState()
+
+_call_state = ContextVar("pooled_call_state", default=b"empty")
+
+
+class IsolatedWorker:
+    def __init__(self) -> None:
+        self.identity: tuple[int, int] | None = None
+
+    async def dispatch(self, payload: bytes) -> bytes:
+        identity = (threading.get_native_id(), id(asyncio.get_running_loop()))
+        if self.identity is None:
+            self.identity = identity
+        assert self.identity == identity
+        assert _call_state.get() == b"empty"
+        assert sys.exception() is None
+        _call_state.set(payload)
+        await asyncio.sleep(0)
+        assert _call_state.get() == payload
+        if payload == b"error":
+            raise ValueError("expected pooled actor failure")
+        return payload
+
+
+async def isolated_calls() -> None:
+    async with DataActorGroup(max_children=1) as group:
+        actor = await group.spawn("isolated", IsolatedWorker)
+        assert await actor.call(b"first") == b"first"
+        assert await actor.call(b"second") == b"second"
+        try:
+            await actor.call(b"error")
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("Actor error was not propagated")
+        assert await actor.call(b"recovered") == b"recovered"
+
+
+def isolated_state() -> None:
+    asyncio.run(isolated_calls())
 
 
 def loop_identity() -> tuple[int, int]:
