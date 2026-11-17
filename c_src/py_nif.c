@@ -2451,6 +2451,7 @@ static void ctx_serve_request(py_context_t *ctx, ctx_request_t *req, bool nested
             ctx->response_ok = false;
         } else {
             ctx_execute_request(ctx);  /* Reuse execute functions */
+            PyErr_Clear();
             if (PyContext_Exit(context) < 0) {
                 ctx->response_term = make_py_error(ctx->shared_env);
                 ctx->response_ok = false;

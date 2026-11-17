@@ -25,6 +25,7 @@
     multi_process_share_context_thread/1,
     distinct_contexts_distinct_threads/1,
     worker_thread_state_persists/1,
+    worker_conversion_error_recovery/1,
     owngil_thread_affinity/1
 ]).
 
@@ -34,6 +35,7 @@ all() ->
         multi_process_share_context_thread,
         distinct_contexts_distinct_threads,
         worker_thread_state_persists,
+        worker_conversion_error_recovery,
         owngil_thread_affinity
     ].
 
@@ -158,6 +160,26 @@ worker_thread_state_persists(_Config) ->
         py_context:exec(First, <<"sys.modules.pop('_worker_state_probe', None)">>),
         py_context:stop(First),
         py_context:stop(Second)
+    end.
+
+worker_conversion_error_recovery(_Config) ->
+    {ok, Ctx} = py_context:new(#{mode => worker}),
+    try
+        ok = py_context:exec(Ctx, <<
+            "def _pta_surrogate():\n"
+            "    return '\\ud800'\n"
+            "def _pta_valid():\n"
+            "    return len([])\n"
+        >>),
+        {ok, 0} = py_context:call(Ctx, builtins, len, [[]]),
+        {ok, error} = py_context:call(Ctx, '__main__', '_pta_surrogate', []),
+        {ok, 0} = py_context:call(Ctx, '__main__', '_pta_valid', []),
+        {error, {'ZeroDivisionError', _}} = py_context:eval(Ctx, <<"1 / 0">>, #{}),
+        {error, {'TypeError', _}} = py_context:call(Ctx, builtins, len, [123]),
+        {error, {'ValueError', _}} = py_context:exec(Ctx, <<"raise ValueError('expected')">>),
+        {ok, 0} = py_context:call(Ctx, builtins, len, [[]])
+    after
+        py_context:stop(Ctx)
     end.
 
 owngil_thread_affinity(_Config) ->
