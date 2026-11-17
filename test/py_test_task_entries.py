@@ -27,6 +27,25 @@ async def failure(payload: bytes) -> bytes:
 
 
 @entrypoint
+async def surrogate_failure(payload: bytes) -> bytes:
+    raise ValueError("remote\udcff failure")
+
+
+async def surrogate_error() -> bool:
+    group, gate = await open_group(1, 100)
+    pid = await start(group, gate, surrogate_failure, b"", mode="owngil")
+    success, error = await outcome(group, pid)
+    assert not success and isinstance(error, RemoteTaskError)
+    assert error.type_name == "ValueError"
+    assert error.message == "remote\\udcff failure"
+    pid = await start(group, gate, echo, b"completed", mode="owngil")
+    assert await outcome(group, pid) == (True, b"completed")
+    await shutdown(group, 1000)
+    await dispose(group)
+    return True
+
+
+@entrypoint
 async def asleep(payload: bytes) -> bytes:
     await asyncio.sleep(60)
     return payload

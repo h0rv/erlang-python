@@ -142,7 +142,11 @@ class EntryPoint:
                 message = str(error)
             except BaseException:
                 message = "Unprintable task exception"
-            return "remote_error", type(error).__name__, message
+            type_name = (
+                type(error).__name__.encode("utf-8", errors="backslashreplace").decode("utf-8")
+            )
+            message = message.encode("utf-8", errors="backslashreplace").decode("utf-8")
+            return "remote_error", type_name, message
 
 
 def entrypoint(function: Callable[[bytes], Awaitable[bytes]]) -> EntryPoint:
