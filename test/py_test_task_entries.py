@@ -105,7 +105,27 @@ async def cpu(payload: bytes) -> bytes:
 
 
 def malformed(token: int, payload: bytes) -> bytes:
-    return payload
+    raise AssertionError("A non-entry callable executed")
+
+
+async def unresolved(payload: bytes) -> bytes:
+    raise AssertionError("An unresolved task body executed")
+
+
+async def resolution_failure(module: str, name: str, type_name: str, message: str) -> bool:
+    group, gate = await open_group(1, 100)
+    entry = entrypoint(unresolved)
+    entry.module, entry.name = module, name
+    pid = await start(group, gate, entry, b"", mode="owngil")
+    success, error = await outcome(group, pid)
+    assert not success and isinstance(error, RemoteTaskError)
+    assert error.type_name == type_name, error
+    assert error.message == message, error
+    pid = await start(group, gate, echo, b"completed", mode="owngil")
+    assert await outcome(group, pid) == (True, b"completed")
+    await shutdown(group, 1000)
+    await dispose(group)
+    return True
 
 
 async def sealed(token: int) -> bool:

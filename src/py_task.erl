@@ -41,8 +41,8 @@ handle_info(run, #{entry := {Module, Function}, token := Token, ctx := Ctx,
     ok = py_context:start_loop(Ctx),
     Owner = self(),
     spawn_link(fun() ->
-        Reply = py_context:submit_await(Ctx, Module, Function,
-                                       [Token, {bytes, Payload}], #{}, infinity),
+        Reply = py_context:submit_await(Ctx, '_erlang_impl._tasks', execute_entry,
+                                       [Module, Function, Token, {bytes, Payload}], #{}, infinity),
         Owner ! {named_result, Reply}
     end),
     {noreply, State};

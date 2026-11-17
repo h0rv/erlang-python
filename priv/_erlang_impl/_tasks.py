@@ -138,15 +138,27 @@ class EntryPoint:
         except asyncio.CancelledError:
             return ("cancelled",)
         except BaseException as error:
-            try:
-                message = str(error)
-            except BaseException:
-                message = "Unprintable task exception"
-            type_name = (
-                type(error).__name__.encode("utf-8", errors="backslashreplace").decode("utf-8")
-            )
-            message = message.encode("utf-8", errors="backslashreplace").decode("utf-8")
-            return "remote_error", type_name, message
+            return _remote_error(error)
+
+
+def _remote_error(error: BaseException) -> tuple[Literal["remote_error"], str, str]:
+    try:
+        message = str(error)
+    except BaseException:
+        message = "Unprintable task exception"
+    type_name = type(error).__name__.encode("utf-8", errors="backslashreplace").decode("utf-8")
+    message = message.encode("utf-8", errors="backslashreplace").decode("utf-8")
+    return "remote_error", type_name, message
+
+
+async def execute_entry(module: str, name: str, token: int, payload: bytes) -> EntryResult:
+    try:
+        entry = erlang._task_resolve_entry(module, name)
+        if not isinstance(entry, EntryPoint):
+            raise TypeError("Named tasks require an erlang.tasks.EntryPoint")
+    except BaseException as error:
+        return _remote_error(error)
+    return await entry(token, payload)
 
 
 def entrypoint(function: Callable[[bytes], Awaitable[bytes]]) -> EntryPoint:
