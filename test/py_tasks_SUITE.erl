@@ -203,7 +203,7 @@ owngil_missing_attribute(_) ->
 
 owngil_non_entry(_) ->
     resolution_failure(<<"py_test_task_entries">>, <<"malformed">>,
-                       <<"TypeError">>, <<"Named tasks require an erlang.tasks.EntryPoint">>).
+                       <<"TypeError">>, <<"Named tasks require an async Python function">>).
 
 resolution_failure(Module, Function, Type, Message) ->
     {ok, Ctx} = py_context:new(#{mode => worker, managed_loop => dedicated}),

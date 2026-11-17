@@ -2,7 +2,7 @@ import asyncio
 import threading
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from functools import update_wrapper
+from inspect import iscoroutinefunction
 from types import FunctionType
 from typing import Literal, assert_never, final
 
@@ -113,34 +113,6 @@ async def seal_entry(token: int) -> bool:
     return state.body.seal()
 
 
-@final
-class EntryPoint:
-    def __init__(self, function: Callable[[bytes], Awaitable[bytes]]) -> None:
-        self._function = function
-        if not isinstance(function, FunctionType):
-            raise TypeError("Task entrypoints require a Python function")
-        self.module = function.__module__
-        self.name = function.__qualname__
-        update_wrapper(self, function)
-
-    async def __call__(self, token: int, payload: bytes) -> EntryResult:
-        state = _entries[token]
-        if state.sealed:
-            return ("cancelled",)
-        if state.body is None:
-            state.body = Body(self._function)
-        body = state.body
-        try:
-            value = await body.run(payload)
-            if not isinstance(value, bytes):
-                raise TypeError("Task entries must return bytes")
-            return "ok", value
-        except asyncio.CancelledError:
-            return ("cancelled",)
-        except BaseException as error:
-            return _remote_error(error)
-
-
 def _remote_error(error: BaseException) -> tuple[Literal["remote_error"], str, str]:
     try:
         message = str(error)
@@ -154,21 +126,24 @@ def _remote_error(error: BaseException) -> tuple[Literal["remote_error"], str, s
 async def execute_entry(module: str, name: str, token: int, payload: bytes) -> EntryResult:
     try:
         entry = erlang._task_resolve_entry(module, name)
-        if not isinstance(entry, EntryPoint):
-            raise TypeError("Named tasks require an erlang.tasks.EntryPoint")
+        if not isinstance(entry, FunctionType) or not iscoroutinefunction(entry):
+            raise TypeError("Named tasks require an async Python function")
     except BaseException as error:
         return _remote_error(error)
-    return await entry(token, payload)
-
-
-def entrypoint(function: Callable[[bytes], Awaitable[bytes]]) -> EntryPoint:
-    """Name a byte-oriented task body for import in its owning interpreter.
-
-    Only top-level entries can be started. Cancellation is cooperative and waits
-    for the owning loop; CPU/native-blocked bodies delay cancellation and sealing.
-    Remote failures transfer type/message text, not exception identity or traceback.
-    """
-    return EntryPoint(function)
+    state = _entries[token]
+    if state.sealed:
+        return ("cancelled",)
+    if state.body is None:
+        state.body = Body(entry)
+    try:
+        value = await state.body.run(payload)
+        if not isinstance(value, bytes):
+            raise TypeError("Task entries must return bytes")
+        return "ok", value
+    except asyncio.CancelledError:
+        return ("cancelled",)
+    except BaseException as error:
+        return _remote_error(error)
 
 
 class RemoteTaskError(RuntimeError):
@@ -240,18 +215,23 @@ async def open_group(count: int, max_bytes: int) -> tuple[object, object]:
 async def start(
     group: object,
     gate: object,
-    factory: Callable[[], Body] | EntryPoint,
+    factory: Callable[[], Body] | Callable[[bytes], Awaitable[bytes]],
     payload: bytes,
     *,
     mode: Literal["worker", "owngil"] = "worker",
 ) -> object:
+    """Start a worker factory or name a top-level async byte function for owngil.
+
+    Owngil resolves the function in its own interpreter. Cancellation is cooperative;
+    CPU/native-blocked bodies delay it. Remote errors transfer type/message text only.
+    """
     if mode != "worker":
-        if not isinstance(factory, EntryPoint):
-            raise TypeError("owngil tasks require a decorated entrypoint")
-        if not factory.name.isidentifier() or not all(
-            part.isidentifier() for part in factory.module.split(".")
+        if not isinstance(factory, FunctionType) or not iscoroutinefunction(factory):
+            raise TypeError("owngil tasks require an async Python function")
+        if not factory.__qualname__.isidentifier() or not all(
+            part.isidentifier() for part in factory.__module__.split(".")
         ):
-            raise TypeError("Task entrypoints must be importable top-level functions")
+            raise TypeError("owngil tasks require importable top-level functions")
         ticket = erlang._actor_reserve(gate, len(payload))
         try:
             return result(
@@ -262,13 +242,11 @@ async def start(
                     ticket,
                     payload,
                     mode,
-                    (factory.module, factory.name),
+                    (factory.__module__, factory.__qualname__),
                 )
             )
         finally:
             erlang._actor_abort(ticket)
-    if isinstance(factory, EntryPoint):
-        raise TypeError("Named task entries require mode='owngil'")
     ticket = erlang._actor_reserve(gate, len(payload))
     try:
         return result(
