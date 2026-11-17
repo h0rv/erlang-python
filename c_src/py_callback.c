@@ -3686,6 +3686,45 @@ static PyObject *erlang_channel_snapshot(PyObject *self, PyObject *args) {
     return out;
 }
 
+/* CPython only records the thread running the main program when Py_RunMain
+ * runs it. Remote debuggers (pdb -p, sys.remote_exec) attach to that thread,
+ * so mark the thread that runs a context's event loop instead. */
+#if PY_VERSION_HEX >= 0x030E0000
+PyAPI_FUNC(int) _PyInterpreterState_SetRunningMain(PyInterpreterState *);
+PyAPI_FUNC(void) _PyInterpreterState_SetNotRunningMain(PyInterpreterState *);
+PyAPI_FUNC(int) _PyInterpreterState_IsRunningMain(PyInterpreterState *);
+#endif
+
+/* _set_running_main(True) -> bool: True if this thread became the main
+ * interpreter's running main thread. _set_running_main(False) undoes it and
+ * must only follow a True result on the same thread. */
+static PyObject *erlang_set_running_main(PyObject *self, PyObject *arg) {
+    (void)self;
+    int enable = PyObject_IsTrue(arg);
+    if (enable < 0) {
+        return NULL;
+    }
+#if PY_VERSION_HEX >= 0x030E0000
+    PyInterpreterState *interp = PyInterpreterState_Get();
+    if (interp != PyInterpreterState_Main()) {
+        Py_RETURN_FALSE;
+    }
+    if (!enable) {
+        _PyInterpreterState_SetNotRunningMain(interp);
+        Py_RETURN_FALSE;
+    }
+    if (_PyInterpreterState_IsRunningMain(interp)) {
+        Py_RETURN_FALSE;
+    }
+    if (_PyInterpreterState_SetRunningMain(interp) < 0) {
+        return NULL;
+    }
+    Py_RETURN_TRUE;
+#else
+    Py_RETURN_FALSE;
+#endif
+}
+
 /* Python method definitions for erlang module */
 static PyObject *python_task_resolve_entry(PyObject *self, PyObject *args) {
     (void)self;
@@ -3701,6 +3740,7 @@ static PyObject *python_task_resolve_entry(PyObject *self, PyObject *args) {
 
 static PyMethodDef ErlangModuleMethods[] = {
     {"_task_resolve_entry", python_task_resolve_entry, METH_VARARGS, "Resolve a named task without discarding Python exceptions."},
+    {"_set_running_main", erlang_set_running_main, METH_O, NULL},
     {"_channel_create_bounded", erlang_channel_create_bounded, METH_VARARGS, NULL},
     {"_channel_ready", erlang_channel_ready, METH_VARARGS, NULL},
     {"_channel_cancel_ready", erlang_channel_cancel_ready, METH_VARARGS, NULL},

@@ -180,3 +180,10 @@ async def wait_channel(ref):
 
 def served_count():
     return served
+
+
+async def claim_running_main():
+    claimed = erlang._set_running_main(True)
+    if claimed:
+        erlang._set_running_main(False)
+    return claimed

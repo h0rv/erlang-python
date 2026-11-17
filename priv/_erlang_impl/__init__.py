@@ -206,11 +206,17 @@ def _run_loop_forever(notify_pid: object | None = None, capsule: object | None =
                 _erlang.send(notify_pid, (atom('py_loop_started'),))
 
         startup = None
+        import erlang as _erlang
+
+        # pdb -p and sys.remote_exec run their script on this thread.
+        running_main = _erlang._set_running_main(True)
         try:
             asyncio.set_event_loop(loop)
             startup = loop.call_soon(_started)
             loop.run_forever()
         finally:
+            if running_main:
+                _erlang._set_running_main(False)
             if startup is not None:
                 startup.cancel()
             try:

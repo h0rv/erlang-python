@@ -46,7 +46,8 @@
     test_preload_option/1,
     test_bad_fd_rejected/1,
     %% worker mode
-    test_worker_mode_single_loop/1
+    test_worker_mode_single_loop/1,
+    test_worker_loop_is_running_main/1
 ]).
 
 %% logger handler callback used by test_churn_no_poll_reports
@@ -81,7 +82,7 @@ groups() ->
         test_preload_option,
         test_bad_fd_rejected
      ]},
-     {worker, [], [test_worker_mode_single_loop]}].
+     {worker, [], [test_worker_mode_single_loop, test_worker_loop_is_running_main]}].
 
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(erlang_python),
@@ -572,3 +573,20 @@ wait_until_loop(Fun, Deadline) ->
 
 flush() ->
     receive _ -> flush() after 0 -> ok end.
+
+%% @doc A running worker loop holds the interpreter's running main thread, so
+%% pdb -p and sys.remote_exec attach to it; stopping the loop releases it.
+test_worker_loop_is_running_main(Config) ->
+    C = new_ctx(Config),
+    case py_context:submit_await(C, py_test_workerloop, claim_running_main, []) of
+        {ok, false} -> stop_ctx(C), {skip, "needs Python 3.14+"};
+        {ok, true} -> running_main_while_looping(C)
+    end.
+
+running_main_while_looping(C) ->
+    ok = py_context:start_loop(C),
+    {ok, false} = py_context:submit_await(C, py_test_workerloop, claim_running_main, []),
+    ok = py_context:stop_loop(C),
+    {ok, true} = py_context:submit_await(C, py_test_workerloop, claim_running_main, []),
+    stop_ctx(C),
+    ok.
