@@ -14,7 +14,9 @@ register_callbacks() ->
         end
     end),
     py_callback:register('_task_start', fun([Group, Gate, Ticket, Payload, Factory]) ->
-        safe_call(Group, {start, Gate, Ticket, Payload, Factory})
+        safe_call(Group, {start, Gate, Ticket, Payload, Factory});
+        ([Group, Gate, Ticket, Payload, Mode, Entry]) ->
+        safe_call(Group, {start_named, task_mode(Mode), Gate, Ticket, Payload, Entry})
     end),
     py_callback:register('_task_wait', fun([Group, Pid]) ->
         safe_call(Group, {wait, Pid})
@@ -41,6 +43,34 @@ safe_call(Group, Request) ->
     try gen_server:call(Group, Request, infinity)
     catch exit:Reason -> {error, {uncertain_inflight, Reason}} end.
 
+task_mode(<<"owngil">>) -> owngil;
+task_mode(<<"isolated">>) -> isolated;
+task_mode(<<"worker">>) -> worker;
+task_mode(Mode) -> Mode.
+
+validate_entry(owngil, {Module, Function}) when is_binary(Module), is_binary(Function) ->
+    case lists:all(fun python_identifier/1, binary:split(Module, <<".">>, [global]))
+         andalso python_identifier(Function) of
+        true -> ok;
+        _ -> {error, invalid_task_entry}
+    end;
+validate_entry(owngil, _) -> {error, invalid_task_entry};
+validate_entry(Mode, _) -> {error, {unsupported_task_mode, Mode}}.
+
+python_identifier(Name) ->
+    %% ID_Start/Continue with Other_ID exceptions and NFKC closure (Python XID).
+    %% U+2E2F is Pattern_Syntax despite its letter category.
+    Start = <<"[\\p{L}\\p{Nl}_\\x{1885}\\x{1886}\\x{2118}\\x{212E}]">>,
+    Continue = <<"[\\p{L}\\p{Nl}\\p{Mn}\\p{Mc}\\p{Nd}\\p{Pc}"
+                 "\\x{B7}\\x{387}\\x{1369}-\\x{1371}\\x{19DA}"
+                 "\\x{200C}\\x{200D}\\x{2118}\\x{212E}\\x{30FB}\\x{FF65}]">>,
+    Pattern = <<"\\A(?!.*\\x{2E2F})", Start/binary, Continue/binary, "*\\z">>,
+    Options = [unicode, ucp, {capture, none}],
+    try
+        re:run(Name, Pattern, Options) =:= match andalso
+        re:run(unicode:characters_to_nfkc_binary(Name), Pattern, Options) =:= match
+    catch error:badarg -> false end.
+
 init({Count, Bytes}) when is_integer(Count), Count > 0, is_integer(Bytes), Bytes > 0 ->
     process_flag(trap_exit, true),
     {ok, Sup} = py_supervision:start_link(#{strategy => one_for_one, intensity => 0,
@@ -63,6 +93,16 @@ handle_call(info, _, #{gate := Gate, sup := Sup, jobs := Jobs} = State) ->
     {reply, #{gate => py_nif:actor_gate_info(Gate), children => supervisor:which_children(Sup),
               contexts => [maps:get(ctx, Job) || Job <- maps:values(Jobs)],
               jobs => map_size(Jobs)}, State};
+handle_call({start_named, Mode, Gate, Ticket, Payload, Entry}, _, State) ->
+    case validate_entry(Mode, Entry) of
+        ok when is_binary(Payload) -> start_named(Gate, Ticket, Payload, Entry, State);
+        ok ->
+            py_nif:actor_ticket_reject(Ticket),
+            {reply, {error, invalid_task_payload}, State};
+        Error ->
+            py_nif:actor_ticket_reject(Ticket),
+            {reply, Error, State}
+    end;
 handle_call({start, Gate, Ticket, Payload, Factory}, _,
             #{gate := Gate, jobs := Jobs, max := Max, closed := false,
               sup := Sup} = State) when map_size(Jobs) < Max ->
@@ -115,6 +155,42 @@ handle_call({shutdown, Budget}, From, #{gate := Gate, jobs := Jobs, control := C
     {noreply, queue_poll(State#{jobs := Next, closed := true, closing := {From, Timer, Deadline}})};
 handle_call(_, _, State) -> {reply, {error, invalid_request}, State}.
 
+start_named(Gate, Ticket, Payload, Entry,
+            #{gate := Gate, jobs := Jobs, max := Max, closed := false, sup := Sup} = State)
+        when map_size(Jobs) < Max ->
+    case py_nif:actor_ticket_commit(Ticket, Gate, byte_size(Payload)) of
+        ok ->
+            Id = make_ref(),
+            Token = erlang:unique_integer([positive]),
+            Spec = #{id => Id,
+                     start => {py_task, start_link, [self(), owngil, Entry, Token, Ticket, Payload]},
+                     restart => temporary, shutdown => infinity},
+            case supervisor:start_child(Sup, Spec) of
+                {ok, Pid} ->
+                    {Ctx, Object, Native} = gen_server:call(Pid, info, infinity),
+                    Mon = monitor(process, Pid),
+                    Job = #{id => Id, ctx => Ctx, native => Native, object => Object,
+                            ticket => Ticket, mon => Mon, result => pending, waiters => [],
+                            ready => false, down => false, reaping => false, reaped => false,
+                            observed => false, cancel_sent => false, seal_sent => false, sealed => false},
+                    Pid ! run,
+                    {reply, {ok, Pid}, State#{jobs := Jobs#{Pid => Job}}};
+                Error ->
+                    py_nif:actor_gate_close(Gate),
+                    {reply, {error, {uncertain_inflight, Error}}, State#{closed := true}}
+            end;
+        Error -> {reply, Error, State}
+    end;
+start_named(_, Ticket, _, _, State) ->
+    py_nif:actor_ticket_reject(Ticket),
+    {reply, {error, task_slots_full_or_closed}, State}.
+
+request_cancel(#{cancel_sent := false, ready := false,
+                 object := {named, Token}, ctx := Ctx} = Job, _) ->
+    spawn(fun() ->
+        py_context:submit_await(Ctx, '_erlang_impl._tasks', cancel_entry, [Token], #{}, infinity)
+    end),
+    Job#{cancel_sent := true};
 request_cancel(#{cancel_sent := false, ready := false, object := Object} = Job, Control) ->
     %% One bounded control RPC per admitted child. Never block this owner on
     %% Python's GIL: its shutdown timer must also work during a native C call.
@@ -124,6 +200,20 @@ request_cancel(#{cancel_sent := false, ready := false, object := Object} = Job, 
     Job#{cancel_sent := true};
 request_cancel(Job, _) -> Job.
 
+seal_unstarted(Pid, true, #{seal_sent := false, ticket := Ticket,
+                          object := {named, Token}, ctx := Ctx} = Job, _) ->
+    case py_nif:actor_ticket_info(Ticket) of
+        complete -> Job;
+        reaped -> Job;
+        _ ->
+            Owner = self(),
+            spawn(fun() ->
+                Result = py_context:submit_await(Ctx, '_erlang_impl._tasks', seal_entry,
+                                                 [Token], #{}, infinity),
+                Owner ! {sealed, Pid, Result}
+            end),
+            Job#{seal_sent := true}
+    end;
 seal_unstarted(Pid, true, #{seal_sent := false, ticket := Ticket, object := Object} = Job, Control) ->
     case py_nif:actor_ticket_info(Ticket) of
         complete -> Job;
@@ -161,6 +251,8 @@ handle_info({work_result, Pid, Reply}, #{jobs := Jobs, gate := Gate} = State) ->
             {Result, Closed} = case {py_nif:actor_ticket_info(Ticket), Reply} of
                 {complete, {ok, _}} -> {Reply, maps:get(closed, State)};
                 {complete, {python_error, _}} -> {Reply, maps:get(closed, State)};
+                {complete, {cancelled}} -> {Reply, maps:get(closed, State)};
+                {complete, {remote_error, _, _}} -> {Reply, maps:get(closed, State)};
                 _ -> py_nif:actor_gate_close(Gate), {{error, {uncertain_inflight, Reply}}, true}
             end,
             {noreply, queue_poll(State#{closed := Closed,

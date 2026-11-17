@@ -6092,6 +6092,7 @@ static ErlNifFunc nif_funcs[] = {
     {"actor_ticket_info", 1, nif_actor_ticket_info, 0},
     {"actor_ticket_commit", 3, nif_actor_ticket_commit, 0},
     {"actor_ticket_reject", 1, nif_actor_ticket_reject, 0},
+    {"task_ticket_complete", 1, nif_task_ticket_complete, 0},
     {"task_ticket_reap", 2, nif_task_ticket_reap, 0},
     {"context_eval_async", 5, nif_context_eval_async, 0},
     {"context_exec_async", 4, nif_context_exec_async, 0},

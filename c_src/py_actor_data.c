@@ -114,7 +114,8 @@ static ERL_NIF_TERM nif_actor_ticket_info(ErlNifEnv *env, int argc, const ERL_NI
 }
 /* The task owner must first seal an unstarted Body under its Python lock.
  * Native cleanup ACK then proves that this context cannot dispatch it later.
- * Ordinary completion is still owned exclusively by execute's finally block. */
+ * Worker completion belongs to execute's finally block; named tasks complete
+ * only after their coordinator receives a terminal envelope. */
 static ERL_NIF_TERM nif_task_ticket_reap(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     (void)argc;
     actor_ticket_t *ticket;
@@ -137,6 +138,25 @@ static ERL_NIF_TERM nif_task_ticket_reap(ErlNifEnv *env, int argc, const ERL_NIF
     }
     pthread_mutex_unlock(&ticket->mutex);
     return error == NULL ? ATOM_OK : make_error(env, error);
+}
+static ERL_NIF_TERM nif_task_ticket_complete(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
+    actor_ticket_t *ticket;
+    if (!enif_get_resource(env, argv[0], ACTOR_TICKET_RESOURCE_TYPE, (void **)&ticket))
+        return enif_make_badarg(env);
+    pthread_mutex_lock(&ticket->mutex);
+    if (ticket->state != ACTOR_COMMITTED) {
+        pthread_mutex_unlock(&ticket->mutex);
+        return make_error(env, "ticket_not_committed");
+    }
+    ticket->state = ACTOR_COMPLETE;
+    pthread_mutex_lock(&ticket->gate->mutex);
+    ticket->gate->unsettled--;
+    pthread_mutex_unlock(&ticket->gate->mutex);
+    work_ticket_dispose(ticket->work);
+    ticket->work = NULL;
+    pthread_mutex_unlock(&ticket->mutex);
+    return ATOM_OK;
 }
 static ERL_NIF_TERM nif_actor_ticket_commit(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     (void)argc;
