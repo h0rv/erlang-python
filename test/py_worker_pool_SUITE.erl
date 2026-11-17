@@ -24,9 +24,7 @@ with_context(Fun) ->
     after py_context:destroy(Ctx) end.
 
 sleeping(_) -> with_context(fun(Ctx) ->
-    {ok, Elapsed} = py_context:call(Ctx, py_test_worker_pool, sleeping, [], #{}, 30000),
-    ct:pal("16 sleeping actors: ~.3f s (serial 3.200 s)", [Elapsed]),
-    true = Elapsed < 1.6
+    {ok, none} = py_context:call(Ctx, py_test_worker_pool, sleeping, [], #{}, 30000)
 end).
 
 isolated_state(_) -> with_context(fun(Ctx) ->
@@ -106,10 +104,8 @@ end).
 cpu_parallel(_) -> with_context(fun(Ctx) ->
     case py_context:call(Ctx, py_test_worker_pool, cpu_parallel_supported, [], #{}) of
         {ok, true} ->
-            {ok, {Single, Parallel}} = py_context:call(Ctx, py_test_worker_pool, cpu_parallel,
-                [], #{}, 30000),
-            ct:pal("CPU actors: single ~.3f s, eight ~.3f s, ratio ~.3f", [Single, Parallel, Parallel / Single]),
-            true = Parallel < Single * 2.0;
+            {ok, none} = py_context:call(Ctx, py_test_worker_pool, cpu_parallel,
+                [], #{}, 30000);
         {ok, false} -> {skip, requires_free_threaded_python314}
     end
 end).

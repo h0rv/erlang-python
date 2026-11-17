@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- Worker pool overlap regressions use rendezvous barriers and distinct thread
+  identities instead of sleep deadlines and CPU speed ratios.
+
 - Data actor calls preserve the original Python exception object and type on
   pooled workers instead of serializing it into a `RuntimeError`.
 
