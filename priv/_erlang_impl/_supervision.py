@@ -91,7 +91,7 @@ class NativeSupervisor:
         capacity: int | None,
         max_bytes: int | None,
         max_children: int | None,
-    ) -> NativeSupervisor:
+    ) -> "NativeSupervisor":
         self._check_control()
         _require_available(capacity, max_bytes, max_children)
         process = await _operation(

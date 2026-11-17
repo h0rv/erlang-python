@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Quote the supervisor return annotation so importing the event loop does not
+  raise `NameError` on Python 3.12 and 3.13.
+
 ## 5.0.1 (2026-09-22)
 
 ### Fixed
