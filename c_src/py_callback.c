@@ -3818,6 +3818,7 @@ static PyMethodDef ErlangModuleMethods[] = {
     {"_actor_abort", python_actor_abort, METH_O, "Abort only an uncommitted ticket."},
     {"_actor_complete", python_actor_complete, METH_O, "Acknowledge actual data dispatch completion."},
     {"_actor_retain", python_actor_retain, METH_O, "Retain a main-interpreter object."},
+    {"_actor_construct", python_actor_construct, METH_VARARGS, "Construct an actor-owned object exactly once."},
     {"_actor_unwrap", python_actor_unwrap, METH_O, "Recover a retained Python object."},
     {"_actor_retained_object_stats", python_actor_retained_object_stats, METH_NOARGS,
      "Snapshot retained resources and their Python value, context and environment edges."},

@@ -257,6 +257,7 @@ static int is_inline_schedule_marker(PyObject *obj);
 #include "py_util.c"
 #include "py_mem_limit.c"
 static PyObject *python_actor_retain(PyObject *self, PyObject *value);
+static PyObject *python_actor_construct(PyObject *self, PyObject *args);
 static PyObject *python_actor_unwrap(PyObject *self, PyObject *value);
 static PyObject *python_actor_take_exception(PyObject *self, PyObject *value);
 static PyObject *python_actor_retained_object_stats(PyObject *self, PyObject *unused);
@@ -6101,6 +6102,8 @@ static ErlNifFunc nif_funcs[] = {
     {"context_call", 6, nif_context_call_with_env, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"context_call_async", 7, nif_context_call_async, 0},
     {"local_object_async", 5, nif_local_object_async, 0},
+    {"actor_object_new", 0, nif_actor_object_new, 0},
+    {"actor_object_release", 1, nif_actor_object_release, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"context_cleanup_status", 1, nif_context_cleanup_status, 0},
     {"actor_gate_new", 2, nif_actor_gate_new, 0},
     {"actor_gate_info", 1, nif_actor_gate_info, 0},

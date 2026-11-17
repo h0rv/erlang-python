@@ -41,6 +41,10 @@
 
 ### Fixed
 
+- Data actor shutdown explicitly releases its Python object after native work
+  drains, including killed actors. Stale worker-heap terms no longer retain
+  actor resources until Erlang garbage collection.
+
 - Task-group admission reserves capacity while child initialization runs off
   the group server. Slow interpreter starts no longer block other results,
   waits, or admissions; failed starts release their reservation after cleanup.

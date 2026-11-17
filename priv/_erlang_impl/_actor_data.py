@@ -2,13 +2,14 @@ import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
 from threading import local
-from typing import Literal, Protocol, Self
+from typing import Literal, Protocol, Self, runtime_checkable
 
 import erlang
 
 from ._actor_common import _owned_wait, _result
 
 
+@runtime_checkable
 class DataDispatcher(Protocol):
     async def dispatch(self, payload: bytes, /) -> bytes: ...
 
@@ -82,6 +83,21 @@ def arguments(state: object, ticket: object, payload: bytes) -> object:
 
 def portable(value: object) -> object:
     return erlang._actor_retain(erlang._actor_unwrap(value))
+
+
+def initialize(factory: object, state: object) -> None:
+    erlang._actor_construct(state, factory)
+
+
+def call(state: object, ticket: object, payload: bytes) -> bytes:
+    try:
+        container = erlang._actor_unwrap(state)
+        if not isinstance(container, DataDispatcher):
+            raise TypeError("Actor factory must return a data dispatcher")
+    except BaseException:
+        erlang._actor_complete(ticket)
+        raise
+    return dispatch_worker(container, ticket, payload)
 
 
 def response(value: object) -> bytes:

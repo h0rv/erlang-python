@@ -152,6 +152,7 @@ reap_finished(Id, Generation, #{sup := Sup} = State) ->
                         #{unsettled := 0} ->
                             case lists:keymember(Id, 1, supervisor:which_children(Sup)) of
                                 false ->
+                                    ok = py_actor_registry:release(Gate),
                                     ets:delete_object(py_actor_generations, Snapshot),
                                     forget_child(Id, State);
                                 true -> State
@@ -229,7 +230,8 @@ wait_completion(Gate) ->
     case py_nif:actor_gate_wait(Gate) of
         ok -> ok;
         {ok, Ref} -> receive {actor_gate_drained, Ref} -> ok end
-    end.
+    end,
+    py_actor_registry:release(Gate).
 
 %% A committed call whose actor died before Python ran it has no completion.
 %% The lease barrier proves that no request from the dead holder can run later.

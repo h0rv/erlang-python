@@ -79,6 +79,8 @@
     submit_task_with_env/8,
     context_cleanup_status/1,
     actor_gate_new/2,
+    actor_object_new/0,
+    actor_object_release/1,
     actor_gate_info/1,
     actor_gate_wait/1,
     actor_gate_close/1,
@@ -635,6 +637,10 @@ submit_task(_LoopRef, _CallerPid, _Ref, _Module, _Func, _Args, _Kwargs) ->
 
 context_cleanup_status(_Ctx) -> ?NIF_STUB.
 actor_gate_new(_Count, _Bytes) -> ?NIF_STUB.
+-spec actor_object_new() -> reference().
+actor_object_new() -> ?NIF_STUB.
+-spec actor_object_release(reference()) -> ok.
+actor_object_release(_Object) -> ?NIF_STUB.
 actor_gate_info(_Gate) -> ?NIF_STUB.
 actor_gate_wait(_Gate) -> ?NIF_STUB.
 actor_gate_close(_Gate) -> ?NIF_STUB.

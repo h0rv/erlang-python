@@ -2,10 +2,10 @@
 -export([all/0, init_per_suite/1, end_per_suite/1,
          basic/1, cancelled/1, restart/1, ticket_orders/1, busy_kill/1,
          abandoned_commit/1, queued_abort/1, concurrent_children/1, group_kill/1,
-         callback_overflow/1, state_graphs/1]).
+         callback_overflow/1, state_graphs/1, resource_release/1, resource_busy_kill/1]).
 all() -> [basic, cancelled, restart, ticket_orders, busy_kill,
           abandoned_commit, queued_abort, concurrent_children, group_kill, callback_overflow,
-          state_graphs].
+          state_graphs, resource_release, resource_busy_kill].
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(erlang_python), Config.
 end_per_suite(_) -> application:stop(erlang_python).
@@ -31,6 +31,64 @@ end).
 basic(_) -> with_context(fun(Ctx) ->
     {ok, true} = py_context:call(Ctx, py_test_actor_data, basic, [], #{}, 10000)
 end).
+
+resource_actor(Ctx) ->
+    {ok, Factory} = py_context:eval(Ctx,
+        <<"__import__('erlang')._actor_retain(__import__('py_test_actor_data').Resource)">>),
+    {ok, Group} = py_actor_group:start_link(1),
+    unlink(Group),
+    {ok, {Actor, Generation, Gate}} = gen_server:call(Group,
+        {spawn, <<"resource">>, Factory, 1, 4, <<"temporary">>}, infinity),
+    #{object := Object, ctx := Worker} = sys:get_state(Actor),
+    {Group, Actor, Generation, Gate, Object, Worker}.
+
+assert_released(Ctx, Object, Worker) ->
+    {ok, false} = py_context:call(Ctx, py_test_actor_data, resource_alive, [], #{}),
+    {ok, true} = py_context:call(Ctx, py_test_actor_data, reference_released, [Object], #{}),
+    ok = py_nif:actor_object_release(Object),
+    true = is_process_alive(Worker).
+
+resource_release(_) -> with_context(fun(Ctx) ->
+    [begin
+        {Group, Actor, Generation, Gate, Object, Worker} = resource_actor(Ctx),
+        Ticket = reserve(Ctx, Gate, 1),
+        {ok, {ok, {bytes, <<"1">>}}} = py_callback:execute(<<"_actor_data_call">>,
+            [Actor, Gate, Ticket, <<"1">>]),
+        {ok, true} = py_context:call(Ctx, py_test_actor_data, resource_alive, [], #{}),
+        case Mode of
+            stop -> {ok, stopped} = gen_server:call(Group, {stop, <<"resource">>}, infinity);
+            kill -> {ok, killed} = gen_server:call(Group, {crash, <<"resource">>, Generation}, infinity);
+            close -> ok = gen_server:stop(Group, normal, infinity);
+            group_kill ->
+                Mon = monitor(process, Actor),
+                exit(Group, kill),
+                receive {'DOWN', Mon, process, Actor, _} -> ok end,
+                ok = py_actor_registry:release(Gate)
+        end,
+        assert_released(Ctx, Object, Worker),
+        case is_process_alive(Group) of true -> gen_server:stop(Group); false -> ok end
+    end || Mode <- [stop, kill, close, group_kill]]
+end).
+
+resource_busy_kill(_) -> with_gate(fun() -> with_context(fun(Ctx) ->
+    {Group, Actor, _, Gate, Object, Worker} = resource_actor(Ctx),
+    Ticket = reserve(Ctx, Gate, 4),
+    Parent = self(),
+    spawn(fun() ->
+        Result = try py_callback:execute(<<"_actor_data_call">>,
+            [Actor, Gate, Ticket, <<"wait">>]) catch exit:Reason -> {exit, Reason} end,
+        Parent ! {finished, Result}
+    end),
+    {ok, _} = py_callback:execute(<<"actor_data_entered">>, []),
+    exit(Actor, kill),
+    receive {finished, _} -> ok after 5000 -> error(call_survived) end,
+    {ok, true} = py_context:call(Ctx, py_test_actor_data, resource_alive, [], #{}),
+    {ok, false} = py_context:call(Ctx, py_test_actor_data, reference_released, [Object], #{}),
+    {ok, _} = py_callback:execute(<<"actor_data_release">>, []),
+    ok = py_actor_registry:release(Gate),
+    assert_released(Ctx, Object, Worker),
+    gen_server:stop(Group, normal, infinity)
+end) end).
 
 cancelled(_) -> with_gate(fun() -> with_context(fun(Ctx) ->
     {ok, true} = py_context:call(Ctx, py_test_actor_data, cancelled, [], #{}, 10000)
