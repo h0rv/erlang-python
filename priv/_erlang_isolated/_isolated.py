@@ -803,6 +803,7 @@ def install_erlang_module(runtime):
     from ._shm import SharedMemory, SharedBuffer
 
     ns = dict(
+        _task_resolve_entry=_resolve,
         call=call, async_call=async_call, send=send, whereis=whereis,
         self=self_, atom=atom, Atom=Atom, Pid=Pid, Ref=Ref, Port=Port,
         ProcessError=ProcessError, SuspensionRequired=SuspensionRequired,

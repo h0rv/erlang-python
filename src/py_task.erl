@@ -5,15 +5,23 @@
 start_link(Group, Factory, Ticket, Payload) ->
     gen_server:start_link(?MODULE, {Group, Factory, Ticket, Payload}, []).
 
-start_link(Group, owngil, Entry, Token, Ticket, Payload) ->
-    gen_server:start_link(?MODULE, {named, Group, Entry, Token, Ticket, Payload}, []).
+start_link(Group, Mode, Entry, Token, Ticket, Payload) when Mode =:= owngil; Mode =:= isolated ->
+    gen_server:start_link(?MODULE, {named, Group, Mode, Entry, Token, Ticket, Payload}, []).
 
-init({named, Group, Entry, Token, Ticket, Payload}) ->
-    {ok, Ctx} = py_context:new(#{mode => owngil, context_owner => self()}),
-    Native = py_context:get_nif_ref(Ctx),
+init({named, Group, Mode, Entry, Token, Ticket, Payload}) ->
+    Opts = case Mode of
+        isolated ->
+            process_flag(trap_exit, true),
+            #{mode => isolated, restart => false, context_owner => self(),
+              task_exit_observer => {Group, self()}};
+        owngil -> #{mode => owngil, context_owner => self()}
+    end,
+    {ok, Ctx} = py_context:new(Opts),
+    Native = case Mode of isolated -> isolated; owngil -> py_context:get_nif_ref(Ctx) end,
     {ok, none} = py_context:call(Ctx, '_erlang_impl._tasks', prepare_entry, [Token]),
+    case Mode of isolated -> ok = py_context:start_loop(Ctx); owngil -> ok end,
     Mon = monitor(process, Ctx),
-    {ok, #{group => Group, ctx => Ctx, native => Native, mon => Mon,
+    {ok, #{group => Group, ctx => Ctx, native => Native, mon => Mon, mode => Mode,
            entry => Entry, token => Token, object => {named, Token},
            ticket => Ticket, payload => Payload}};
 init({Group, Factory, Ticket, Payload}) ->
@@ -36,6 +44,18 @@ handle_cast(_, State) -> {noreply, State}.
 
 %% The group captures ownership and installs its monitor before sending run.
 %% Cancellation goes through its separate control context, never this busy turn.
+handle_info(run, #{mode := isolated, entry := {Module, Function}, token := Token,
+                   ctx := Ctx, payload := Payload} = State) ->
+    Reply = py_context:submit(Ctx, '_erlang_impl._tasks', execute_entry,
+                              [Module, Function, Token, {bytes, Payload}]),
+    case Reply of
+        {ok, Ref} -> {noreply, State#{task_ref => Ref}};
+        _ -> self() ! {named_result, Reply}, {noreply, State}
+    end;
+handle_info({async_result, Ref, Reply}, #{mode := isolated, task_ref := Ref} = State) ->
+    handle_info({named_result, Reply}, State);
+handle_info({isolated_child_exited, Ctx, Reason}, #{mode := isolated, ctx := Ctx} = State) ->
+    crashed(Reason, State);
 handle_info(run, #{entry := {Module, Function}, token := Token, ctx := Ctx,
                    payload := Payload} = State) ->
     ok = py_context:start_loop(Ctx),
@@ -65,9 +85,17 @@ handle_info(run, #{ctx := Ctx, object := Object, group := Group,
             {stop, normal, State};
         {ok, false} -> run_shared(State)
     end;
+handle_info({'DOWN', Mon, process, _, {child_exited, Reason}},
+            #{mode := isolated, mon := Mon} = State) ->
+    crashed(Reason, State);
 handle_info({'DOWN', Mon, process, _, Reason}, #{mon := Mon} = State) ->
     {stop, {context_died, Reason}, State};
 handle_info(_, State) -> {noreply, State}.
+
+crashed(Reason, #{group := Group, ticket := Ticket} = State) ->
+    ok = py_nif:task_ticket_complete(Ticket),
+    Group ! {work_result, self(), {task_crashed, Reason}},
+    {stop, normal, State}.
 
 named_result({ok, {<<"ok">>, Bytes}}, Ticket) when is_binary(Bytes) ->
     ok = py_nif:task_ticket_complete(Ticket),

@@ -5,13 +5,19 @@
          owngil_prestart_cancel/1, owngil_running_cancel/1, owngil_killed_context/1,
          owngil_missing_envelope/1, unsupported_named_mode/1, owngil_surrogate_error/1,
          owngil_unicode_identifiers/1, owngil_import_failure/1,
-         owngil_missing_attribute/1, owngil_non_entry/1, worker_rejects_async/1]).
+         owngil_missing_attribute/1, owngil_non_entry/1, worker_rejects_async/1,
+         isolated_api/1, isolated_crash/1, isolated_prestart_cancel/1, isolated_running_cancel/1,
+         isolated_shutdown/1, isolated_cancel_killed/1, isolated_result_wins/1,
+         isolated_unacknowledged_down/1, isolated_exit_timeout/1]).
 all() -> [killed_child, killed_context, killed_group, queued_ticket, killed_before_execution,
           retained_exception_lifecycle, owngil_api, owngil_parallel,
           owngil_prestart_cancel, owngil_running_cancel, owngil_killed_context,
           owngil_missing_envelope, unsupported_named_mode, owngil_surrogate_error,
           owngil_unicode_identifiers, owngil_import_failure,
-          owngil_missing_attribute, owngil_non_entry, worker_rejects_async].
+          owngil_missing_attribute, owngil_non_entry, worker_rejects_async,
+          isolated_api, isolated_crash, isolated_prestart_cancel, isolated_running_cancel, isolated_shutdown,
+          isolated_cancel_killed, isolated_result_wins, isolated_unacknowledged_down,
+          isolated_exit_timeout].
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(erlang_python),
     ok = py_import:add_path(filename:dirname(code:which(?MODULE))),
@@ -236,6 +242,12 @@ owngil_parallel(_) ->
     end).
 
 owngil_prestart_cancel(_) ->
+    named_prestart_cancel(owngil, <<"py_test_task_entries">>).
+
+isolated_prestart_cancel(_) ->
+    named_prestart_cancel(isolated, <<"py_test_isolated_task_entries">>).
+
+named_prestart_cancel(Mode, Module) ->
     with_named_group(1, fun(Source, Group, Gate) ->
         {ok, Ticket} = py_context:call(Source, py_test_actor_data, reserve, [Gate, 4]),
         ok = py_nif:actor_ticket_commit(Ticket, Gate, 4),
@@ -243,7 +255,7 @@ owngil_prestart_cancel(_) ->
         Id = make_ref(),
         Token = erlang:unique_integer([positive]),
         Spec = #{id => Id, start => {py_task, start_link,
-            [Group, owngil, {<<"py_test_task_entries">>, <<"must_not_run">>}, Token, Ticket, <<"work">>]},
+            [Group, Mode, {Module, <<"must_not_run">>}, Token, Ticket, <<"work">>]},
             restart => temporary, shutdown => infinity},
         {ok, Pid} = supervisor:start_child(Sup, Spec),
         {Ctx, Object, Native} = gen_server:call(Pid, info),
@@ -258,7 +270,7 @@ owngil_prestart_cancel(_) ->
         end),
         try
             ok = gen_server:call(Group, {cancel, Pid}),
-            wait_entry_sealed(Ctx, Token, 100),
+            wait_entry_sealed(Ctx, Module, Token, 100),
             {ok, true} = py_context:submit_await(Ctx, '_erlang_impl._tasks', seal_entry, [Token]),
             committed = py_nif:actor_ticket_info(Ticket),
             #{count := 1, unsettled := 1} = py_nif:actor_gate_info(Gate),
@@ -266,7 +278,19 @@ owngil_prestart_cancel(_) ->
         after sys:resume(Pid) end,
         {cancelled} = gen_server:call(Group, {wait, Pid}, 10000),
         complete = py_nif:actor_ticket_info(Ticket),
-        clean = py_nif:context_cleanup_status(Native)
+        case Mode of
+            isolated -> false = is_process_alive(Ctx);
+            owngil -> clean = py_nif:context_cleanup_status(Native)
+        end,
+        #{count := 0, unsettled := 0, closed := false} = py_nif:actor_gate_info(Gate),
+        {ok, Next} = start_named(Source, Group, Gate, Mode, Module, <<"echo">>, <<"reuse">>),
+        {ok, {bytes, <<"reuse">>}} = gen_server:call(Group, {wait, Next}, 5000),
+        {ok, Pending} = start_named(Source, Group, Gate, Mode, Module, <<"asleep">>, <<>>),
+        Before = erlang:monotonic_time(millisecond),
+        ok = gen_server:call(Group, {shutdown, 2000}, 3000),
+        true = erlang:monotonic_time(millisecond) - Before < 2000,
+        {cancelled} = gen_server:call(Group, {wait, Pending}, 1000),
+        #{count := 0, unsettled := 0} = py_nif:actor_gate_info(Gate)
     end).
 
 owngil_running_cancel(_) ->
@@ -323,8 +347,8 @@ unsupported_named_mode(_) ->
         {ok, Ticket} = py_context:call(Source, py_test_actor_data, reserve, [Gate, 4]),
         {error, ticket_not_committed} = py_nif:task_ticket_complete(Ticket),
         reserved = py_nif:actor_ticket_info(Ticket),
-        {error, {unsupported_task_mode, isolated}} = gen_server:call(Group,
-            {start_named, isolated, Gate, Ticket, <<"work">>, {<<"a">>, <<"b">>}}),
+        {error, {unsupported_task_mode, unsupported}} = gen_server:call(Group,
+            {start_named, unsupported, Gate, Ticket, <<"work">>, {<<"a">>, <<"b">>}}),
         aborted = py_nif:actor_ticket_info(Ticket),
         {ok, Invalid} = py_context:call(Source, py_test_actor_data, reserve, [Gate, 4]),
         {error, invalid_task_entry} = gen_server:call(Group,
@@ -342,14 +366,128 @@ with_named_group(Count, Fun) ->
     after gen_server:stop(Group, normal, infinity), py_context:destroy(Source) end.
 
 start_named(Source, Group, Gate, Function, Payload) ->
+    start_named(Source, Group, Gate, owngil, <<"py_test_task_entries">>, Function, Payload).
+
+start_named(Source, Group, Gate, Mode, Module, Function, Payload) ->
     {ok, Ticket} = py_context:call(Source, py_test_actor_data, reserve, [Gate, byte_size(Payload)]),
-    try gen_server:call(Group, {start_named, owngil, Gate, Ticket, Payload,
-                               {<<"py_test_task_entries">>, Function}}, infinity)
+    try gen_server:call(Group, {start_named, Mode, Gate, Ticket, Payload,
+                               {Module, Function}}, infinity)
     after {ok, none} = py_context:call(Source, py_test_actor_data, abort, [Ticket]) end.
 
-wait_entry_sealed(_, _, 0) -> error(cancellation_not_delivered);
-wait_entry_sealed(Ctx, Token, N) ->
-    case py_context:submit_await(Ctx, py_test_task_entries, sealed, [Token]) of
+wait_entry_sealed(_, _, _, 0) -> error(cancellation_not_delivered);
+wait_entry_sealed(Ctx, Module, Token, N) ->
+    case py_context:submit_await(Ctx, Module, sealed, [Token]) of
         {ok, true} -> ok;
-        {ok, false} -> receive after 5 -> wait_entry_sealed(Ctx, Token, N - 1) end
+        {ok, false} -> receive after 5 -> wait_entry_sealed(Ctx, Module, Token, N - 1) end
     end.
+
+isolated_api(_) ->
+    {ok, Ctx} = py_context:new(#{mode => worker, managed_loop => dedicated}),
+    try
+        ok = py_context:start_loop(Ctx),
+        {ok, true} = py_context:submit_await(Ctx, py_test_isolated_tasks, api, [], #{}, 30000)
+    after py_context:destroy(Ctx) end.
+
+isolated_start(Source, Group, Gate, Function, Payload) ->
+    start_named(Source, Group, Gate, isolated, <<"py_test_isolated_task_entries">>, Function, Payload).
+
+isolated_crash(_) ->
+    with_named_group(1, fun(Source, Group, Gate) ->
+        {ok, Pid} = isolated_start(Source, Group, Gate, <<"crash">>, <<>>),
+        #{jobs := Jobs} = sys:get_state(Group),
+        #{ticket := Ticket, ctx := Ctx} = maps:get(Pid, Jobs),
+        {task_crashed, {signal, 6}} = gen_server:call(Group, {wait, Pid}, 10000),
+        false = is_process_alive(Ctx),
+        complete = py_nif:actor_ticket_info(Ticket),
+        #{count := 0, unsettled := 0, closed := false} = py_nif:actor_gate_info(Gate),
+        {ok, Next} = isolated_start(Source, Group, Gate, <<"echo">>, <<"VM alive">>),
+        {ok, {bytes, <<"VM alive">>}} = gen_server:call(Group, {wait, Next}, 10000),
+        ok = gen_server:call(Group, {shutdown, 5000}, 10000)
+    end).
+
+isolated_callbacks(Fun) ->
+    Parent = self(),
+    py_callback:register(isolated_task_entered, fun([Payload]) -> Parent ! {entered, Payload}, ok end),
+    py_callback:register(isolated_task_finished, fun([Payload]) -> Parent ! {finished, Payload}, ok end),
+    try Fun() after
+        py_callback:unregister(isolated_task_entered),
+        py_callback:unregister(isolated_task_finished)
+    end.
+
+isolated_running_cancel(_) ->
+    isolated_callbacks(fun() -> with_named_group(1, fun(Source, Group, Gate) ->
+        {ok, Pid} = isolated_start(Source, Group, Gate, <<"waiting">>, <<"cancel">>),
+        receive {entered, <<"cancel">>} -> ok after 5000 -> error(not_running) end,
+        ok = gen_server:call(Group, {cancel, Pid}),
+        {cancelled} = gen_server:call(Group, {wait, Pid}, 10000),
+        receive {finished, <<"cancel">>} -> ok after 5000 -> error(not_cleaned) end,
+        #{count := 0, unsettled := 0, closed := false} = py_nif:actor_gate_info(Gate)
+    end) end).
+
+isolated_shutdown(_) ->
+    isolated_callbacks(fun() -> with_named_group(2, fun(Source, Group, Gate) ->
+        Pids = [begin
+            {ok, Pid} = isolated_start(Source, Group, Gate, <<"waiting">>, Payload),
+            receive {entered, Payload} -> ok after 5000 -> error(not_running) end,
+            Pid
+        end || Payload <- [<<"first">>, <<"second">>]],
+        ok = gen_server:call(Group, {shutdown, 5000}, 10000),
+        [{cancelled} = gen_server:call(Group, {wait, Pid}, 10000) || Pid <- Pids],
+        [receive {finished, Payload} -> ok after 5000 -> error(not_cleaned) end
+         || Payload <- [<<"first">>, <<"second">>]],
+        #{count := 0, unsettled := 0} = py_nif:actor_gate_info(Gate)
+    end) end).
+
+isolated_cancel_killed(_) ->
+    isolated_callbacks(fun() -> with_named_group(1, fun(Source, Group, Gate) ->
+        {ok, Pid} = isolated_start(Source, Group, Gate, <<"blocked">>, <<"blocked">>),
+        receive {entered, <<"blocked">>} -> ok after 5000 -> error(not_running) end,
+        #{jobs := Jobs} = sys:get_state(Group),
+        #{ctx := Ctx} = maps:get(Pid, Jobs),
+        ok = gen_server:call(Group, {cancel, Pid}),
+        ok = py_context:interrupt(Ctx),
+        {task_crashed, {signal, 9}} = gen_server:call(Group, {wait, Pid}, 10000),
+        #{count := 0, unsettled := 0, closed := false} = py_nif:actor_gate_info(Gate),
+        {ok, Next} = isolated_start(Source, Group, Gate, <<"echo">>, <<"after kill">>),
+        {ok, {bytes, <<"after kill">>}} = gen_server:call(Group, {wait, Next}, 10000)
+    end) end).
+
+isolated_result_wins(_) ->
+    isolated_callbacks(fun() -> with_named_group(1, fun(Source, Group, Gate) ->
+        {ok, Pid} = isolated_start(Source, Group, Gate, <<"result_then_crash">>, <<"result">>),
+        receive {entered, <<"result">>} -> ok after 5000 -> error(not_running) end,
+        #{jobs := Jobs} = sys:get_state(Group),
+        #{ctx := Ctx} = maps:get(Pid, Jobs),
+        Mon = monitor(process, Ctx),
+        ok = sys:suspend(Pid),
+        try
+            receive {'DOWN', Mon, process, Ctx, {child_exited, {signal, 6}}} -> ok
+            after 5000 -> error(child_did_not_exit) end
+        after sys:resume(Pid) end,
+        {ok, {bytes, <<"result">>}} = gen_server:call(Group, {wait, Pid}, 10000),
+        #{count := 0, unsettled := 0, closed := false} = py_nif:actor_gate_info(Gate)
+    end) end).
+
+isolated_unacknowledged_down(_) ->
+    isolated_callbacks(fun() -> with_named_group(1, fun(Source, Group, Gate) ->
+        {ok, Pid} = isolated_start(Source, Group, Gate, <<"waiting">>, <<"unknown">>),
+        receive {entered, <<"unknown">>} -> ok after 5000 -> error(not_running) end,
+        #{ctx := Ctx, mon := Mon} = sys:get_state(Pid),
+        Pid ! {'DOWN', Mon, process, Ctx, killed},
+        {error, {uncertain_inflight, _}} = gen_server:call(Group, {wait, Pid}, 10000),
+        #{count := 1, unsettled := 1, closed := true} = py_nif:actor_gate_info(Gate),
+        {error, {uncertain_inflight, shutdown_deadline}} = gen_server:call(Group, {shutdown, 100})
+    end) end).
+
+isolated_exit_timeout(_) ->
+    isolated_callbacks(fun() -> with_named_group(1, fun(Source, Group, Gate) ->
+        {ok, Pid} = isolated_start(Source, Group, Gate, <<"waiting">>, <<"timeout">>),
+        receive {entered, <<"timeout">>} -> ok after 5000 -> error(not_running) end,
+        #{ctx := Ctx} = sys:get_state(Pid),
+        {looping, Data} = sys:get_state(Ctx),
+        {stop, {child_exit_unacknowledged, {signal, 9}}, _} =
+            py_isolated:handle_event(state_timeout, exit_status, {restarting, killed}, Data),
+        {error, {uncertain_inflight, _}} = gen_server:call(Group, {wait, Pid}, 10000),
+        #{count := 1, unsettled := 1, closed := true} = py_nif:actor_gate_info(Gate),
+        {error, {uncertain_inflight, shutdown_deadline}} = gen_server:call(Group, {shutdown, 100})
+    end) end).

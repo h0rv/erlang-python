@@ -48,13 +48,14 @@ task_mode(<<"isolated">>) -> isolated;
 task_mode(<<"worker">>) -> worker;
 task_mode(Mode) -> Mode.
 
-validate_entry(owngil, {Module, Function}) when is_binary(Module), is_binary(Function) ->
+validate_entry(Mode, {Module, Function})
+        when (Mode =:= owngil orelse Mode =:= isolated), is_binary(Module), is_binary(Function) ->
     case lists:all(fun python_identifier/1, binary:split(Module, <<".">>, [global]))
          andalso python_identifier(Function) of
         true -> ok;
         _ -> {error, invalid_task_entry}
     end;
-validate_entry(owngil, _) -> {error, invalid_task_entry};
+validate_entry(Mode, _) when Mode =:= owngil; Mode =:= isolated -> {error, invalid_task_entry};
 validate_entry(Mode, _) -> {error, {unsupported_task_mode, Mode}}.
 
 python_identifier(Name) ->
@@ -95,7 +96,7 @@ handle_call(info, _, #{gate := Gate, sup := Sup, jobs := Jobs} = State) ->
               jobs => map_size(Jobs)}, State};
 handle_call({start_named, Mode, Gate, Ticket, Payload, Entry}, _, State) ->
     case validate_entry(Mode, Entry) of
-        ok when is_binary(Payload) -> start_named(Gate, Ticket, Payload, Entry, State);
+        ok when is_binary(Payload) -> start_named(Mode, Gate, Ticket, Payload, Entry, State);
         ok ->
             py_nif:actor_ticket_reject(Ticket),
             {reply, {error, invalid_task_payload}, State};
@@ -155,7 +156,7 @@ handle_call({shutdown, Budget}, From, #{gate := Gate, jobs := Jobs, control := C
     {noreply, queue_poll(State#{jobs := Next, closed := true, closing := {From, Timer, Deadline}})};
 handle_call(_, _, State) -> {reply, {error, invalid_request}, State}.
 
-start_named(Gate, Ticket, Payload, Entry,
+start_named(Mode, Gate, Ticket, Payload, Entry,
             #{gate := Gate, jobs := Jobs, max := Max, closed := false, sup := Sup} = State)
         when map_size(Jobs) < Max ->
     case py_nif:actor_ticket_commit(Ticket, Gate, byte_size(Payload)) of
@@ -163,7 +164,7 @@ start_named(Gate, Ticket, Payload, Entry,
             Id = make_ref(),
             Token = erlang:unique_integer([positive]),
             Spec = #{id => Id,
-                     start => {py_task, start_link, [self(), owngil, Entry, Token, Ticket, Payload]},
+                     start => {py_task, start_link, [self(), Mode, Entry, Token, Ticket, Payload]},
                      restart => temporary, shutdown => infinity},
             case supervisor:start_child(Sup, Spec) of
                 {ok, Pid} ->
@@ -181,7 +182,7 @@ start_named(Gate, Ticket, Payload, Entry,
             end;
         Error -> {reply, Error, State}
     end;
-start_named(_, Ticket, _, _, State) ->
+start_named(_, _, Ticket, _, _, State) ->
     py_nif:actor_ticket_reject(Ticket),
     {reply, {error, task_slots_full_or_closed}, State}.
 
@@ -200,6 +201,7 @@ request_cancel(#{cancel_sent := false, ready := false, object := Object} = Job, 
     Job#{cancel_sent := true};
 request_cancel(Job, _) -> Job.
 
+seal_unstarted(_, _, #{native := isolated} = Job, _) -> Job;
 seal_unstarted(Pid, true, #{seal_sent := false, ticket := Ticket,
                           object := {named, Token}, ctx := Ctx} = Job, _) ->
     case py_nif:actor_ticket_info(Ticket) of
@@ -228,6 +230,7 @@ seal_unstarted(Pid, true, #{seal_sent := false, ticket := Ticket, object := Obje
     end;
 seal_unstarted(_, _, Job, _) -> Job.
 
+reap_context(_, _, #{native := isolated} = Job) -> Job;
 reap_context(Pid, true, #{ctx := Ctx, native := Native, reaping := false} = Job) ->
     Owner = self(),
     spawn(fun() -> Owner ! {reaped, Pid, py_context:reap_dead(Ctx, Native)} end),
@@ -245,6 +248,12 @@ queue_poll(#{polling := false} = State) ->
 queue_poll(State) -> State.
 
 handle_cast(_, State) -> {noreply, State}.
+handle_info({task_child_exited, Pid, Ctx, _Reason}, #{jobs := Jobs} = State) ->
+    case maps:find(Pid, Jobs) of
+        {ok, #{native := isolated, ctx := Ctx} = Job} ->
+            {noreply, queue_poll(State#{jobs := Jobs#{Pid := Job#{reaped := true}}})};
+        _ -> {noreply, State}
+    end;
 handle_info({work_result, Pid, Reply}, #{jobs := Jobs, gate := Gate} = State) ->
     case maps:find(Pid, Jobs) of
         {ok, #{result := pending, ticket := Ticket} = Job} ->
@@ -253,6 +262,7 @@ handle_info({work_result, Pid, Reply}, #{jobs := Jobs, gate := Gate} = State) ->
                 {complete, {python_error, _}} -> {Reply, maps:get(closed, State)};
                 {complete, {cancelled}} -> {Reply, maps:get(closed, State)};
                 {complete, {remote_error, _, _}} -> {Reply, maps:get(closed, State)};
+                {complete, {task_crashed, _}} -> {Reply, maps:get(closed, State)};
                 _ -> py_nif:actor_gate_close(Gate), {{error, {uncertain_inflight, Reply}}, true}
             end,
             {noreply, queue_poll(State#{closed := Closed,

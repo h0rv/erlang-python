@@ -4,6 +4,16 @@
 
 ### Added
 
+- Isolated named tasks accept plain top-level async byte functions with
+  `erlang.tasks.start(..., mode="isolated")`. Each task owns a child process
+  that is never restarted or retried. Exceptions and lookup/import failures
+  return `RemoteTaskError` just as in owngil mode.
+- `TaskCrashed(reason)` reports an acknowledged child exit without a terminal
+  task reply: execution stopped, but external effects are unknown. The ticket
+  is released and the group remains usable. A cancellation request alone is
+  not an acknowledgement: a subsequent child exit is still `TaskCrashed`;
+  only a terminal cancelled reply yields `CancelledError`.
+
 - The thread running a `py_context:start_loop/1,2` loop in the main
   interpreter is marked as CPython's running main thread while the loop runs
   (Python 3.14+), so `python -m pdb -p`, `sys.remote_exec` and the Python 3.15

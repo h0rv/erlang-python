@@ -22,6 +22,7 @@ codec, shared memory wrappers and fd server helpers live in
 | `_etf.py` | ETF codec with the `py_convert.c` type mapping; opaque `Pid`, `Ref`, `Port` keep their raw bytes | no | yes |
 | `_isolated.py` | Child runtime: frame parser, reader thread, re-entrant main loop, interrupt signal, execution stack, asyncio loop, `SharedMemory` conversion, the `erlang` shim | no | yes |
 | `_shm.py` | `SharedMemory` and `SharedBuffer` over `mmap`; `from_term` cache; buffer flow control through Erlang callbacks | yes | yes |
+| `_tasks.py` | Worker factories and named async byte tasks in `owngil` or `isolated` mode; token-local cancellation and terminal result envelopes | yes | yes (named tasks only) |
 
 Conventions: modules starting with `_` are internal; user code imports
 `erlang`. Anything a mode cannot support raises `RuntimeError` with the
