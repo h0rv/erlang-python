@@ -81,6 +81,7 @@ loop, channels and servers.
 | `_erlang_impl/_etf.py` | Pure-Python ETF codec with the `py_convert.c` mapping | isolated child |
 | `_erlang_impl/_isolated.py` | Child runtime: socket frames, reader thread, re-entrant main loop, interrupt signal, asyncio loop, the `erlang` shim | isolated child |
 | `_erlang_impl/_shm.py` | `SharedMemory` and `SharedBuffer` wrappers over mmap | all |
+| `_erlang_isolated/` | Bootstrap-safe implementations of `_isolated`, `_etf`, `_shm`, `_server`; the original `_erlang_impl` paths statically re-export their APIs | isolated child and shared embedded helpers |
 | `py_isolated_child.py` | Child launcher: rlimits, parent-death signal, cgroup join, connect | isolated child |
 | `test_erlang_loop.py`, `test_async_task.py`, `test_channel_ref.py`, `tests/` | Python-side tests of the loop, tasks and channels | test |
 

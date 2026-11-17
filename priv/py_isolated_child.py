@@ -117,7 +117,7 @@ def _start_memory_watchdog(limit, runtime):
     {error, {child_exited, {memory_limit, Bytes}}}."""
     import resource
     import threading
-    from _erlang_impl._etf import Atom
+    from _erlang_isolated._etf import Atom
 
     def rss():
         r = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
@@ -182,8 +182,8 @@ def main(argv):
     except OSError as exc:
         _die('cannot connect to %s: %s' % (opts['socket'], exc))
 
-    from _erlang_impl import _isolated
-    from _erlang_impl._etf import Atom
+    from _erlang_isolated import _isolated
+    from _erlang_isolated._etf import Atom
 
     runtime = _isolated.Runtime(sock)
     _isolated.install_erlang_module(runtime)
