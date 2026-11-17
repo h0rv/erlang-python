@@ -1,6 +1,6 @@
 -module(py_task).
 -behaviour(gen_server).
--export([start_link/4, start_link/6, init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
+-export([start_link/4, start_link/6, init/1, handle_continue/2, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 start_link(Group, Factory, Ticket, Payload) ->
     gen_server:start_link(?MODULE, {Group, Factory, Ticket, Payload}, []).
@@ -8,7 +8,14 @@ start_link(Group, Factory, Ticket, Payload) ->
 start_link(Group, Mode, Entry, Token, Ticket, Payload) when Mode =:= owngil; Mode =:= isolated ->
     gen_server:start_link(?MODULE, {named, Group, Mode, Entry, Token, Ticket, Payload}, []).
 
-init({named, Group, Mode, Entry, Token, Ticket, Payload}) ->
+init(Args) ->
+    {ok, #{initializing => Args}, {continue, initialize}}.
+
+handle_continue(initialize, #{initializing := Args}) ->
+    {ok, State} = initialize(Args),
+    {noreply, State}.
+
+initialize({named, Group, Mode, Entry, Token, Ticket, Payload}) ->
     Opts = case Mode of
         isolated ->
             process_flag(trap_exit, true),
@@ -17,26 +24,36 @@ init({named, Group, Mode, Entry, Token, Ticket, Payload}) ->
         owngil -> #{mode => owngil, context_owner => self()}
     end,
     {ok, Ctx} = py_context:new(Opts),
-    Native = case Mode of isolated -> isolated; owngil -> py_context:get_nif_ref(Ctx) end,
-    {ok, none} = py_context:call(Ctx, '_erlang_impl._tasks', prepare_entry, [Token]),
-    case Mode of isolated -> ok = py_context:start_loop(Ctx); owngil -> ok end,
-    Mon = monitor(process, Ctx),
-    {ok, #{group => Group, ctx => Ctx, native => Native, mon => Mon, mode => Mode,
-           entry => Entry, token => Token, object => {named, Token},
-           ticket => Ticket, payload => Payload}};
-init({Group, Factory, Ticket, Payload}) ->
+    try
+        Native = case Mode of isolated -> isolated; owngil -> py_context:get_nif_ref(Ctx) end,
+        {ok, none} = py_context:call(Ctx, '_erlang_impl._tasks', prepare_entry, [Token]),
+        case Mode of isolated -> ok = py_context:start_loop(Ctx); owngil -> ok end,
+        Mon = monitor(process, Ctx),
+        {ok, #{group => Group, ctx => Ctx, native => Native, mon => Mon, mode => Mode,
+               entry => Entry, token => Token, object => {named, Token},
+               ticket => Ticket, payload => Payload}}
+    catch Class:Reason:Stack ->
+        py_context:destroy(Ctx),
+        erlang:raise(Class, Reason, Stack)
+    end;
+initialize({Group, Factory, Ticket, Payload}) ->
     {ok, Ctx} = py_context:new(#{mode => worker, managed_loop => dedicated, context_owner => self()}),
-    Native = py_context:get_nif_ref(Ctx),
-    {ok, Env} = py_context:create_local_env(Ctx),
-    {ok, Empty} = py_context:eval_ref(Ctx, <<"()">>, #{}, Env),
-    {ok, Kwargs} = py_context:eval_ref(Ctx, <<"{}">>, #{}, Env),
-    {ok, Object} = py_context:apply_ref(Ctx, Factory, Empty, Kwargs, Env),
-    {ok, Dispatch} = py_context:eval_ref(Ctx,
-        <<"__import__('_erlang_impl._tasks', fromlist=['execute']).execute">>, #{}, Env),
-    Mon = monitor(process, Ctx),
-    {ok, #{group => Group, ctx => Ctx, native => Native, mon => Mon, env => Env,
-           object => Object, dispatch => Dispatch, kwargs => Kwargs,
-           ticket => Ticket, payload => Payload}}.
+    try
+        Native = py_context:get_nif_ref(Ctx),
+        {ok, Env} = py_context:create_local_env(Ctx),
+        {ok, Empty} = py_context:eval_ref(Ctx, <<"()">>, #{}, Env),
+        {ok, Kwargs} = py_context:eval_ref(Ctx, <<"{}">>, #{}, Env),
+        {ok, Object} = py_context:apply_ref(Ctx, Factory, Empty, Kwargs, Env),
+        {ok, Dispatch} = py_context:eval_ref(Ctx,
+            <<"__import__('_erlang_impl._tasks', fromlist=['execute']).execute">>, #{}, Env),
+        Mon = monitor(process, Ctx),
+        {ok, #{group => Group, ctx => Ctx, native => Native, mon => Mon, env => Env,
+               object => Object, dispatch => Dispatch, kwargs => Kwargs,
+               ticket => Ticket, payload => Payload}}
+    catch Class:Reason:Stack ->
+        py_context:destroy(Ctx),
+        erlang:raise(Class, Reason, Stack)
+    end.
 
 handle_call(info, _From, #{ctx := Ctx, object := Object, native := Native} = State) ->
     {reply, {Ctx, Object, Native}, State}.
@@ -128,4 +145,5 @@ run_shared(#{ctx := Ctx, env := Env, object := Object, dispatch := Dispatch,
 
 terminate(_, #{ctx := Ctx}) ->
     _ = py_context:stop_loop(Ctx),
-    py_context:destroy(Ctx).
+    py_context:destroy(Ctx);
+terminate(_, #{initializing := _}) -> ok.

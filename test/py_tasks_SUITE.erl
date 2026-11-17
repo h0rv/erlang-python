@@ -2,7 +2,7 @@
 -export([all/0, init_per_suite/1, end_per_suite/1, init_per_testcase/2, killed_child/1,
          killed_context/1, killed_group/1, queued_ticket/1, killed_before_execution/1,
          retained_exception_lifecycle/1, owngil_api/1, owngil_parallel/1,
-         owngil_completion_latency/1,
+         owngil_completion_latency/1, slow_start/1, failed_start/1, shutdown_start/1, killed_starter/1,
          owngil_prestart_cancel/1, owngil_running_cancel/1, owngil_killed_context/1,
          owngil_missing_envelope/1, unsupported_named_mode/1, owngil_surrogate_error/1,
          owngil_unicode_identifiers/1, owngil_import_failure/1,
@@ -12,7 +12,7 @@
          isolated_unacknowledged_down/1, isolated_exit_timeout/1]).
 all() -> [killed_child, killed_context, killed_group, queued_ticket, killed_before_execution,
           retained_exception_lifecycle, owngil_api, owngil_parallel,
-          owngil_completion_latency,
+          owngil_completion_latency, slow_start, failed_start, shutdown_start, killed_starter,
           owngil_prestart_cancel, owngil_running_cancel, owngil_killed_context,
           owngil_missing_envelope, unsupported_named_mode, owngil_surrogate_error,
           owngil_unicode_identifiers, owngil_import_failure,
@@ -26,7 +26,9 @@ init_per_suite(Config) ->
     Config.
 end_per_suite(_) -> application:stop(erlang_python).
 init_per_testcase(Test, Config) ->
-    case lists:prefix("owngil_", atom_to_list(Test)) andalso not py_nif:owngil_supported() of
+    RequiresOwnGil = lists:prefix("owngil_", atom_to_list(Test)) orelse
+        lists:member(Test, [slow_start, failed_start, shutdown_start, killed_starter]),
+    case RequiresOwnGil andalso not py_nif:owngil_supported() of
         true -> {skip, "OWN_GIL requires Python 3.14+"};
         false -> Config
     end.
@@ -228,6 +230,75 @@ resolution_failure(Module, Function, Type, Message) ->
         {ok, true} = py_context:submit_await(Ctx, py_test_task_entries, resolution_failure,
                                            [Module, Function, Type, Message], #{}, 15000)
     after py_context:destroy(Ctx) end.
+
+slow_start(_) ->
+    with_named_group(2, fun(Source, Group, Gate) ->
+        {ok, Done} = start_named(Source, Group, Gate, <<"echo">>, <<"work">>),
+        {Ticket, Release} = pending_start(Source, Group, Gate),
+        try
+            #{starting := 1, jobs := 1} = gen_server:call(Group, info, 500),
+            {error, task_slots_full_or_closed} = start_named(Source, Group, Gate, <<"echo">>, <<>>),
+            {ok, {bytes, <<"work">>}} = gen_server:call(Group, {wait, Done}, 500),
+            {ok, Other} = start_named(Source, Group, Gate, <<"echo">>, <<>>),
+            {ok, {bytes, <<>>}} = gen_server:call(Group, {wait, Other}, 500)
+        after Release ! release end,
+        receive {started, Ticket, {ok, Slow}} ->
+            {ok, {bytes, <<"work">>}} = gen_server:call(Group, {wait, Slow}, 5000)
+        after 5000 -> error(start_timeout) end,
+        #{count := 0, unsettled := 0} = py_nif:actor_gate_info(Gate)
+    end).
+
+failed_start(_) ->
+    with_named_group(1, fun(Source, Group, Gate) ->
+        {ok, Factory} = py_context:eval(Source,
+            <<"__import__('erlang')._actor_retain(__import__('py_test_tasks').failed_factory)">>),
+        {ok, Ticket} = py_context:call(Source, py_test_actor_data, reserve, [Gate, 4]),
+        {error, _} = gen_server:call(Group, {start, Gate, Ticket, <<"work">>, Factory}, 5000),
+        aborted = py_nif:actor_ticket_info(Ticket),
+        #{count := 0, unsettled := 0, closed := false} = py_nif:actor_gate_info(Gate),
+        #{starting := 0, jobs := 0, children := []} = gen_server:call(Group, info, 500),
+        {ok, Pid} = start_named(Source, Group, Gate, <<"echo">>, <<>>),
+        {ok, {bytes, <<>>}} = gen_server:call(Group, {wait, Pid}, 500)
+    end).
+
+shutdown_start(_) ->
+    with_named_group(1, fun(Source, Group, Gate) ->
+        {Ticket, Release} = pending_start(Source, Group, Gate),
+        Request = gen_server:send_request(Group, {shutdown, 2000}),
+        #{starting := 1, gate := #{closed := true}} = gen_server:call(Group, info, 500),
+        Release ! release,
+        receive {started, Ticket, {error, admission_closed}} -> ok after 5000 -> error(start_timeout) end,
+        {reply, ok} = gen_server:receive_response(Request, 5000),
+        #{count := 0, unsettled := 0} = py_nif:actor_gate_info(Gate)
+    end).
+
+killed_starter(_) ->
+    with_named_group(1, fun(Source, Group, Gate) ->
+        {Ticket, Release} = pending_start(Source, Group, Gate),
+        try
+            {monitors, [{process, Starter}]} = process_info(Group, monitors),
+            exit(Starter, kill),
+            receive {started, Ticket, {error, {uncertain_inflight, {starter_died, killed}}}} -> ok
+            after 5000 -> error(start_timeout) end,
+            #{count := 1, closed := true} = py_nif:actor_gate_info(Gate),
+            {error, {uncertain_inflight, _}} = gen_server:call(Group, disposal, 500),
+            {error, {uncertain_inflight, shutdown_deadline}} = gen_server:call(Group, {shutdown, 50}, 500)
+        after Release ! release end
+    end).
+
+pending_start(Source, Group, Gate) ->
+    Parent = self(),
+    py_callback:register(task_test_slow_start, fun([]) ->
+        Parent ! {initializing, self()},
+        receive release -> ok after 5000 -> error(release_timeout) end
+    end),
+    {ok, Factory} = py_context:eval(Source,
+        <<"__import__('erlang')._actor_retain(__import__('py_test_tasks').slow_factory)">>),
+    {ok, Ticket} = py_context:call(Source, py_test_actor_data, reserve, [Gate, 4]),
+    spawn(fun() -> Parent ! {started, Ticket,
+        gen_server:call(Group, {start, Gate, Ticket, <<"work">>, Factory}, infinity)} end),
+    receive {initializing, Release} -> {Ticket, Release}
+    after 5000 -> error(initialization_timeout) end.
 
 owngil_completion_latency(_) ->
     with_named_group(1, fun(Source, Group, Gate) ->

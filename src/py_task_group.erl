@@ -80,23 +80,25 @@ init({Count, Bytes}) when is_integer(Count), Count > 0, is_integer(Bytes), Bytes
     Native = py_context:get_nif_ref(Control),
     Gate = py_nif:actor_gate_new(Count, Bytes),
     {ok, #{sup => Sup, control => Control, control_native => Native, gate => Gate, max => Count,
-           jobs => #{}, closed => false, closing => none, polling => false}}.
+           jobs => #{}, starting => #{}, closed => false, closing => none, polling => false}}.
 
 handle_call(gate, _, #{gate := Gate} = State) -> {reply, {ok, {self(), Gate}}, State};
-handle_call(disposal, _, #{control_native := Native, jobs := Jobs, gate := Gate} = State) ->
+handle_call(disposal, _, #{control_native := Native, jobs := Jobs, starting := Starting, gate := Gate} = State) ->
     py_nif:actor_gate_close(Gate),
-    Reply = case {map_size(Jobs), py_nif:actor_gate_info(Gate)} of
+    Reply = case {map_size(Jobs) + map_size(Starting), py_nif:actor_gate_info(Gate)} of
         {0, #{count := 0, unsettled := 0}} -> {ok, Native};
         _ -> {error, {uncertain_inflight, {unobserved_results, maps:keys(Jobs)}}}
     end,
     {reply, Reply, State#{closed := true}};
-handle_call(info, _, #{gate := Gate, sup := Sup, jobs := Jobs} = State) ->
+handle_call(info, _, #{gate := Gate, sup := Sup, jobs := Jobs, starting := Starting} = State) ->
     {reply, #{gate => py_nif:actor_gate_info(Gate), children => supervisor:which_children(Sup),
               contexts => [maps:get(ctx, Job) || Job <- maps:values(Jobs)],
-              jobs => map_size(Jobs)}, State};
-handle_call({start_named, Mode, Gate, Ticket, Payload, Entry}, _, State) ->
+              jobs => map_size(Jobs), starting => map_size(Starting)}, State};
+handle_call({start_named, Mode, Gate, Ticket, Payload, Entry}, From, State) ->
     case validate_entry(Mode, Entry) of
-        ok when is_binary(Payload) -> start_named(Mode, Gate, Ticket, Payload, Entry, State);
+        ok when is_binary(Payload) ->
+            Token = erlang:unique_integer([positive]),
+            begin_start(Gate, Ticket, Payload, [self(), Mode, Entry, Token, Ticket, Payload], From, State);
         ok ->
             py_nif:actor_ticket_reject(Ticket),
             {reply, {error, invalid_task_payload}, State};
@@ -104,32 +106,8 @@ handle_call({start_named, Mode, Gate, Ticket, Payload, Entry}, _, State) ->
             py_nif:actor_ticket_reject(Ticket),
             {reply, Error, State}
     end;
-handle_call({start, Gate, Ticket, Payload, Factory}, _,
-            #{gate := Gate, jobs := Jobs, max := Max, closed := false,
-              sup := Sup} = State) when map_size(Jobs) < Max ->
-    ok = py_nif:actor_ticket_commit(Ticket, Gate, byte_size(Payload)),
-    Id = make_ref(),
-    Spec = #{id => Id, start => {py_task, start_link, [self(), Factory, Ticket, Payload]},
-             restart => temporary, shutdown => infinity},
-    case supervisor:start_child(Sup, Spec) of
-        {ok, Pid} ->
-            {Ctx, Object, Native} = gen_server:call(Pid, info, infinity),
-            Mon = monitor(process, Pid),
-            Job = #{id => Id, ctx => Ctx, native => Native, object => Object,
-                    ticket => Ticket, mon => Mon, result => pending, waiters => [],
-                    ready => false, down => false, reaping => false, reaped => false,
-                    observed => false, cancel_sent => false, seal_sent => false, sealed => false},
-            Pid ! run,
-            {reply, {ok, Pid}, State#{jobs := Jobs#{Pid => Job}}};
-        Error ->
-            %% Commit happened but Python did not run. Retain uncertainty;
-            %% releasing it here would require proof across factory startup.
-            py_nif:actor_gate_close(Gate),
-            {reply, {error, {uncertain_inflight, Error}}, State#{closed := true}}
-    end;
-handle_call({start, _Gate, Ticket, _Payload, _Factory}, _, State) ->
-    py_nif:actor_ticket_reject(Ticket),
-    {reply, {error, task_slots_full_or_closed}, State};
+handle_call({start, Gate, Ticket, Payload, Factory}, From, State) ->
+    begin_start(Gate, Ticket, Payload, [self(), Factory, Ticket, Payload], From, State);
 handle_call({wait, Pid}, From, #{jobs := Jobs} = State) ->
     case maps:find(Pid, Jobs) of
         {ok, #{ready := true, result := Result}} ->
@@ -156,33 +134,27 @@ handle_call({shutdown, Budget}, From, #{gate := Gate, jobs := Jobs, control := C
     {noreply, queue_poll(State#{jobs := Next, closed := true, closing := {From, Timer, Deadline}})};
 handle_call(_, _, State) -> {reply, {error, invalid_request}, State}.
 
-start_named(Mode, Gate, Ticket, Payload, Entry,
-            #{gate := Gate, jobs := Jobs, max := Max, closed := false, sup := Sup} = State)
-        when map_size(Jobs) < Max ->
-    case py_nif:actor_ticket_commit(Ticket, Gate, byte_size(Payload)) of
-        ok ->
-            Id = make_ref(),
-            Token = erlang:unique_integer([positive]),
-            Spec = #{id => Id,
-                     start => {py_task, start_link, [self(), Mode, Entry, Token, Ticket, Payload]},
-                     restart => temporary, shutdown => infinity},
+begin_start(Gate, Ticket, Payload, Args, From,
+            #{gate := Gate, jobs := Jobs, starting := Starting, max := Max,
+              closed := false, sup := Sup} = State)
+        when map_size(Jobs) + map_size(Starting) < Max ->
+    Owner = self(),
+    Ref = make_ref(),
+    Id = make_ref(),
+    Spec = #{id => Id, start => {py_task, start_link, Args},
+             restart => temporary, shutdown => infinity},
+    {_, Mon} = spawn_monitor(fun() ->
+        Result = try
             case supervisor:start_child(Sup, Spec) of
-                {ok, Pid} ->
-                    {Ctx, Object, Native} = gen_server:call(Pid, info, infinity),
-                    Mon = monitor(process, Pid),
-                    Job = #{id => Id, ctx => Ctx, native => Native, object => Object,
-                            ticket => Ticket, mon => Mon, result => pending, waiters => [],
-                            ready => false, down => false, reaping => false, reaped => false,
-                            observed => false, cancel_sent => false, seal_sent => false, sealed => false},
-                    Pid ! run,
-                    {reply, {ok, Pid}, State#{jobs := Jobs#{Pid => Job}}};
-                Error ->
-                    py_nif:actor_gate_close(Gate),
-                    {reply, {error, {uncertain_inflight, Error}}, State#{closed := true}}
-            end;
-        Error -> {reply, Error, State}
-    end;
-start_named(_, _, Ticket, _, _, State) ->
+                {ok, Pid} -> {ok, Pid, gen_server:call(Pid, info, infinity)};
+                Error -> Error
+            end
+        catch Class:Reason -> {error, {Class, Reason}} end,
+        Owner ! {task_started, Ref, Result}
+    end),
+    Pending = #{id => Id, mon => Mon, from => From, ticket => Ticket, bytes => byte_size(Payload)},
+    {noreply, State#{starting := Starting#{Ref => Pending}}};
+begin_start(_, Ticket, _, _, _, State) ->
     py_nif:actor_ticket_reject(Ticket),
     {reply, {error, task_slots_full_or_closed}, State}.
 
@@ -242,12 +214,56 @@ reap_context(_, true, #{ctx := Ctx, native := Native, reaped := false} = Job) ->
     end;
 reap_context(_, _, Job) -> Job.
 
+fail_start(Ref, Error, #{starting := Starting, sup := Sup} = State) ->
+    #{id := Id} = maps:get(Ref, Starting),
+    Owner = self(),
+    spawn(fun() ->
+        Cleanup = case supervisor:terminate_child(Sup, Id) of
+            ok -> ok;
+            {error, not_found} -> ok;
+            Other -> Other
+        end,
+        Owner ! {task_start_failed, Ref, Error, Cleanup}
+    end),
+    State.
+
+uncertain_start(Ref, Reason, #{starting := Starting, gate := Gate} = State) ->
+    #{from := From} = maps:get(Ref, Starting),
+    py_nif:actor_gate_close(Gate),
+    gen_server:reply(From, {error, {uncertain_inflight, Reason}}),
+    State#{closed := true}.
+
 queue_poll(#{polling := false} = State) ->
     erlang:send_after(5, self(), poll),
     State#{polling := true};
 queue_poll(State) -> State.
 
 handle_cast(_, State) -> {noreply, State}.
+handle_info({task_started, Ref, Result}, #{starting := Starting, gate := Gate, jobs := Jobs} = State) ->
+    #{id := Id, mon := Mon, from := From, ticket := Ticket, bytes := Bytes} = maps:get(Ref, Starting),
+    demonitor(Mon, [flush]),
+    case Result of
+        {ok, Pid, {Ctx, Object, Native}} ->
+            case py_nif:actor_ticket_commit(Ticket, Gate, Bytes) of
+                ok ->
+                    Job = #{id => Id, ctx => Ctx, native => Native, object => Object,
+                            ticket => Ticket, mon => monitor(process, Pid), result => pending, waiters => [],
+                            ready => false, down => false, reaping => false, reaped => false,
+                            observed => false, cancel_sent => false, seal_sent => false, sealed => false},
+                    Pid ! run,
+                    gen_server:reply(From, {ok, Pid}),
+                    {noreply, State#{starting := maps:remove(Ref, Starting), jobs := Jobs#{Pid => Job}}};
+                Error -> {noreply, fail_start(Ref, Error, State)}
+            end;
+        Error -> {noreply, fail_start(Ref, Error, State)}
+    end;
+handle_info({task_start_failed, Ref, Error, ok}, #{starting := Starting} = State) ->
+    #{ticket := Ticket, from := From} = maps:get(Ref, Starting),
+    ok = py_nif:actor_ticket_reject(Ticket),
+    gen_server:reply(From, Error),
+    {noreply, queue_poll(State#{starting := maps:remove(Ref, Starting)})};
+handle_info({task_start_failed, Ref, Error, Cleanup}, State) ->
+    {noreply, uncertain_start(Ref, {Error, Cleanup}, State)};
 handle_info({task_child_exited, Pid, Ctx, _Reason}, #{jobs := Jobs} = State) ->
     case maps:find(Pid, Jobs) of
         {ok, #{native := isolated, ctx := Ctx} = Job} ->
@@ -269,15 +285,19 @@ handle_info({work_result, Pid, Reply}, #{jobs := Jobs, gate := Gate} = State) ->
                 jobs := Jobs#{Pid := Job#{result := Result}}})};
         _ -> {noreply, State}
     end;
-handle_info({'DOWN', Mon, process, Pid, Reason}, #{jobs := Jobs, gate := Gate} = State) ->
-    case maps:find(Pid, Jobs) of
-        {ok, #{mon := Mon, result := Previous} = Job} ->
-            Result = case Reason of normal -> Previous;
-                _ -> py_nif:actor_gate_close(Gate), {error, {uncertain_inflight, Reason}} end,
-            Closed = maps:get(closed, State) orelse Reason =/= normal,
-            {noreply, queue_poll(State#{closed := Closed,
-                jobs := Jobs#{Pid := Job#{down := true, result := Result}}})};
-        _ -> {noreply, State}
+handle_info({'DOWN', Mon, process, Pid, Reason}, #{jobs := Jobs, gate := Gate, starting := Starting} = State) ->
+    case [Ref || {Ref, #{mon := M}} <- maps:to_list(Starting), M =:= Mon] of
+        [Ref] -> {noreply, uncertain_start(Ref, {starter_died, Reason}, State)};
+        [] ->
+            case maps:find(Pid, Jobs) of
+                {ok, #{mon := Mon, result := Previous} = Job} ->
+                    Result = case Reason of normal -> Previous;
+                        _ -> py_nif:actor_gate_close(Gate), {error, {uncertain_inflight, Reason}} end,
+                    Closed = maps:get(closed, State) orelse Reason =/= normal,
+                    {noreply, queue_poll(State#{closed := Closed,
+                        jobs := Jobs#{Pid := Job#{down := true, result := Result}}})};
+                _ -> {noreply, State}
+            end
     end;
 handle_info({sealed, Pid, {ok, Sealed}}, #{jobs := Jobs} = State) when is_boolean(Sealed) ->
     case maps:find(Pid, Jobs) of
@@ -333,7 +353,7 @@ handle_info(poll, #{jobs := Jobs, closing := Closing, gate := Gate,
         end
     end, #{}, Jobs),
     #{count := Count, unsettled := Unsettled} = py_nif:actor_gate_info(Gate),
-    AllReady = Count =:= 0 andalso Unsettled =:= 0 andalso
+    AllReady = map_size(maps:get(starting, State)) =:= 0 andalso Count =:= 0 andalso Unsettled =:= 0 andalso
         lists:all(fun(#{ready := Ready}) -> Ready end, maps:values(Next)),
     NewClosing = case {AllReady, Closing} of
         {true, {From, Timer, _}} -> erlang:cancel_timer(Timer), gen_server:reply(From, ok), none;

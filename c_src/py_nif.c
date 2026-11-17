@@ -6079,7 +6079,7 @@ static ErlNifFunc nif_funcs[] = {
     {"owngil_apply_paths", 3, nif_owngil_apply_paths, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"execution_mode", 0, nif_execution_mode, 0},
     {"os_kill", 2, nif_os_kill, 0},
-    {"context_create", 1, nif_context_create, 0},
+    {"context_create", 1, nif_context_create, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"context_destroy", 1, nif_context_destroy, 0},
     {"context_interrupt", 1, nif_context_interrupt, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"context_set_memory_limit", 2, nif_context_set_memory_limit, 0},
