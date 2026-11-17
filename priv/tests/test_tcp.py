@@ -178,6 +178,43 @@ class _TestCreateServer:
 class _TestCreateConnection:
     """Tests for create_connection functionality."""
 
+    loop: asyncio.AbstractEventLoop
+
+    def test_tcp_nodelay(self) -> None:
+        async def main(host: str, family: socket.AddressFamily) -> None:
+            accepted = self.loop.create_future()
+
+            class ServerProtocol(asyncio.Protocol):
+                def connection_made(self, transport):
+                    accepted.set_result(transport)
+
+            server = await self.loop.create_server(
+                ServerProtocol, host, 0, family=family
+            )
+            client = None
+            peer = None
+            try:
+                client, _ = await self.loop.create_connection(
+                    asyncio.Protocol, host,
+                    server.sockets[0].getsockname()[1]
+                )
+                peer = await accepted
+                for transport in (client, peer):
+                    assert transport.get_extra_info('socket').getsockopt(
+                        socket.IPPROTO_TCP, socket.TCP_NODELAY
+                    ) == 1
+            finally:
+                if client is not None:
+                    client.close()
+                if peer is not None:
+                    peer.close()
+                server.close()
+                await server.wait_closed()
+
+        self.loop.run_until_complete(main('127.0.0.1', socket.AF_INET))
+        if socket.has_ipv6:
+            self.loop.run_until_complete(main('::1', socket.AF_INET6))
+
     def test_create_connection_basic(self):
         """Test basic TCP connection."""
         port = tb.find_free_port()

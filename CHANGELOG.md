@@ -35,6 +35,8 @@
 
 ### Fixed
 
+- TCP transports disable Nagle's algorithm, matching asyncio and avoiding
+  delayed-ACK stalls between small writes. Unix sockets are unchanged.
 - Entry module import and function resolution failures return terminal
   `RemoteTaskError` results and release the task ticket.
 - Async functions passed to worker-mode task submission are rejected before
