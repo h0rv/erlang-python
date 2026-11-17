@@ -1,10 +1,12 @@
 -module(py_worker_pool_SUITE).
 -export([all/0, init_per_suite/1, end_per_suite/1,
          sleeping/1, cpu_parallel/1, reuse/1, capacity/1, portable_env/1, callbacks/1,
-         isolated_state/1, policy_independent/1, factory_drain/1, exception_identity/1]).
+         isolated_state/1, policy_independent/1, factory_drain/1, exception_identity/1,
+         preferred_release/1, preferred_timeout/1, preferred_fifo/1, preferred_races/1]).
 
 all() -> [reuse, portable_env, capacity, callbacks, sleeping, cpu_parallel, isolated_state,
-          policy_independent, factory_drain, exception_identity].
+          policy_independent, factory_drain, exception_identity,
+          preferred_release, preferred_timeout, preferred_fifo, preferred_races].
 init_per_suite(Config) ->
     application:load(erlang_python),
     application:set_env(erlang_python, worker_pool_max, 16),
@@ -161,3 +163,101 @@ capacity(_) ->
     [Pid ! release || Pid <- Rest],
     [py_worker_pool:drain(Pid) || Pid <- Holders],
     ok.
+
+preferred_state() ->
+    First = spawn(fun barrier_worker/0),
+    Second = spawn(fun barrier_worker/0),
+    {First, Second, #{free => [Second], busy => #{First => {self(), make_ref()}},
+        queue => queue:new(), workers => [First, Second], max => 2, drains => #{}}}.
+
+barrier_worker() ->
+    receive {pool_barrier, From, Ref} -> From ! {Ref, ok}, barrier_worker() end.
+
+clean_preferred(State) ->
+    [demonitor(Mon, [flush]) || {_, Mon} <- maps:values(maps:get(busy, State))],
+    [begin erlang:cancel_timer(Timer), demonitor(Mon, [flush]) end
+        || {_, Mon, _, Timer} <- queue:to_list(maps:get(queue, State)), is_reference(Timer)],
+    [exit(Worker, kill) || Worker <- maps:get(workers, State)].
+
+preferred_release(_) ->
+    {First, Second, State} = preferred_state(),
+    Tag = make_ref(),
+    {noreply, Waiting} = py_worker_pool:handle_call({checkout, First}, {self(), Tag}, State),
+    [{_, Mon, First, Timer}] = queue:to_list(maps:get(queue, Waiting)),
+    true = is_reference(Timer),
+    [Second] = maps:get(free, Waiting),
+    {reply, ok, Served} = py_worker_pool:handle_call({checkin, First}, {self(), make_ref()}, Waiting),
+    receive {Tag, First} -> ok end,
+    false = erlang:read_timer(Timer),
+    {noreply, Served} = py_worker_pool:handle_info({preferred_timeout, Mon}, Served),
+    clean_preferred(Served).
+
+preferred_timeout(_) ->
+    {First, Second, State} = preferred_state(),
+    Tag = make_ref(),
+    {noreply, Waiting} = py_worker_pool:handle_call({checkout, First}, {self(), Tag}, State),
+    [{_, Mon, First, _}] = queue:to_list(maps:get(queue, Waiting)),
+    receive {preferred_timeout, Mon} -> ok end,
+    {noreply, Served} = py_worker_pool:handle_info({preferred_timeout, Mon}, Waiting),
+    receive {Tag, Second} -> ok end,
+    true = queue:is_empty(maps:get(queue, Served)),
+    {noreply, Served} = py_worker_pool:handle_info({preferred_timeout, Mon}, Served),
+    clean_preferred(Served).
+
+preferred_fifo(_) ->
+    {First, Second, Initial} = preferred_state(),
+    State = Initial#{free := [], busy := #{First => {self(), make_ref()}, Second => {self(), make_ref()}}},
+    A = make_ref(), B = make_ref(),
+    {noreply, One} = py_worker_pool:handle_call({checkout, First}, {self(), A}, State),
+    {noreply, Two} = py_worker_pool:handle_call({checkout, undefined}, {self(), B}, One),
+    [{_, Mon, _, _}, {_, NextMon, _, _}] = queue:to_list(maps:get(queue, Two)),
+    {noreply, Expired} = py_worker_pool:handle_info({preferred_timeout, Mon}, Two),
+    [Mon, NextMon] = [M || {_, M, _, _} <- queue:to_list(maps:get(queue, Expired))],
+    {reply, ok, ServedA} = py_worker_pool:handle_call({checkin, Second}, {self(), make_ref()}, Expired),
+    receive {A, Second} -> ok end,
+    {reply, ok, ServedB} = py_worker_pool:handle_call({checkin, Second}, {self(), make_ref()}, ServedA),
+    receive {B, Second} -> ok end,
+    clean_preferred(ServedB).
+
+preferred_races(_) ->
+    Orders = [[timeout, checkin, death], [timeout, death, checkin],
+              [checkin, timeout, death], [checkin, death, timeout],
+              [death, timeout, checkin], [death, checkin, timeout]],
+    lists:foreach(fun preferred_race/1, Orders).
+
+preferred_race(Order) ->
+    {First, _, State} = preferred_state(),
+    Caller = spawn(fun() -> receive stop -> ok end end),
+    {noreply, Waiting} = py_worker_pool:handle_call({checkout, First}, {Caller, make_ref()}, State),
+    [{_, Mon, _, Timer}] = queue:to_list(maps:get(queue, Waiting)),
+    erlang:cancel_timer(Timer),
+    Final = lists:foldl(fun(Event, Current) ->
+        Next = case Event of
+            timeout ->
+                {noreply, N} = py_worker_pool:handle_info({preferred_timeout, Mon}, Current), N;
+            checkin ->
+                {reply, ok, N} = py_worker_pool:handle_call({checkin, First}, {self(), make_ref()}, Current), N;
+            death ->
+                Watch = monitor(process, Caller),
+                exit(Caller, kill),
+                receive {'DOWN', Watch, process, Caller, _} -> ok end,
+                Held = [{Ctx, M} || {Ctx, {Pid, M}} <- maps:to_list(maps:get(busy, Current)), Pid =:= Caller],
+                DownMon = case Held of [] -> Mon; [{_, M}] -> M end,
+                {noreply, N} = py_worker_pool:handle_info({'DOWN', DownMon, process, Caller, killed}, Current),
+                case Held of
+                    [] -> N;
+                    [{Ctx, _}] ->
+                        receive {drained, Ctx, Caller} -> ok end,
+                        {noreply, Drained} = py_worker_pool:handle_info({drained, Ctx, Caller}, N), Drained
+                end
+        end,
+        Free = maps:get(free, Next),
+        length(Free) =:= length(lists:usort(Free)) orelse error(duplicate_worker),
+        [] = [W || W <- Free, maps:is_key(W, maps:get(busy, Next))],
+        Next
+    end, Waiting, Order),
+    true = queue:is_empty(maps:get(queue, Final)),
+    0 = map_size(maps:get(busy, Final)),
+    2 = length(maps:get(free, Final)),
+    {noreply, Final} = py_worker_pool:handle_info({preferred_timeout, Mon}, Final),
+    clean_preferred(Final).

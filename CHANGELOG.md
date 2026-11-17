@@ -45,6 +45,9 @@
 
 ### Changed
 
+- Busy preferred workers receive a bounded 100 ms affinity wait before fallback;
+  timed-out checkouts keep their original FIFO position.
+
 - Data actors share a node-wide worker pool instead of owning a thread each.
   Actor coroutines run on worker-local loops. The pool starts at the available
   logical CPU count, grows on demand up to `worker_pool_max` (default four times
