@@ -147,10 +147,7 @@ class _ActorTasks:
         loop = task.get_loop()
         with self.lock:
             self.tasks.setdefault(loop, set()).add(task)
-            sealed = self.sealed
         task.add_done_callback(self.finished, context=Context())
-        if sealed:
-            task.cancel()
 
     def finished(self, task: asyncio.Task[object]) -> None:
         with self.lock:
@@ -161,20 +158,23 @@ class _ActorTasks:
         if not task.cancelled():
             task.exception()
 
-    async def cancel(self, loop: asyncio.AbstractEventLoop) -> None:
+    async def cancel(
+        self, loop: asyncio.AbstractEventLoop, initial: tuple[asyncio.Task[object], ...]
+    ) -> None:
+        for task in initial:
+            task.cancel()
         while True:
             with self.lock:
                 tasks = tuple(self.tasks.get(loop, ()))
             if not tasks:
                 return
-            for task in tasks:
-                task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
 
     def close(self) -> None:
         with self.lock:
             already_closing = self.sealed
             self.sealed = True
+            initial = {loop: tuple(tasks) for loop, tasks in self.tasks.items()}
         if already_closing:
             self.closed.wait()
             return
@@ -184,7 +184,7 @@ class _ActorTasks:
             if not loops:
                 break
             for loop in loops:
-                pending = self.cancel(loop)
+                pending = self.cancel(loop, initial.pop(loop, ()))
                 if loop is _worker_loop.loop and not loop.is_running():
                     loop.run_until_complete(pending)
                 else:
@@ -251,11 +251,12 @@ def close_worker_loop() -> None:
 
 async def _shutdown_worker(loop: asyncio.AbstractEventLoop) -> None:
     current = asyncio.current_task()
+    for task in asyncio.all_tasks(loop):
+        if task is not current:
+            task.cancel()
     while pending := tuple(
         task for task in asyncio.all_tasks(loop) if task is not current
     ):
-        for task in pending:
-            task.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
     await loop.shutdown_asyncgens()
     await loop.shutdown_default_executor()

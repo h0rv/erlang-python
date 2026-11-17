@@ -86,7 +86,7 @@ class PendingActor:
             ready.set()
             await asyncio.Event().wait()
         finally:
-            await asyncio.sleep(0)
+            await asyncio.gather(asyncio.sleep(0))
             assert self.resource_ref() is self.resource
             if self.checks.state is not None:
                 assert erlang._actor_unwrap(self.checks.state) is self
@@ -251,8 +251,16 @@ async def shutdown_pending(ready: asyncio.Event) -> None:
         ready.set()
         await asyncio.Event().wait()
     finally:
+        await asyncio.gather(asyncio.sleep(0))
+        task = asyncio.create_task(shutdown_cleanup())
+        shutdown_tasks.add(task)
+        task.add_done_callback(shutdown_tasks.discard)
+
+
+async def shutdown_cleanup() -> None:
+    for _ in range(4):
         await asyncio.sleep(0)
-        shutdown_finished.set()
+    shutdown_finished.set()
 
 
 async def arm_shutdown() -> None:
