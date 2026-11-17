@@ -35,6 +35,14 @@
 
 ### Fixed
 
+- Python FD poll leases use the operating system's descriptor limit instead of
+  a process-wide 4,096-lease ceiling. Duplication failures retain their `OSError`
+  and errno, and leases still close only after selection retirement.
+- Native channel readiness waiters allocate their event credit at registration
+  without an 8,192-waiter ceiling. Preallocated wakeups do not consume the
+  separate 16,384-event unreserved queue budget; cancellation and queue drains
+  return their respective credits.
+
 - Task-group admission reserves capacity while child initialization runs off
   the group server. Slow interpreter starts no longer block other results,
   waits, or admissions; failed starts release their reservation after cleanup.
