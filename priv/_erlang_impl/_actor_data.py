@@ -1,13 +1,15 @@
 import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Literal, Protocol, Self
+from threading import local
+from typing import Literal, Protocol, Self, runtime_checkable
 
 import erlang
 
 from ._actor_common import _owned_wait, _result
 
 
+@runtime_checkable
 class DataDispatcher(Protocol):
     async def dispatch(self, payload: bytes, /) -> bytes: ...
 
@@ -79,6 +81,25 @@ def arguments(state: object, ticket: object, payload: bytes) -> object:
     return erlang._actor_retain((erlang._actor_unwrap(state), ticket, payload))
 
 
+def portable(value: object) -> object:
+    return erlang._actor_retain(erlang._actor_unwrap(value))
+
+
+def initialize(factory: object, state: object) -> None:
+    erlang._actor_construct(state, factory)
+
+
+def call(state: object, ticket: object, payload: bytes) -> bytes:
+    try:
+        container = erlang._actor_unwrap(state)
+        if not isinstance(container, DataDispatcher):
+            raise TypeError("Actor factory must return a data dispatcher")
+    except BaseException:
+        erlang._actor_complete(ticket)
+        raise
+    return dispatch_worker(container, ticket, payload)
+
+
 def response(value: object) -> bytes:
     result = erlang._actor_unwrap(value)
     if not isinstance(result, bytes):
@@ -94,6 +115,30 @@ async def dispatch(container: DataDispatcher, ticket: object, payload: bytes) ->
         return result
     finally:
         erlang._actor_complete(ticket)
+
+
+class _WorkerLoop(local):
+    def __init__(self) -> None:
+        self.loop: asyncio.AbstractEventLoop | None = None
+
+    def get(self) -> asyncio.AbstractEventLoop:
+        if self.loop is None:
+            self.loop = asyncio.new_event_loop()
+        return self.loop
+
+
+_worker_loop = _WorkerLoop()
+
+
+def dispatch_worker(container: DataDispatcher, ticket: object, payload: bytes) -> bytes:
+    return _worker_loop.get().run_until_complete(dispatch(container, ticket, payload))
+
+
+def close_worker_loop() -> None:
+    loop = _worker_loop.loop
+    if loop is not None:
+        loop.close()
+        _worker_loop.loop = None
 
 
 def _resolved(reply: object) -> tuple[object, int, object]:
@@ -187,7 +232,7 @@ class DataActorRef:
         return ActorInfo(pid.decode("ascii"), generation, count, size)
 
     async def crash(self) -> None:
-        """Kill exactly this generation and wait for its owned context and body to drain."""
+        """Kill exactly this generation and wait for its running body to drain."""
         pending = asyncio.create_task(
             erlang.async_call(
                 "_actor_group_crash", self._group, self.child_id, self.generation

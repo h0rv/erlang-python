@@ -4,6 +4,16 @@
 
 ### Added
 
+- Pooled actor regression for per-call context variable isolation and recovery
+  after exceptions while reusing the same worker thread and event loop.
+
+- Pooled actor snapshot regression covering asynchronous state callbacks,
+  serialized versioned writes, stale-write rejection and restoration after restart.
+
+- Explicit version-checked actor snapshots in local Mnesia `disc_copies` tables.
+  Writes synchronize the transaction log before acknowledgement; stale versions
+  cannot replace a newer snapshot. Queue and snapshot storage share startup.
+
 - Isolated named tasks accept plain top-level async byte functions with
   `erlang.tasks.start(..., mode="isolated")`. Each task owns a child process
   that is never restarted or retried. Exceptions and lookup/import failures
@@ -20,6 +30,17 @@
   sampling profiler attach to it.
 
 ### Changed
+
+- Data actors share a node-wide worker pool instead of owning a thread each.
+  Actor coroutines run on worker-local loops. The pool starts at the available
+  logical CPU count, grows on demand up to `worker_pool_max` (default four times
+  that count), and queues checkouts FIFO at the cap. Killing an actor drains its
+  running body before restart without destroying its worker.
+
+- Worker contexts retain one Python thread state for the lifetime of their
+  dedicated thread instead of creating one per call. Thread-local values
+  persist between calls on that context, while each call starts with a fresh
+  `contextvars` context so bindings do not leak between calls.
 
 - `ErlangSocketTransport` implements `set_protocol()` and `get_protocol()`.
   Uvicorn's WebSocket upgrade swaps the HTTP protocol for a WebSocket
@@ -42,6 +63,10 @@
   without an 8,192-waiter ceiling. Preallocated wakeups do not consume the
   separate 16,384-event unreserved queue budget; cancellation and queue drains
   return their respective credits.
+
+- Data actor shutdown explicitly releases its Python object after native work
+  drains, including killed actors. Stale worker-heap terms no longer retain
+  actor resources until Erlang garbage collection.
 
 - Task-group admission reserves capacity while child initialization runs off
   the group server. Slow interpreter starts no longer block other results,

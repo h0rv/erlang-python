@@ -24,6 +24,8 @@
     exec_eval_call_share_thread/1,
     multi_process_share_context_thread/1,
     distinct_contexts_distinct_threads/1,
+    worker_thread_state_persists/1,
+    worker_conversion_error_recovery/1,
     owngil_thread_affinity/1
 ]).
 
@@ -32,6 +34,8 @@ all() ->
         exec_eval_call_share_thread,
         multi_process_share_context_thread,
         distinct_contexts_distinct_threads,
+        worker_thread_state_persists,
+        worker_conversion_error_recovery,
         owngil_thread_affinity
     ].
 
@@ -111,6 +115,71 @@ distinct_contexts_distinct_threads(_Config) ->
             ok;
         _ ->
             {skip, "needs at least 2 contexts"}
+    end.
+
+worker_thread_state_persists(_Config) ->
+    {ok, First} = py_context:new(#{mode => worker}),
+    {ok, Second} = py_context:new(#{mode => worker}),
+    try
+        ok = py_context:exec(First, <<
+            "import contextvars, sys, threading, types\n"
+            "_state_probe = types.ModuleType('_worker_state_probe')\n"
+            "_state_probe.local = threading.local()\n"
+            "_state_probe.var = contextvars.ContextVar('worker_state', default='empty')\n"
+            "_state_probe.read = lambda: _state_probe.var.get()\n"
+            "sys.modules['_worker_state_probe'] = _state_probe\n"
+            "_state_probe.local.value = 'first'\n"
+            "_state_probe.var.set('first')\n"
+            "_state_native_id = threading.get_native_id()\n"
+        >>),
+        {ok, FirstId} = py_context:call(First, threading, get_native_id, []),
+        {ok, true} = py_context:eval(First, <<"_state_native_id == threading.get_native_id()">>, #{}),
+        {ok, <<"empty">>} = py_context:call(First, '_worker_state_probe', read, []),
+        {ok, <<"eval">>} = py_context:eval(First, <<
+            "(_state_probe.var.set('eval'), _state_probe.var.get())[1]"
+        >>, #{}),
+        {ok, <<"empty">>} = py_context:call(First, '_worker_state_probe', read, []),
+        ok = py_context:exec(Second, <<
+            "import _worker_state_probe as _state_probe\n"
+            "assert not hasattr(_state_probe.local, 'value')\n"
+            "assert _state_probe.var.get() == 'empty'\n"
+            "_state_probe.local.value = 'second'\n"
+            "_state_probe.var.set('second')\n"
+        >>),
+        {ok, SecondId} = py_context:call(Second, threading, get_native_id, []),
+        true = FirstId =/= SecondId,
+        {error, _} = py_context:eval(First, <<"(_state_probe.var.set('error'), 1 / 0)">>, #{}),
+        ok = py_context:exec(First, <<"pass">>),
+        {ok, [<<"first">>, <<"empty">>, true]} = py_context:eval(First, <<
+            "[_state_probe.local.value, _state_probe.var.get(), sys.exception() is None]"
+        >>, #{}),
+        {ok, [<<"second">>, <<"empty">>]} = py_context:eval(Second, <<
+            "[_state_probe.local.value, _state_probe.var.get()]"
+        >>, #{})
+    after
+        py_context:exec(First, <<"sys.modules.pop('_worker_state_probe', None)">>),
+        py_context:stop(First),
+        py_context:stop(Second)
+    end.
+
+worker_conversion_error_recovery(_Config) ->
+    {ok, Ctx} = py_context:new(#{mode => worker}),
+    try
+        ok = py_context:exec(Ctx, <<
+            "def _pta_surrogate():\n"
+            "    return '\\ud800'\n"
+            "def _pta_valid():\n"
+            "    return len([])\n"
+        >>),
+        {ok, 0} = py_context:call(Ctx, builtins, len, [[]]),
+        {ok, error} = py_context:call(Ctx, '__main__', '_pta_surrogate', []),
+        {ok, 0} = py_context:call(Ctx, '__main__', '_pta_valid', []),
+        {error, {'ZeroDivisionError', _}} = py_context:eval(Ctx, <<"1 / 0">>, #{}),
+        {error, {'TypeError', _}} = py_context:call(Ctx, builtins, len, [123]),
+        {error, {'ValueError', _}} = py_context:exec(Ctx, <<"raise ValueError('expected')">>),
+        {ok, 0} = py_context:call(Ctx, builtins, len, [[]])
+    after
+        py_context:stop(Ctx)
     end.
 
 owngil_thread_affinity(_Config) ->

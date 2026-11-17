@@ -1,10 +1,10 @@
 -module(py_actor_temporary_SUITE).
 -export([all/0, init_per_suite/1, end_per_suite/1,
          natural_cycles/1, failed_cycles/1, killed_cycles/1, stale_generation/1,
-         busy_actor/1, busy_context/1, unsettled_blocks/1]).
+         busy_actor/1, unsettled_blocks/1]).
 
 all() -> [natural_cycles, failed_cycles, killed_cycles, stale_generation,
-          busy_actor, busy_context, unsettled_blocks].
+          busy_actor, unsettled_blocks].
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(erlang_python), Config.
 end_per_suite(_) -> application:stop(erlang_python).
@@ -24,7 +24,7 @@ with_group(Fun) ->
 child(Group, Factory, Id) ->
     {ok, {Actor, Generation, Gate}} = gen_server:call(Group,
         {spawn, Id, Factory, 1, 4, <<"temporary">>}, infinity),
-    [{_, Actor, Generation, Gate, Owned, _}] = ets:lookup(py_actor_generations, {Group, Id}),
+    #{ctx := Owned} = sys:get_state(Actor),
     {Actor, Generation, Gate, Owned}.
 
 reserve(Ctx, Gate, Bytes) ->
@@ -44,10 +44,9 @@ cycles(Reason) -> with_group(fun(Ctx, Group, Factory) ->
         {ok, {ok, {bytes, <<"1">>}}} = py_callback:execute(<<"_actor_data_call">>,
             [Actor, Gate, Ticket, <<"1">>]),
         ActorMon = monitor(process, Actor),
-        ContextMon = monitor(process, Owned),
         case Reason of normal -> gen_server:stop(Actor, normal, infinity);
             _ -> exit(Actor, Reason) end,
-        down(Actor, ActorMon), down(Owned, ContextMon),
+        down(Actor, ActorMon), true = is_process_alive(Owned),
         #{sup := Sup} = sys:get_state(Group),
         [] = supervisor:which_children(Sup),
         %% The NEXT spawn must recover automatically, without group.stop.
@@ -56,31 +55,30 @@ cycles(Reason) -> with_group(fun(Ctx, Group, Factory) ->
     await_empty(Group, 1000),
     {ok, stopped} = gen_server:call(Group, {stop, <<"x">>}),
     {Actor, _, _, Owned} = child(Group, Factory, <<"x">>),
-    ActorMon = monitor(process, Actor), ContextMon = monitor(process, Owned),
+    ActorMon = monitor(process, Actor),
     %% Explicit stop also copes with OTP deleting its temporary child spec.
     {ok, stopped} = gen_server:call(Group, {stop, <<"x">>}, infinity),
-    down(Actor, ActorMon), down(Owned, ContextMon),
+    down(Actor, ActorMon), true = is_process_alive(Owned),
     {_, _, _, _} = child(Group, Factory, <<"y">>)
 end).
 
 stale_generation(_) -> with_group(fun(_Ctx, Group, Factory) ->
     {Old, Generation, _, Owned} = child(Group, Factory, <<"x">>),
-    Mon = monitor(process, Owned),
-    exit(Old, kill), down(Owned, Mon),
-    {New, Current, Gate, NewCtx} = child(Group, Factory, <<"x">>),
+    Mon = monitor(process, Old),
+    exit(Old, kill), down(Old, Mon),
+    true = is_process_alive(Owned),
+    {New, Current, Gate, _NewCtx} = child(Group, Factory, <<"x">>),
     true = Current > Generation,
     %% The old DOWN and delayed drain check can arrive after ID reuse.
     Group ! {{temporary, <<"x">>, Generation}, make_ref(), process, Old, killed},
     Group ! {reap_temporary, <<"x">>, Generation},
     #{ids := [<<"x">>]} = sys:get_state(Group),
-    [{_, New, Current, Gate, NewCtx, _}] = ets:lookup(py_actor_generations, {Group, <<"x">>}),
+    [{_, New, Current, Gate}] = ets:lookup(py_actor_generations, {Group, <<"x">>}),
     {ok, {New, Current, Gate}} = gen_server:call(Group, {resolve, <<"x">>}),
     blocked(Group, Factory)
 end).
 
-busy_actor(_) -> busy(actor).
-busy_context(_) -> busy(context).
-busy(Victim) -> with_group(fun(Ctx, Group, Factory) ->
+busy_actor(_) -> with_group(fun(Ctx, Group, Factory) ->
     {Actor, _, Gate, Owned} = child(Group, Factory, <<"x">>),
     Parent = self(),
     ok = py_callback:register(actor_data_gate, fun([]) ->
@@ -95,19 +93,16 @@ busy(Victim) -> with_group(fun(Ctx, Group, Factory) ->
             Parent ! {finished, Result}
         end),
         Callback = receive {entered, Pid} -> Pid after 5000 -> error(entry_timeout) end,
-        ActorMon = monitor(process, Actor), ContextMon = monitor(process, Owned),
-        case Victim of actor -> exit(Actor, kill); context -> exit(Owned, kill) end,
+        ActorMon = monitor(process, Actor),
+        exit(Actor, kill),
         down(Actor, ActorMon),
         #{sup := Sup} = sys:get_state(Group),
         [] = supervisor:which_children(Sup),
-        case Victim of
-            actor -> true = is_process_alive(Owned);
-            context -> down(Owned, ContextMon)
-        end,
+        true = is_process_alive(Owned),
         #{unsettled := 1, count := 1} = py_nif:actor_gate_info(Gate),
         blocked(Group, Factory),
         Callback ! release,
-        case Victim of actor -> down(Owned, ContextMon); context -> ok end,
+        true = is_process_alive(Owned),
         receive {finished, _} -> ok after 5000 -> error(call_survived) end,
         await_empty(Group, 1000),
         #{unsettled := 0, count := 0} = py_nif:actor_gate_info(Gate),
@@ -119,8 +114,9 @@ unsettled_blocks(_) -> with_group(fun(Ctx, Group, Factory) ->
     {Actor, Generation, Gate, Owned} = child(Group, Factory, <<"x">>),
     Ticket = reserve(Ctx, Gate, 1),
     ok = py_nif:actor_ticket_commit(Ticket, Gate, 1),
-    Mon = monitor(process, Owned),
-    exit(Actor, kill), down(Owned, Mon),
+    Mon = monitor(process, Actor),
+    exit(Actor, kill), down(Actor, Mon),
+    true = is_process_alive(Owned),
     #{sup := Sup} = sys:get_state(Group),
     [] = supervisor:which_children(Sup),
     %% No Python completion acknowledgment exists yet. Death alone must not

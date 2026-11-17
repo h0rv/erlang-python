@@ -5,6 +5,9 @@ typedef struct {
     PyObject *value;
     py_context_t *ctx;
     py_env_resource_t *env;
+    bool actor_owned;
+    bool released;
+    pthread_mutex_t mutex;
 } local_object_t;
 
 static ErlNifResourceType *LOCAL_OBJECT_RESOURCE_TYPE;
@@ -42,6 +45,7 @@ static PyObject *python_actor_retain(PyObject *self, PyObject *value) {
     ref->value = Py_NewRef(value);
     ref->ctx = NULL;
     ref->env = NULL;
+    ref->actor_owned = false;
     atomic_fetch_add(&local_object_count, 1);
     atomic_fetch_add(&local_object_value_count, 1);
     PyObject *capsule = PyCapsule_New(ref, LOCAL_OBJECT_CAPSULE,
@@ -58,6 +62,14 @@ static PyObject *python_actor_unwrap(PyObject *self, PyObject *value) {
     }
     local_object_t *ref = PyCapsule_GetPointer(value, LOCAL_OBJECT_CAPSULE);
     if (ref == NULL) return NULL;
+    if (ref->actor_owned) {
+        pthread_mutex_lock(&ref->mutex);
+        PyObject *result = Py_XNewRef(ref->value);
+        pthread_mutex_unlock(&ref->mutex);
+        if (result == NULL)
+            PyErr_SetString(PyExc_RuntimeError, "Actor object is uninitialized or released");
+        return result;
+    }
     if (ref->value == NULL) {
         PyErr_SetString(PyExc_RuntimeError, "Retained result was already transferred");
         return NULL;
@@ -136,6 +148,74 @@ static void local_object_destructor(ErlNifEnv *env, void *resource) {
     }
     if (ref->env != NULL) enif_release_resource(ref->env);
     if (ref->ctx != NULL) enif_release_resource(ref->ctx);
+    if (ref->actor_owned) pthread_mutex_destroy(&ref->mutex);
+}
+
+static ERL_NIF_TERM nif_actor_object_new(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
+    (void)argv;
+    local_object_t *ref = enif_alloc_resource(LOCAL_OBJECT_RESOURCE_TYPE, sizeof(*ref));
+    if (ref == NULL) return make_error(env, "alloc_failed");
+    memset(ref, 0, sizeof(*ref));
+    atomic_fetch_add(&local_object_count, 1);
+    if (pthread_mutex_init(&ref->mutex, NULL) != 0) {
+        enif_release_resource(ref);
+        return make_error(env, "alloc_failed");
+    }
+    ref->actor_owned = true;
+    ERL_NIF_TERM term = enif_make_resource(env, ref);
+    enif_release_resource(ref);
+    return term;
+}
+
+static PyObject *python_actor_construct(PyObject *self, PyObject *args) {
+    PyObject *capsule, *factory_capsule;
+    if (!PyArg_ParseTuple(args, "OO", &capsule, &factory_capsule)) return NULL;
+    if (PyInterpreterState_GetID(PyInterpreterState_Get()) != 0) {
+        PyErr_SetString(PyExc_RuntimeError, "Actors require the main interpreter");
+        return NULL;
+    }
+    local_object_t *ref = PyCapsule_GetPointer(capsule, LOCAL_OBJECT_CAPSULE);
+    if (ref == NULL) return NULL;
+    if (!ref->actor_owned) {
+        PyErr_SetString(PyExc_TypeError, "Expected an actor-owned reference");
+        return NULL;
+    }
+    PyObject *factory = python_actor_unwrap(self, factory_capsule);
+    if (factory == NULL) return NULL;
+    PyObject *value = PyObject_CallNoArgs(factory);
+    Py_DECREF(factory);
+    if (value == NULL) return NULL;
+    pthread_mutex_lock(&ref->mutex);
+    bool available = !ref->released && ref->value == NULL;
+    if (available) {
+        ref->value = Py_NewRef(value);
+        atomic_fetch_add(&local_object_value_count, 1);
+    }
+    pthread_mutex_unlock(&ref->mutex);
+    Py_DECREF(value);
+    if (!available) {
+        PyErr_SetString(PyExc_RuntimeError, "Actor object is initialized or released");
+        return NULL;
+    }
+    Py_RETURN_NONE;
+}
+
+static ERL_NIF_TERM nif_actor_object_release(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
+    local_object_t *ref;
+    if (!enif_get_resource(env, argv[0], LOCAL_OBJECT_RESOURCE_TYPE, (void **)&ref) ||
+        !ref->actor_owned) return enif_make_badarg(env);
+    PyGILState_STATE gil = PyGILState_Ensure();
+    pthread_mutex_lock(&ref->mutex);
+    PyObject *value = ref->value;
+    ref->value = NULL;
+    ref->released = true;
+    pthread_mutex_unlock(&ref->mutex);
+    if (value != NULL) atomic_fetch_sub(&local_object_value_count, 1);
+    Py_XDECREF(value);
+    PyGILState_Release(gil);
+    return ATOM_OK;
 }
 
 /* Takes ownership of value, including on allocation failure. GIL held. */
@@ -150,6 +230,7 @@ static ERL_NIF_TERM local_object_result(py_context_t *ctx, py_env_resource_t *en
     ref->value = value;
     ref->ctx = ctx;
     ref->env = env;
+    ref->actor_owned = false;
     atomic_fetch_add(&local_object_count, 1);
     atomic_fetch_add(&local_object_value_count, 1);
     atomic_fetch_add(&local_object_context_count, 1);

@@ -1,5 +1,8 @@
 import asyncio
-from contextlib import suppress
+import tempfile
+from contextlib import ExitStack, suppress
+from io import BufferedRandom
+from weakref import ReferenceType, ref
 
 import erlang
 from erlang.actors import ActorGenerationChanged, ActorOverloaded, DataActorGroup
@@ -19,6 +22,30 @@ class Counter:
         else:
             self.value += int(payload)
         return str(self.value).encode()
+
+
+resources: list[ReferenceType[BufferedRandom]] = []
+
+
+class Resource(Counter):
+    def __init__(self) -> None:
+        super().__init__()
+        with ExitStack() as files:
+            self.file = files.enter_context(tempfile.TemporaryFile())
+            self.resources = files.pop_all()
+        resources.append(ref(self.file))
+
+
+def resource_alive() -> bool:
+    return resources[-1]() is not None
+
+
+def reference_released(state: object) -> bool:
+    try:
+        erlang._actor_unwrap(state)
+    except RuntimeError:
+        return True
+    return False
 
 
 def reserve(gate: object, size: int) -> object:

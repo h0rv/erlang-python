@@ -17,6 +17,10 @@ exercised by suites). Guides are in `docs/`, suites in `test/`. Start with
 | `py_context_embedded` | Process body for `worker` and `owngil` mode: the receive loop, callbacks (suspension and pipe), worker loops | live | architecture, state-machines | same |
 | `py_isolated` | `gen_statem` driving a child process over the socket; restart policy | live | isolated | `py_isolated_*_SUITE` |
 | `py_context_router` | Pools and scheduler-affinity routing | live | pools, context-affinity | `py_context_router_SUITE`, `py_pool_SUITE` |
+| `py_worker_pool` | Node-wide worker leases, preferred-worker affinity, FIFO checkout and holder-death barriers | live | workers | `py_worker_pool_SUITE`, `py_actor_data_SUITE`, `py_actor_temporary_SUITE` |
+| `py_data_actor` | Serial data actor dispatch on leased workers | live | | `py_actor_data_SUITE`, `py_actor_temporary_SUITE` |
+| `py_actor_group` | Actor generations, admission and completion-based restart boundaries | live | | `py_actor_data_SUITE`, `py_actor_temporary_SUITE` |
+| `py_actor_registry` | Generation table and explicit actor-object release after native drain | live | | `py_actor_data_SUITE` |
 | `py_context_sup`, `py_context_init` | Supervisor of contexts; starts the default pool at boot | live | pools | (through the above) |
 | `py_nif` | Erlang stubs and docs for every NIF | live | api-reference | all |
 | `py_callback` | Registry of Erlang funs callable as `erlang.call('name', ...)` | live | README (callbacks) | `py_callback_encoding_SUITE`, `py_thread_callback_SUITE` |
@@ -32,6 +36,8 @@ exercised by suites). Guides are in `docs/`, suites in `test/`. Start with
 | `py_import` | Registry of imports and `sys.path` entries applied to every interpreter | live | imports | `py_import_SUITE` |
 | `py_preload` | Code run once per interpreter at start | live | preload | `py_preload_SUITE` |
 | `py_state` | Shared key/value store visible from Python as `erlang.state_get/set/delete/keys` | live | README (shared state) | `py_state_SUITE` |
+| `py_actor_state` | Explicit versioned actor snapshots, local disk transactions and log sync | live | | `py_actor_state_SUITE` |
+| `py_mnesia` | Shared directory-checked Mnesia schema startup | live | | `py_actor_state_SUITE`, `py_durable_queue_SUITE` |
 | `py_semaphore` | ETS counting semaphore for rate limiting | live | scalability | (through `py_SUITE`) |
 | `py_logger`, `py_tracer` | Python `logging` into Erlang logger; tracing hooks | live | logging | `py_logging_SUITE` |
 | `erlang_python_app`, `erlang_python_sup` | Application start and the supervision tree | live | architecture | all |
@@ -49,6 +55,8 @@ files. Editing `py_convert.c` alone does not compile it alone; build with
 | `py_nif.c` | Runtime init, context creation and destruction, the request queue and the two context thread mains, the process-per-context NIFs (`nif_context_*`), process-local envs, `py_ref`, the NIF table | live |
 | `py_convert.c` | `py_to_term` / `term_to_py`, the type mapping, tagged tuples (`{bytes, B}`, shared handles) | live |
 | `py_exec.c` | Execution mode detection and GIL helpers | live |
+| `py_actor_data.c` | Actor admission tickets and event-driven gate completion notifications | live |
+| `py_work_admission.c`, `py_work_admission.h` | Native bounded admission accounting and owner monitoring | live |
 | `py_callback.c` | The `erlang` Python module: `call`, `send`, `whereis`, `Atom`/`Pid`/`Ref` types, schedule markers, callback pipes, channel and shared dict methods | live |
 | `py_thread_worker.c` | Python threads calling Erlang through `py_thread_handler` | live |
 | `py_subinterp_thread.c` | Sub-interpreter thread pool used by owngil contexts and loop pools | live |
@@ -73,6 +81,7 @@ loop, channels and servers.
 | `_erlang_impl/__init__.py` | Public surface of `erlang` in embedded modes: `run`, `sleep`, `spawn_task`, loop policy, `atom`, channels, `server` | embedded |
 | `_erlang_impl/_loop.py`, `_policy.py`, `_transport.py` | `ErlangEventLoop` (uvloop-compatible) over `enif_select` | embedded |
 | `_erlang_impl/_supervision.py` | Supervisor facade; event-loop import compatibility covered by `py_import_SUITE` | embedded |
+| `_erlang_impl/_actor_data.py` | Byte actor facade and worker-local coroutine dispatch | embedded |
 | `_erlang_impl/_reactor.py` | Protocol-based reactor over fds Erlang owns | embedded |
 | `_erlang_impl/_channel.py`, `_byte_channel.py` | Python side of channels | embedded |
 | `_erlang_impl/_server.py` | `serve`, `adopt`, `stop_serving` on fds handed over by Erlang; plain asyncio, works in every mode | all |

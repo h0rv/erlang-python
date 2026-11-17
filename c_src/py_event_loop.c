@@ -3200,6 +3200,31 @@ static void send_task_failure(ErlNifEnv *term_env, ErlNifPid *caller_pid,
     enif_free_env(msg_env);
 }
 
+static bool processing_loop_stopped(erlang_event_loop_t *loop, PyObject *owner,
+                                    uint64_t generation) {
+    pthread_mutex_lock(&loop->mutex);
+    bool stopped = loop->shutdown || !loop->py_loop_valid ||
+        loop->py_loop != owner || loop->py_owner_generation != generation;
+    pthread_mutex_unlock(&loop->mutex);
+    return stopped;
+}
+
+static void fail_stopped_tasks(erlang_event_loop_t *loop, dequeued_task_t *tasks,
+                               int first, int count) {
+    PyErr_Clear();
+    for (int i = first; i < count; i++) {
+        ErlNifEnv *term_env = tasks[i].term_env;
+        const ERL_NIF_TERM *fields;
+        int arity;
+        ErlNifPid caller;
+        if (enif_get_tuple(term_env, tasks[i].task_term, &arity, &fields) &&
+            (arity == 6 || arity == 7) && enif_get_local_pid(term_env, fields[0], &caller)) {
+            send_task_failure(term_env, &caller, fields[1], "loop_stopped");
+        }
+        return_pooled_env(loop, term_env);
+    }
+}
+
 /**
  * process_ready_tasks(LoopRef) -> ok | {error, Reason}
  *
@@ -3435,8 +3460,19 @@ ERL_NIF_TERM nif_process_ready_tasks(ErlNifEnv *env, int argc,
         loop->py_cache_valid = true;
     }
 
+    PyObject *py_loop = NULL;
+    uint64_t owner_generation = 0;
+    int task_idx = 0;
+    ERL_NIF_TERM result = ATOM_OK;
+    bool python_more = false;
+
     /* Lazy loop creation (uvloop-style): create Python loop on first use */
-    if (!loop->py_loop_valid || loop->py_loop == NULL) {
+    pthread_mutex_lock(&loop->mutex);
+    bool stopped = loop->shutdown;
+    bool needs_loop = !loop->py_loop_valid || loop->py_loop == NULL;
+    pthread_mutex_unlock(&loop->mutex);
+    if (stopped) goto processing_stopped;
+    if (needs_loop) {
         if (num_tasks == 0) {
             /* Nothing to schedule and no Python loop to run callbacks in:
              * the pending events stay queued for whoever polls this loop
@@ -3516,6 +3552,17 @@ ERL_NIF_TERM nif_process_ready_tasks(ErlNifEnv *env, int argc,
         Py_DECREF(new_loop);
     }
 
+    /* Python calls can release the GIL and let the driver close its owner.
+     * Pin the receiver under the same mutex as _clear_loop_ref; never reload
+     * the field after checking it. The generation fences release/rebind. */
+    pthread_mutex_lock(&loop->mutex);
+    if (!loop->shutdown && loop->py_loop_valid) {
+        py_loop = Py_XNewRef(loop->py_loop);
+        owner_generation = loop->py_owner_generation;
+    }
+    pthread_mutex_unlock(&loop->mutex);
+    if (py_loop == NULL) goto processing_stopped;
+
     /* ========================================================================
      * Set event loop in current thread's context (dirty NIF scheduler fix)
      *
@@ -3528,7 +3575,7 @@ ERL_NIF_TERM nif_process_ready_tasks(ErlNifEnv *env, int argc,
      * Note: events_module is already cached, no need to import again.
      * ======================================================================== */
     /* Set our loop as current event loop for this thread */
-    PyObject *set_result = PyObject_CallMethod(asyncio, "set_event_loop", "O", loop->py_loop);
+    PyObject *set_result = PyObject_CallMethod(asyncio, "set_event_loop", "O", py_loop);
     Py_XDECREF(set_result);
 
     /* Save and set running loop (needed for asyncio.Task creation) */
@@ -3537,14 +3584,14 @@ ERL_NIF_TERM nif_process_ready_tasks(ErlNifEnv *env, int argc,
         PyErr_Clear();
         old_running_loop = Py_NewRef(Py_None);
     }
-    PyObject *set_running = PyObject_CallMethod(events_module, "_set_running_loop", "O", loop->py_loop);
+    PyObject *set_running = PyObject_CallMethod(events_module, "_set_running_loop", "O", py_loop);
     Py_XDECREF(set_running);
 
     /* Process all dequeued tasks */
-    ERL_NIF_TERM result = ATOM_OK;
     int coros_scheduled = 0;  /* Track if any coroutines were scheduled */
 
-    for (int task_idx = 0; task_idx < num_tasks; task_idx++) {
+    for (; task_idx < num_tasks; task_idx++) {
+        if (processing_loop_stopped(loop, py_loop, owner_generation)) goto processing_stopped;
         ErlNifEnv *term_env = tasks[task_idx].term_env;
         ERL_NIF_TERM task_term = tasks[task_idx].task_term;
 
@@ -3610,6 +3657,11 @@ ERL_NIF_TERM nif_process_ready_tasks(ErlNifEnv *env, int argc,
         /* Fallback to process namespace and cache/import */
         if (func == NULL) {
             func = get_function_for_task(loop, ns, module_name, func_name);
+        }
+
+        if (processing_loop_stopped(loop, py_loop, owner_generation)) {
+            Py_XDECREF(func);
+            goto processing_stopped;
         }
 
         if (func == NULL) {
@@ -3683,6 +3735,13 @@ ERL_NIF_TERM nif_process_ready_tasks(ErlNifEnv *env, int argc,
         /* Check if result is a coroutine (direct C API, avoids method call overhead) */
         bool is_coro = PyCoro_CheckExact(coro);
 
+        if (is_coro && processing_loop_stopped(loop, py_loop, owner_generation)) {
+            PyObject *closed = PyObject_CallMethod(coro, "close", NULL);
+            Py_XDECREF(closed);
+            Py_DECREF(coro);
+            goto processing_stopped;
+        }
+
         /* Create caller PID object */
         extern PyTypeObject ErlangPidType;
         ErlangPidObject *pid_obj = PyObject_New(ErlangPidObject, &ErlangPidType);
@@ -3717,8 +3776,8 @@ ERL_NIF_TERM nif_process_ready_tasks(ErlNifEnv *env, int argc,
             if (wrapped_coro != NULL) {
                 bool construction_attempted = false;
                 PyObject *task = admitted
-                    ? work_admission_create_task(loop->py_loop, wrapped_coro, &construction_attempted)
-                    : PyObject_CallMethod(loop->py_loop, "create_task", "O", wrapped_coro);
+                    ? work_admission_create_task(py_loop, wrapped_coro, &construction_attempted)
+                    : PyObject_CallMethod(py_loop, "create_task", "O", wrapped_coro);
                 if (task != NULL) {
                     if (completion != NULL) {
                         PyObject *attached = PyObject_CallMethod(task, "add_done_callback", "O", completion);
@@ -3729,8 +3788,11 @@ ERL_NIF_TERM nif_process_ready_tasks(ErlNifEnv *env, int argc,
                     }
                     coros_scheduled++;
                 } else {
-                    if (admitted)
-                        send_task_failure(term_env, &caller_pid, tuple_elems[1], "task_creation_failed");
+                    bool retired = processing_loop_stopped(loop, py_loop, owner_generation);
+                    if (retired) PyErr_Clear();
+                    if (admitted || retired)
+                        send_task_failure(term_env, &caller_pid, tuple_elems[1],
+                                          retired ? "loop_stopped" : "task_creation_failed");
                     if (!construction_attempted) {
                         if (completion != NULL) work_completion_not_started(completion);
                         PyObject *closed = PyObject_CallMethod(wrapped_coro, "close", NULL);
@@ -3790,7 +3852,12 @@ ERL_NIF_TERM nif_process_ready_tasks(ErlNifEnv *env, int argc,
      * If so, skip calling _run_once - the running loop will handle events itself
      * when poll_events_wait returns. Calling _run_once on a running loop is not
      * safe because _run_once is not reentrant. */
-    PyObject *is_running = PyObject_CallMethod(loop->py_loop, "is_running", NULL);
+    if (processing_loop_stopped(loop, py_loop, owner_generation)) goto processing_stopped;
+    PyObject *is_running = PyObject_CallMethod(py_loop, "is_running", NULL);
+    if (processing_loop_stopped(loop, py_loop, owner_generation)) {
+        Py_XDECREF(is_running);
+        goto processing_stopped;
+    }
     if (is_running != NULL) {
         int running = PyObject_IsTrue(is_running);
         Py_DECREF(is_running);
@@ -3801,6 +3868,7 @@ ERL_NIF_TERM nif_process_ready_tasks(ErlNifEnv *env, int argc,
              * as _wakeup_for (call_soon_threadsafe).
              * Note: events_module is cached, so we don't DECREF it. */
             Py_XDECREF(old_running_loop);
+            Py_DECREF(py_loop);
             loop_gil_release(loop, &gil);
             if (!loop->shutdown) {
                 pthread_mutex_lock(&loop->mutex);
@@ -3839,7 +3907,12 @@ ERL_NIF_TERM nif_process_ready_tasks(ErlNifEnv *env, int argc,
     while ((coros_scheduled > 0 || current_pending > 0 || py_ready > 0) && iterations < max_iterations) {
         iterations++;
 
-        PyObject *run_result = PyObject_CallMethod(loop->py_loop, "_run_once", "i", 0);
+        if (processing_loop_stopped(loop, py_loop, owner_generation)) goto processing_stopped;
+        PyObject *run_result = PyObject_CallMethod(py_loop, "_run_once", "i", 0);
+        if (processing_loop_stopped(loop, py_loop, owner_generation)) {
+            Py_XDECREF(run_result);
+            goto processing_stopped;
+        }
         if (run_result != NULL) {
             Py_DECREF(run_result);
         } else {
@@ -3849,7 +3922,11 @@ ERL_NIF_TERM nif_process_ready_tasks(ErlNifEnv *env, int argc,
         }
 
         /* Check if Python loop has more ready callbacks */
-        PyObject *ready_len = PyObject_CallMethod(loop->py_loop, "_get_ready_count", NULL);
+        PyObject *ready_len = PyObject_CallMethod(py_loop, "_get_ready_count", NULL);
+        if (processing_loop_stopped(loop, py_loop, owner_generation)) {
+            Py_XDECREF(ready_len);
+            goto processing_stopped;
+        }
         py_ready = 0;
         if (ready_len != NULL) {
             py_ready = (int)PyLong_AsLong(ready_len);
@@ -3867,17 +3944,26 @@ ERL_NIF_TERM nif_process_ready_tasks(ErlNifEnv *env, int argc,
     /* Preserve Python-only work across the worker's 'more' handoff. The
      * worker queues its own task_ready on 'more'; keeping the coalescing
      * flag set supplies the next pass's work hint and coalesces producers. */
-    bool python_more = iterations == max_iterations && py_ready > 0;
+    python_more = iterations == max_iterations && py_ready > 0;
     if (python_more) {
         atomic_store(&loop->task_wake_pending, true);
     }
+    goto processing_done;
+
+processing_stopped:
+    fail_stopped_tasks(loop, tasks, task_idx, num_tasks);
+    result = make_error(env, "loop_stopped");
+
+processing_done:
 
     /* Restore original event loop context before releasing GIL.
      * Note: events_module is cached, so we don't DECREF it here. */
-    PyObject *restore = PyObject_CallMethod(events_module, "_set_running_loop", "O",
-                                            old_running_loop ? old_running_loop : Py_None);
-    Py_XDECREF(restore);
+    if (old_running_loop != NULL) {
+        PyObject *restore = PyObject_CallMethod(events_module, "_set_running_loop", "O", old_running_loop);
+        Py_XDECREF(restore);
+    }
     Py_XDECREF(old_running_loop);
+    Py_XDECREF(py_loop);
 
     loop_gil_release(loop, &gil);
 

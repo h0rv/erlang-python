@@ -50,6 +50,7 @@ init([]) ->
     %% Initialize callback registry ETS table (owned by supervisor for resilience)
     ok = py_callback:init_tab(),
     ok = py_actor_group:register_callbacks(),
+    ok = py_actor_state:register_callbacks(),
 
     %% Initialize shared state ETS table (owned by supervisor for resilience)
     ok = py_state:init_tab(),
@@ -191,6 +192,8 @@ init([]) ->
 
     Children = [CallbackSpec, ShmSpec, ThreadHandlerSpec, LoggerSpec, TracerSpec,
                 ContextSupSpec, ContextRouterInitSpec,
+                #{id => py_worker_pool, start => {py_worker_pool, start_link, []},
+                  shutdown => infinity},
                 WorkerRegistrySpec, WorkerSupSpec, EventLoopSpec,
                 EventLoopPoolSpec, ActorRegistrySpec, ActorRootSpec,
                 #{id => py_durable_queue_sync, start => {py_durable_queue_sync, start_link, []}},

@@ -59,6 +59,15 @@ one Python execution environment and serves calls in order. Pools
 
 ## Life of a call, per mode
 
+Each worker context runs on one dedicated thread whose Python thread state
+persists for the thread's lifetime. Values stored in `threading.local()` persist
+between calls on that context; reset them explicitly when they must not carry
+over to the next call. Each top-level worker call enters a fresh `contextvars`
+context, so `ContextVar` bindings from a previous call are not inherited, even
+after an error. Nested calls made while serving an inline Erlang callback stay
+in the outer call's context. This does not reset module globals or the context's
+namespace.
+
 ### worker and owngil (embedded)
 
 1. `py:call(M, F, A)` picks a context through `py_context_router` and sends
