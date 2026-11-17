@@ -1,10 +1,10 @@
 -module(py_worker_pool_SUITE).
 -export([all/0, init_per_suite/1, end_per_suite/1,
          sleeping/1, cpu_parallel/1, reuse/1, capacity/1, portable_env/1, callbacks/1,
-         isolated_state/1, policy_independent/1, factory_drain/1]).
+         isolated_state/1, policy_independent/1, factory_drain/1, exception_identity/1]).
 
 all() -> [reuse, portable_env, capacity, callbacks, sleeping, cpu_parallel, isolated_state,
-          policy_independent, factory_drain].
+          policy_independent, factory_drain, exception_identity].
 init_per_suite(Config) ->
     application:load(erlang_python),
     application:set_env(erlang_python, worker_pool_max, 16),
@@ -50,6 +50,10 @@ policy_independent(_) -> with_context(fun(Ctx) ->
         py_worker_pool:checkin(Second),
         py_context:exec(Ctx, <<"asyncio.set_event_loop_policy(_old_policy)">>)
     end
+end).
+
+exception_identity(_) -> with_context(fun(Ctx) ->
+    {ok, none} = py_context:call(Ctx, py_test_worker_errors, exception_identity, [], #{}, 30000)
 end).
 
 factory_drain(_) -> with_context(fun(Ctx) ->

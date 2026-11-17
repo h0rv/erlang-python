@@ -29,7 +29,8 @@ handle_call({data, Gate, Ticket, Payload}, _From,
     try
     Reply = case py_context:call(Ctx, '_erlang_impl._actor_data', call,
         [Object, Ticket, {bytes, Payload}], #{}, infinity) of
-        {ok, Bytes} when is_binary(Bytes) -> {ok, {bytes, Bytes}};
+        {ok, {true, Bytes}} when is_binary(Bytes) -> {ok, {bytes, Bytes}};
+        {ok, {false, Error}} -> {python_error, Error};
         Other -> Other
     end,
     {reply, Reply, State#{ctx := Ctx}}

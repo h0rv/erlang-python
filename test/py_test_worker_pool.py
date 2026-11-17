@@ -104,7 +104,7 @@ async def isolated_calls() -> None:
         assert await actor.call(b"second") == b"second"
         try:
             await actor.call(b"error")
-        except RuntimeError:
+        except ValueError:
             pass
         else:
             raise AssertionError("Actor error was not propagated")

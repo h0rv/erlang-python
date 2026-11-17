@@ -89,15 +89,18 @@ def initialize(factory: object, state: object) -> None:
     erlang._actor_construct(state, factory)
 
 
-def call(state: object, ticket: object, payload: bytes) -> bytes:
+def call(
+    state: object, ticket: object, payload: bytes
+) -> tuple[Literal[True], bytes] | tuple[Literal[False], object]:
     try:
         container = erlang._actor_unwrap(state)
         if not isinstance(container, DataDispatcher):
             raise TypeError("Actor factory must return a data dispatcher")
-    except BaseException:
+        return True, dispatch_worker(container, payload)
+    except BaseException as error:
+        return False, erlang._actor_retain(error)
+    finally:
         erlang._actor_complete(ticket)
-        raise
-    return dispatch_worker(container, ticket, payload)
 
 
 def response(value: object) -> bytes:
@@ -107,14 +110,11 @@ def response(value: object) -> bytes:
     return result
 
 
-async def dispatch(container: DataDispatcher, ticket: object, payload: bytes) -> bytes:
-    try:
-        result = await container.dispatch(payload)
-        if type(result) is not bytes:
-            raise TypeError("Actor dispatch must return immutable bytes")
-        return result
-    finally:
-        erlang._actor_complete(ticket)
+async def dispatch(container: DataDispatcher, payload: bytes) -> bytes:
+    result = await container.dispatch(payload)
+    if type(result) is not bytes:
+        raise TypeError("Actor dispatch must return immutable bytes")
+    return result
 
 
 class _WorkerLoop(local):
@@ -130,13 +130,8 @@ class _WorkerLoop(local):
 _worker_loop = _WorkerLoop()
 
 
-def dispatch_worker(container: DataDispatcher, ticket: object, payload: bytes) -> bytes:
-    try:
-        loop = _worker_loop.get()
-    except BaseException:
-        erlang._actor_complete(ticket)
-        raise
-    return loop.run_until_complete(dispatch(container, ticket, payload))
+def dispatch_worker(container: DataDispatcher, payload: bytes) -> bytes:
+    return _worker_loop.get().run_until_complete(dispatch(container, payload))
 
 
 def close_worker_loop() -> None:

@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- Data actor calls preserve the original Python exception object and type on
+  pooled workers instead of serializing it into a `RuntimeError`.
+
 - Holder-death barriers wait for factory callbacks to finish before pool worker
   reuse and actor-object release.
 
