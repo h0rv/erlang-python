@@ -21,6 +21,12 @@
 
 ### Changed
 
+- Data actors share a node-wide worker pool instead of owning a thread each.
+  Actor coroutines run on worker-local loops. The pool starts at the available
+  logical CPU count, grows on demand up to `worker_pool_max` (default four times
+  that count), and queues checkouts FIFO at the cap. Killing an actor drains its
+  running body before restart without destroying its worker.
+
 - `ErlangSocketTransport` implements `set_protocol()` and `get_protocol()`.
   Uvicorn's WebSocket upgrade swaps the HTTP protocol for a WebSocket
   protocol on the same transport and previously raised `NotImplementedError`.

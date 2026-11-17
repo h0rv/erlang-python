@@ -2650,7 +2650,7 @@ static void *ctx_thread_main_worker(void *arg) {
         }
     }
 
-    PyGILState_Release(gstate);
+    PyThreadState *worker_state = PyEval_SaveThread();
 
     /* Signal that we're ready */
     atomic_store(&ctx->thread_running, true);
@@ -2679,7 +2679,16 @@ static void *ctx_thread_main_worker(void *arg) {
     }
 
     /* Cleanup: release namespace dictionaries under GIL */
-    gstate = PyGILState_Ensure();
+    PyEval_RestoreThread(worker_state);
+    PyObject *actor_name = PyUnicode_FromString("_erlang_impl._actor_data");
+    PyObject *actor_module = actor_name == NULL ? NULL : PyImport_GetModule(actor_name);
+    Py_XDECREF(actor_name);
+    if (actor_module != NULL) {
+        PyObject *closed = PyObject_CallMethod(actor_module, "close_worker_loop", NULL);
+        Py_XDECREF(closed);
+        Py_DECREF(actor_module);
+    }
+    if (PyErr_Occurred()) log_and_clear_python_error("worker loop cleanup");
     Py_XDECREF(ctx->module_cache);
     Py_XDECREF(ctx->globals);
     Py_XDECREF(ctx->locals);
@@ -6095,6 +6104,7 @@ static ErlNifFunc nif_funcs[] = {
     {"context_cleanup_status", 1, nif_context_cleanup_status, 0},
     {"actor_gate_new", 2, nif_actor_gate_new, 0},
     {"actor_gate_info", 1, nif_actor_gate_info, 0},
+    {"actor_gate_wait", 1, nif_actor_gate_wait, 0},
     {"actor_gate_close", 1, nif_actor_gate_close, 0},
     {"actor_ticket_info", 1, nif_actor_ticket_info, 0},
     {"actor_ticket_commit", 3, nif_actor_ticket_commit, 0},

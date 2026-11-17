@@ -1,10 +1,10 @@
 -module(py_actor_data_SUITE).
 -export([all/0, init_per_suite/1, end_per_suite/1,
          basic/1, cancelled/1, restart/1, ticket_orders/1, busy_kill/1,
-         context_kill/1, abandoned_commit/1, queued_abort/1, concurrent_children/1, group_kill/1,
+         abandoned_commit/1, queued_abort/1, concurrent_children/1, group_kill/1,
          callback_overflow/1, state_graphs/1]).
 all() -> [basic, cancelled, restart, ticket_orders, busy_kill,
-          context_kill, abandoned_commit, queued_abort, concurrent_children, group_kill, callback_overflow,
+          abandoned_commit, queued_abort, concurrent_children, group_kill, callback_overflow,
           state_graphs].
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(erlang_python), Config.
@@ -38,8 +38,8 @@ end) end).
 
 restart(_) ->
     py_callback:register(actor_data_kill, fun([Pid]) ->
-        [{{Group, Id}, Pid, Old, _, _, _}] = ets:match_object(py_actor_generations,
-            {{'_', '_'}, Pid, '_', '_', '_', '_'}),
+        [{{Group, Id}, Pid, Old, _}] = ets:match_object(py_actor_generations,
+            {{'_', '_'}, Pid, '_', '_'}),
         exit(Pid, kill),
         await_generation(Group, Id, Old, 1000)
     end),
@@ -85,11 +85,9 @@ ticket_orders(_) -> with_context(fun(Ctx) ->
     after gen_server:stop(Group, normal, infinity) end
 end).
 
-busy_kill(_) -> kill_busy(actor).
-context_kill(_) -> kill_busy(context).
-kill_busy(Victim) -> with_gate(fun() -> with_context(fun(Ctx) ->
+busy_kill(_) -> with_gate(fun() -> with_context(fun(Ctx) ->
     {Group, Actor, Generation, Gate} = owned(Ctx),
-    [{_, _, _, _, Owned, _}] = ets:lookup(py_actor_generations, {Group, <<"counter">>}),
+    #{ctx := Worker} = sys:get_state(Actor),
     Ticket = reserve(Ctx, Gate, 4),
     Parent = self(),
     spawn(fun() ->
@@ -98,17 +96,19 @@ kill_busy(Victim) -> with_gate(fun() -> with_context(fun(Ctx) ->
         Parent ! {finished, Result}
     end),
     {ok, _} = py_callback:execute(<<"actor_data_entered">>, []),
-    case Victim of actor -> exit(Actor, kill); context -> exit(Owned, kill) end,
+    exit(Actor, kill),
     receive {finished, _} -> ok after 5000 -> error(call_survived) end,
     ActorMon = monitor(process, Actor),
     receive {'DOWN', ActorMon, process, Actor, _} -> ok after 5000 -> error(actor_survived) end,
-    case Victim of actor -> true = is_process_alive(Owned); context -> ok end,
+    true = is_process_alive(Worker),
     #{closed := true, count := 1, bytes := 4} = py_nif:actor_gate_info(Gate),
-    %% Supervisor waits for the old context, so no new state can overlap it.
+    %% Supervisor waits for the old body, not the pooled worker's death.
     {error, restarting} = gen_server:call(Group, {resolve, <<"counter">>}),
     {ok, _} = py_callback:execute(<<"actor_data_release">>, []),
     await_generation(Group, <<"counter">>, Generation, 1000),
-    false = is_process_alive(Owned),
+    true = is_process_alive(Worker),
+    Worker = py_worker_pool:checkout(Worker),
+    ok = py_worker_pool:checkin(Worker),
     #{closed := true, count := 0, bytes := 0} = py_nif:actor_gate_info(Gate),
     gen_server:stop(Group, normal, infinity),
     [] = ets:lookup(py_actor_generations, {Group, <<"counter">>})
@@ -146,12 +146,11 @@ end).
 
 group_kill(_) -> with_context(fun(Ctx) ->
     {Group, Actor, _, _} = owned(Ctx),
-    [{_, _, _, _, Owned, _}] = ets:lookup(py_actor_generations, {Group, <<"counter">>}),
+    #{ctx := Worker} = sys:get_state(Actor),
     ActorMon = monitor(process, Actor),
-    ContextMon = monitor(process, Owned),
     exit(Group, kill),
     receive {'DOWN', ActorMon, process, Actor, _} -> ok after 5000 -> error(orphan_actor) end,
-    receive {'DOWN', ContextMon, process, Owned, _} -> ok after 5000 -> error(orphan_context) end,
+    true = is_process_alive(Worker),
     %% Synchronize with the registry after its monitor notification.
     registry_empty(Group, 1000)
 end).
@@ -176,7 +175,7 @@ abandoned_commit(_) -> with_context(fun(Ctx) ->
     %% The committed call is still in the suspended actor's mailbox.
     exit(Actor, kill),
     receive {finished, {error, {exit, _, _}}} -> ok after 5000 -> error(call_survived) end,
-    await_ticket(Ticket, reaped, 5000),
+    await_ticket(Ticket, complete, 5000),
     #{unsettled := 0} = py_nif:actor_gate_info(Gate),
     ok = gen_server:stop(Group, normal, 5000)
 end).

@@ -2108,6 +2108,7 @@ typedef struct {
      * insert under the lock.
      */
     pthread_mutex_t async_futures_mutex;
+    pthread_mutex_t async_reader_mutex;
     bool pipe_initialized;
 
     /* Set on hard read error (EIO/EBADF/EOF mid-frame). New
@@ -2462,10 +2463,15 @@ static PyObject *async_callback_reader(PyObject *self, PyObject *args) {
     (void)self;
     (void)args;
 
-    /* Process all available responses */
+    erlang_module_state_t *state = get_erlang_module_state();
+    if (state == NULL || pthread_mutex_trylock(&state->async_reader_mutex) != 0)
+        Py_RETURN_NONE;
+
+    /* Multiple worker loops share the interpreter's framed pipe. */
     while (process_async_callback_response() > 0) {
         /* Continue processing */
     }
+    pthread_mutex_unlock(&state->async_reader_mutex);
 
     Py_RETURN_NONE;
 }
@@ -2667,9 +2673,10 @@ static PyObject *send_async_callback_request(PyObject *self, PyObject *args) {
     PyObject *name_obj;
     PyObject *call_args;
     PyObject *reply_capsule = Py_None;
+    PyObject *future = Py_None;
     native_async_reply_t *reply = NULL;
 
-    if (!PyArg_ParseTuple(args, "OO|O", &name_obj, &call_args, &reply_capsule)) {
+    if (!PyArg_ParseTuple(args, "OO|OO", &name_obj, &call_args, &reply_capsule, &future)) {
         return NULL;
     }
 
@@ -2769,15 +2776,38 @@ static PyObject *send_async_callback_request(PyObject *self, PyObject *args) {
         reply != NULL ? enif_make_resource(msg_env, reply)
                       : enif_make_int(msg_env, state->async_callback_pipe[1]));
 
-    if (!enif_send(NULL, &g_thread_coordinator_pid, msg_env, msg)) {
+    PyObject *key = PyLong_FromUnsignedLongLong(callback_id);
+    if (key == NULL) {
         if (actor_data) actor_data_send_failed(call_args);
+        enif_free_env(msg_env);
+        return NULL;
+    }
+    if (reply == NULL && future != Py_None) {
+        pthread_mutex_lock(&state->async_futures_mutex);
+        int registered = PyDict_SetItem(state->async_pending_futures, key, future);
+        pthread_mutex_unlock(&state->async_futures_mutex);
+        if (registered < 0) {
+            if (actor_data) actor_data_send_failed(call_args);
+            Py_DECREF(key);
+            enif_free_env(msg_env);
+            return NULL;
+        }
+    }
+    if (!enif_send(NULL, &g_thread_coordinator_pid, msg_env, msg)) {
+        if (reply == NULL && future != Py_None) {
+            pthread_mutex_lock(&state->async_futures_mutex);
+            PyDict_DelItem(state->async_pending_futures, key);
+            pthread_mutex_unlock(&state->async_futures_mutex);
+        }
+        if (actor_data) actor_data_send_failed(call_args);
+        Py_DECREF(key);
         enif_free_env(msg_env);
         PyErr_SetString(PyExc_RuntimeError, "Failed to send async callback message");
         return NULL;
     }
     enif_free_env(msg_env);
 
-    return PyLong_FromUnsignedLongLong(callback_id);
+    return key;
 }
 
 /**
@@ -3930,6 +3960,7 @@ static void erlang_module_free(void *module) {
 
     /* Always destroy mutex - it was always initialized in create_erlang_module */
     pthread_mutex_destroy(&state->async_futures_mutex);
+    pthread_mutex_destroy(&state->async_reader_mutex);
     state->pipe_initialized = false;
 }
 
@@ -4009,6 +4040,7 @@ static int create_erlang_module(void) {
         state->async_callback_pipe[1] = -1;
         state->async_pending_futures = NULL;
         pthread_mutex_init(&state->async_futures_mutex, NULL);
+        pthread_mutex_init(&state->async_reader_mutex, NULL);
         state->pipe_initialized = false;
     }
 
@@ -4154,10 +4186,7 @@ static int create_erlang_module(void) {
         "    future = loop.create_future()\n"
         "    \n"
         "    # Send the request and get callback_id\n"
-        "    callback_id = erlang._send_async_request(func_name, args)\n"
-        "    \n"
-        "    # Register the Future\n"
-        "    erlang._register_async_future(callback_id, future)\n"
+        "    erlang._send_async_request(func_name, args, None, future)\n"
         "    \n"
         "    # Wait for the result\n"
         "    return await future\n"

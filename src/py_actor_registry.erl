@@ -1,3 +1,4 @@
+%%% @doc Generation registry owned independently of actor groups.
 -module(py_actor_registry).
 -behaviour(gen_server).
 -export([start_link/0, watch/1, init/1, handle_call/3, handle_cast/2, handle_info/2]).
@@ -15,7 +16,7 @@ handle_info({'DOWN', Mon, process, Group, _}, State) ->
         {Group, Rest} ->
             %% Keyed by group identity, never by a reused logical child ID or
             %% old actor monitor. A late DOWN cannot erase a new generation.
-            ets:match_delete(py_actor_generations, {{Group, '_'}, '_', '_', '_', '_', '_'}),
+            ets:match_delete(py_actor_generations, {{Group, '_'}, '_', '_', '_'}),
             {noreply, Rest};
         error -> {noreply, State}
     end;

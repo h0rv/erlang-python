@@ -20,6 +20,10 @@ suite is visible. `scripts/check_code_map.sh` requires a row per module.
 | `py_shared_dict` | `py_SUITE` |
 | `py_isolated` | `py_isolated_*_SUITE` |
 | `py_context_router` | `py_context_router_SUITE`, `py_pool_SUITE` |
+| `py_worker_pool` | `py_worker_pool_SUITE`, `py_actor_data_SUITE`, `py_actor_temporary_SUITE` |
+| `py_data_actor` | `py_actor_data_SUITE`, `py_actor_temporary_SUITE` |
+| `py_actor_group` | `py_actor_data_SUITE`, `py_actor_temporary_SUITE` |
+| `py_actor_registry` | `py_actor_data_SUITE` |
 | `py_context_sup` | (through the above) |
 | `py_context_init` | (through the above) |
 | `py_nif` | all |

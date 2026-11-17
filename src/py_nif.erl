@@ -80,6 +80,7 @@
     context_cleanup_status/1,
     actor_gate_new/2,
     actor_gate_info/1,
+    actor_gate_wait/1,
     actor_gate_close/1,
     actor_ticket_info/1,
     actor_ticket_commit/3,
@@ -635,6 +636,7 @@ submit_task(_LoopRef, _CallerPid, _Ref, _Module, _Func, _Args, _Kwargs) ->
 context_cleanup_status(_Ctx) -> ?NIF_STUB.
 actor_gate_new(_Count, _Bytes) -> ?NIF_STUB.
 actor_gate_info(_Gate) -> ?NIF_STUB.
+actor_gate_wait(_Gate) -> ?NIF_STUB.
 actor_gate_close(_Gate) -> ?NIF_STUB.
 actor_ticket_info(_Ticket) -> ?NIF_STUB.
 actor_ticket_commit(_Ticket, _Gate, _Bytes) -> ?NIF_STUB.
