@@ -2,8 +2,22 @@
 
 ## Unreleased
 
+### Changed
+
+- Owngil named tasks accept plain top-level async byte functions and resolve
+  their module and function names in the target interpreter.
+
+### Removed
+
+- The `erlang.tasks.entrypoint` decorator and `EntryPoint` class. Pass a plain
+  async function to `erlang.tasks.start(..., mode="owngil")` instead.
+
 ### Fixed
 
+- Entry module import and function resolution failures return terminal
+  `RemoteTaskError` results and release the task ticket.
+- Async functions passed to worker-mode task submission are rejected before
+  admission; worker mode requires a factory returning `Body`.
 - Quote the supervisor return annotation so importing the event loop does not
   raise `NameError` on Python 3.12 and 3.13.
 

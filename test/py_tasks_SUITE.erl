@@ -4,12 +4,14 @@
          retained_exception_lifecycle/1, owngil_api/1, owngil_parallel/1,
          owngil_prestart_cancel/1, owngil_running_cancel/1, owngil_killed_context/1,
          owngil_missing_envelope/1, unsupported_named_mode/1, owngil_surrogate_error/1,
-         owngil_unicode_identifiers/1]).
+         owngil_unicode_identifiers/1, owngil_import_failure/1,
+         owngil_missing_attribute/1, owngil_non_entry/1, worker_rejects_async/1]).
 all() -> [killed_child, killed_context, killed_group, queued_ticket, killed_before_execution,
           retained_exception_lifecycle, owngil_api, owngil_parallel,
           owngil_prestart_cancel, owngil_running_cancel, owngil_killed_context,
           owngil_missing_envelope, unsupported_named_mode, owngil_surrogate_error,
-          owngil_unicode_identifiers].
+          owngil_unicode_identifiers, owngil_import_failure,
+          owngil_missing_attribute, owngil_non_entry, worker_rejects_async].
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(erlang_python),
     ok = py_import:add_path(filename:dirname(code:which(?MODULE))),
@@ -169,6 +171,14 @@ wait_contexts(Baseline, N) ->
         _ -> receive after 5 -> wait_contexts(Baseline, N - 1) end
     end.
 
+worker_rejects_async(_) ->
+    {ok, Ctx} = py_context:new(#{mode => worker, managed_loop => dedicated}),
+    try
+        ok = py_context:start_loop(Ctx),
+        {ok, true} = py_context:submit_await(Ctx, py_test_task_entries, worker_rejects_async,
+                                           [], #{}, 15000)
+    after py_context:destroy(Ctx) end.
+
 owngil_api(_) ->
     {ok, Ctx} = py_context:new(#{mode => worker, managed_loop => dedicated}),
     try
@@ -188,6 +198,27 @@ owngil_unicode_identifiers(_) ->
     try
         ok = py_context:start_loop(Ctx),
         {ok, true} = py_context:submit_await(Ctx, py_test_task_entries, unicode_identifiers, [], #{}, 15000)
+    after py_context:destroy(Ctx) end.
+
+owngil_import_failure(_) ->
+    resolution_failure(<<"py_test_task_import_failure">>, <<"echo">>,
+                       <<"ImportError">>, <<"entry module import failed">>).
+
+owngil_missing_attribute(_) ->
+    resolution_failure(<<"py_test_task_entries">>, <<"missing_entry">>,
+                       <<"AttributeError">>,
+                       <<"module 'py_test_task_entries' has no attribute 'missing_entry'">>).
+
+owngil_non_entry(_) ->
+    resolution_failure(<<"py_test_task_entries">>, <<"malformed">>,
+                       <<"TypeError">>, <<"Named tasks require an async Python function">>).
+
+resolution_failure(Module, Function, Type, Message) ->
+    {ok, Ctx} = py_context:new(#{mode => worker, managed_loop => dedicated}),
+    try
+        ok = py_context:start_loop(Ctx),
+        {ok, true} = py_context:submit_await(Ctx, py_test_task_entries, resolution_failure,
+                                           [Module, Function, Type, Message], #{}, 15000)
     after py_context:destroy(Ctx) end.
 
 owngil_parallel(_) ->
@@ -280,7 +311,8 @@ owngil_killed_context(_) ->
 
 owngil_missing_envelope(_) ->
     with_named_group(1, fun(Source, Group, Gate) ->
-        {ok, Pid} = start_named(Source, Group, Gate, <<"malformed">>, <<"work">>),
+        {ok, Pid} = start_named(Source, Group, Gate, <<"asleep">>, <<"work">>),
+        Pid ! {named_result, {ok, <<"malformed">>}},
         {error, {uncertain_inflight, _}} = gen_server:call(Group, {wait, Pid}, 10000),
         #{count := 1, unsettled := 1, closed := true} = py_nif:actor_gate_info(Gate),
         {error, {uncertain_inflight, shutdown_deadline}} = gen_server:call(Group, {shutdown, 100}, 5000)

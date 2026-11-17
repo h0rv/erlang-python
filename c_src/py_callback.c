@@ -3687,7 +3687,20 @@ static PyObject *erlang_channel_snapshot(PyObject *self, PyObject *args) {
 }
 
 /* Python method definitions for erlang module */
+static PyObject *python_task_resolve_entry(PyObject *self, PyObject *args) {
+    (void)self;
+    const char *module_name, *function_name;
+    if (!PyArg_ParseTuple(args, "ss:_task_resolve_entry", &module_name, &function_name))
+        return NULL;
+    PyObject *module = PyImport_ImportModule(module_name);
+    if (module == NULL) return NULL;
+    PyObject *entry = PyObject_GetAttrString(module, function_name);
+    Py_DECREF(module);
+    return entry;
+}
+
 static PyMethodDef ErlangModuleMethods[] = {
+    {"_task_resolve_entry", python_task_resolve_entry, METH_VARARGS, "Resolve a named task without discarding Python exceptions."},
     {"_channel_create_bounded", erlang_channel_create_bounded, METH_VARARGS, NULL},
     {"_channel_ready", erlang_channel_ready, METH_VARARGS, NULL},
     {"_channel_cancel_ready", erlang_channel_cancel_ready, METH_VARARGS, NULL},

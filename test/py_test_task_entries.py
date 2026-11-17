@@ -1,13 +1,14 @@
 import asyncio
 import time
+from collections.abc import Awaitable
 
 import erlang
 from _erlang_impl._tasks import _entries
 from erlang.tasks import (
+    Body,
     RemoteTaskError,
     cancel,
     dispose,
-    entrypoint,
     open_group,
     outcome,
     shutdown,
@@ -16,18 +17,15 @@ from erlang.tasks import (
 from py_test_entrée import résumé
 
 
-@entrypoint
 async def echo(payload: bytes) -> bytes:
     await asyncio.sleep(0)
     return payload
 
 
-@entrypoint
 async def failure(payload: bytes) -> bytes:
     raise ValueError("remote failure")
 
 
-@entrypoint
 async def surrogate_failure(payload: bytes) -> bytes:
     raise ValueError("remote\udcff failure")
 
@@ -73,25 +71,21 @@ async def unicode_identifiers() -> bool:
     return True
 
 
-@entrypoint
 async def asleep(payload: bytes) -> bytes:
     await asyncio.sleep(60)
     return payload
 
 
-@entrypoint
 async def waiting(payload: bytes) -> bytes:
     await erlang.async_call("task_entry_entered", payload)
     await asyncio.sleep(60)
     return payload
 
 
-@entrypoint
 async def must_not_run(payload: bytes) -> bytes:
     raise AssertionError("A sealed entry executed")
 
 
-@entrypoint
 async def cpu(payload: bytes) -> bytes:
     deadline = int(payload)
     await asyncio.sleep(max(0, (deadline - time.monotonic_ns()) / 1_000_000_000))
@@ -105,11 +99,56 @@ async def cpu(payload: bytes) -> bytes:
 
 
 def malformed(token: int, payload: bytes) -> bytes:
-    return payload
+    raise AssertionError("A non-entry callable executed")
+
+
+async def unresolved(payload: bytes) -> bytes:
+    raise AssertionError("An unresolved task body executed")
+
+
+async def resolution_failure(module: str, name: str, type_name: str, message: str) -> bool:
+    group, gate = await open_group(1, 100)
+    original = unresolved.__module__, unresolved.__qualname__
+    unresolved.__module__, unresolved.__qualname__ = module, name
+    try:
+        pid = await start(group, gate, unresolved, b"", mode="owngil")
+    finally:
+        unresolved.__module__, unresolved.__qualname__ = original
+    success, error = await outcome(group, pid)
+    assert not success and isinstance(error, RemoteTaskError)
+    assert error.type_name == type_name, error
+    assert error.message == message, error
+    pid = await start(group, gate, echo, b"completed", mode="owngil")
+    assert await outcome(group, pid) == (True, b"completed")
+    await shutdown(group, 1000)
+    await dispose(group)
+    return True
 
 
 async def sealed(token: int) -> bool:
     return _entries[token].sealed
+
+
+async def worker_rejects_async() -> bool:
+    group, gate = await open_group(1, 100)
+
+    def factory() -> Body:
+        return Body(echo)
+
+    try:
+        for payload in (b"", b"work"):
+            try:
+                await start(group, gate, echo, payload)
+            except TypeError as error:
+                assert 'async functions require mode="owngil"' in str(error)
+            else:
+                raise AssertionError("An async function was accepted as a worker factory")
+            pid = await start(group, gate, factory, payload)
+            assert await outcome(group, pid) == (True, payload)
+        await shutdown(group, 1000)
+    finally:
+        await dispose(group)
+    return True
 
 
 async def api() -> bool:
@@ -117,7 +156,13 @@ async def api() -> bool:
     ticket = erlang._actor_reserve(gate, 0)
     try:
         reply = await erlang.async_call(
-            "_task_start", group, gate, ticket, b"", "isolated", (echo.module, echo.name)
+            "_task_start",
+            group,
+            gate,
+            ticket,
+            b"",
+            "isolated",
+            (echo.__module__, echo.__qualname__),
         )
         assert reply == ("error", ("unsupported_task_mode", "isolated"))
     finally:
@@ -135,18 +180,39 @@ async def api() -> bool:
     success, error = await outcome(group, pid)
     assert not success and isinstance(error, asyncio.CancelledError)
 
-    @entrypoint
     async def nested(payload: bytes) -> bytes:
         return payload
 
-    anonymous = entrypoint(lambda payload: asyncio.sleep(0, result=payload))
-    for invalid in (nested, anonymous):
+    def not_async(payload: bytes) -> Awaitable[bytes]:
+        return asyncio.sleep(0, result=payload)
+
+    class CallableEntry:
+        async def __call__(self, payload: bytes) -> bytes:
+            return payload
+
+    for invalid in (
+        nested,
+        lambda payload: asyncio.sleep(0, result=payload),
+        not_async,
+        CallableEntry(),
+        CallableEntry().__call__,
+    ):
         try:
             await start(group, gate, invalid, b"", mode="owngil")
-        except TypeError:
-            pass
+        except TypeError as error:
+            assert "owngil tasks require" in str(error)
         else:
             raise AssertionError("Non-importable entry was accepted")
+    original_module = echo.__module__
+    setattr(echo, "__module__", None)
+    try:
+        await start(group, gate, echo, b"", mode="owngil")
+    except TypeError as error:
+        assert "top-level functions" in str(error)
+    else:
+        raise AssertionError("A function without a module was accepted")
+    finally:
+        echo.__module__ = original_module
     await shutdown(group, 1000)
     await dispose(group)
     return True
