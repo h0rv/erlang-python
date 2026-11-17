@@ -54,16 +54,21 @@ class Resource:
 @dataclass
 class TaskChecks:
     cancelled: list[threading.Event] = field(default_factory=list)
-    released: threading.Event = field(default_factory=threading.Event)
+    released: bool = False
+    resources: list[ref[Resource]] = field(default_factory=list)
     state: object | None = None
     owners: list[_ActorTasks] = field(default_factory=list)
+
+    def resource_released(self, resource: ref[Resource]) -> None:
+        self.released = True
 
 
 class PendingActor:
     def __init__(self, checks: TaskChecks) -> None:
         self.checks = checks
         self.resource = Resource()
-        self.resource_ref = ref(self.resource, lambda _: checks.released.set())
+        self.resource_ref = ref(self.resource, checks.resource_released)
+        checks.resources.append(self.resource_ref)
 
     async def pending(
         self, cancelled: threading.Event, ready: asyncio.Event, descendant: bool = False
@@ -126,7 +131,7 @@ async def check_cleanup() -> None:
                     async with asyncio.TaskGroup() as pending:
                         pending.create_task(actor.crash())
                         await asyncio.to_thread(wait_closing, checks.owners[0])
-                        assert not checks.released.is_set()
+                        assert not checks.released
                         assert not any(event.is_set() for event in checks.cancelled)
                         block_release.set()
                 finally:
@@ -142,7 +147,7 @@ async def check_cleanup() -> None:
                 finally:
                     await erlang.async_call("worker_task_release_all", holders)
             assert all(event.is_set() for event in checks.cancelled)
-            assert checks.released.is_set()
+            assert checks.released
         assert all(owner.sealed and not owner.tasks for owner in checks.owners)
     for _ in range(4):
         checks = TaskChecks()
@@ -156,6 +161,7 @@ async def check_cleanup() -> None:
                     calls.create_task(actor.call(b"start"))
         assert len(checks.cancelled) == 32
         assert all(event.is_set() for event in checks.cancelled)
+        assert all(resource() is None for resource in checks.resources)
         assert all(owner.sealed and not owner.tasks for owner in checks.owners)
 
     shared_checks = TaskChecks()
