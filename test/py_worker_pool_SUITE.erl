@@ -41,6 +41,8 @@ policy_independent(_) -> with_context(fun(Ctx) ->
     First = py_worker_pool:checkout(undefined),
     Second = py_worker_pool:checkout(undefined),
     try
+        {ok, none} = py_context:call(First, '_erlang_impl._actor_data', close_worker_loop, [], #{}),
+        {ok, none} = py_context:call(Second, '_erlang_impl._actor_data', close_worker_loop, [], #{}),
         {ok, _} = py_context:call(First, py_test_worker_pool, loop_identity, [], #{}),
         {ok, _} = py_context:call(Second, py_test_worker_pool, loop_identity, [], #{})
     after
