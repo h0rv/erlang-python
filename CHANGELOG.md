@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Added
+
+- The thread running a `py_context:start_loop/1,2` loop in the main
+  interpreter is marked as CPython's running main thread while the loop runs
+  (Python 3.14+), so `python -m pdb -p`, `sys.remote_exec` and the Python 3.15
+  sampling profiler attach to it.
+
 ### Changed
 
 - Owngil named tasks accept plain top-level async byte functions and resolve
