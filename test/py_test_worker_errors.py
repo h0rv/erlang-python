@@ -1,4 +1,5 @@
 import asyncio
+from functools import partial
 
 import erlang
 from erlang.actors import DataActorGroup
@@ -21,7 +22,7 @@ class ErrorActor:
 async def check_exception() -> None:
     for error in (ExpectedError("original actor error"), asyncio.CancelledError()):
         async with DataActorGroup(max_children=1) as group:
-            actor = await group.spawn("error", lambda: ErrorActor(error))
+            actor = await group.spawn("error", partial(ErrorActor, error))
             try:
                 await actor.call(b"error")
             except BaseException as caught:
