@@ -160,7 +160,16 @@ test_child_bootstrap_imports(_Config) ->
     {ok, C} = py_context:new(#{mode => isolated}),
     try
         {ok, 3} = py_context:call(C, operator, add, [1, 2]),
-        {ok, true} = py_context:eval(C, <<"__import__('erlang').is_isolated()">>)
+        {ok, true} = py_context:eval(C, <<"__import__('erlang').is_isolated()">>),
+        ok = py_context:exec(C, <<
+            "import sys\n"
+            "assert '_erlang_impl' not in sys.modules\n"
+            "from _erlang_isolated import _isolated, _etf, _shm, _server\n"
+            "import erlang\n"
+            "assert erlang.Atom is _etf.Atom\n"
+            "assert erlang.SharedMemory is _shm.SharedMemory\n"
+            "assert erlang.server is _server\n"
+        >>)
     after py_context:stop(C) end.
 
 test_embedded_api_imports(_Config) ->
@@ -179,6 +188,15 @@ test_embedded_api_imports(_Config) ->
                 "assert actors.OwnedActor.__module__ == '_erlang_impl._actors'\n"
                 "assert tasks.Body.__module__ == '_erlang_impl._tasks'\n"
                 "assert getattr(_erlang_impl, 'missing', None) is None\n"
+                "from _erlang_impl import _etf, _shm, _server, _isolated\n"
+                "from _erlang_isolated import _etf as child_etf\n"
+                "from _erlang_isolated import _shm as child_shm\n"
+                "from _erlang_isolated import _server as child_server\n"
+                "from _erlang_isolated import _isolated as child_runtime\n"
+                "assert _etf.Atom is child_etf.Atom\n"
+                "assert _shm.SharedMemory is child_shm.SharedMemory\n"
+                "assert _server.serve is child_server.serve\n"
+                "assert _isolated.Runtime is child_runtime.Runtime\n"
             >>)
         after py_context:stop(C) end
     end, [worker, owngil]).

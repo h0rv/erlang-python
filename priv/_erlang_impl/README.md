@@ -4,7 +4,10 @@ The Python half of the `erlang` module. `priv/` is on `sys.path` of every
 interpreter erlang_python starts. In embedded modes the C module `erlang`
 (`c_src/py_callback.c`) is the primary and delegates to this package for the
 asyncio loop, channels, servers and helpers; in an isolated child there is
-no C module and `_isolated.py` builds the whole `erlang` module from here.
+no C module and `_erlang_isolated/_isolated.py` builds the whole `erlang`
+module without importing this package. The bootstrap-safe runtime, ETF
+codec, shared memory wrappers and fd server helpers live in
+`_erlang_isolated`; the original paths here statically re-export them.
 
 | Module | What it is | Embedded | Child |
 |---|---|---|---|
