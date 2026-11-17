@@ -167,7 +167,7 @@ handle_info({async_callback, CallbackId, FuncName, Args, Reply},
                 end
             end)
     end,
-    {noreply, State};
+    {noreply, State, 0};
 handle_info({async_callback, CallbackId, FuncName, Args, WriteFd}, State0) ->
     {Writer, Counter, State1} = ensure_async_writer(WriteFd, State0),
     %% Reserve a slot in the in-flight counter. atomics:add_get is
@@ -192,7 +192,7 @@ handle_info({async_callback, CallbackId, FuncName, Args, WriteFd}, State0) ->
                 Writer ! {respond, CallbackId, Response, Counter}
             end)
     end,
-    {noreply, State1};
+    {noreply, State1, 0};
 
 %% Linked-process exit: covers both sync handlers and async writers.
 %% Both are spawn_link'd so a coordinator crash takes them with it
@@ -216,6 +216,12 @@ handle_info({'EXIT', Pid, _Reason},
             {noreply, State#state{handlers = NewHandlers}}
     end;
 
+%% Callback arguments may hold native object references, released only when
+%% every heap holding them is collected. Collect once the mailbox drains so
+%% an idle coordinator does not pin arguments of finished callbacks.
+handle_info(timeout, State) ->
+    erlang:garbage_collect(),
+    {noreply, State};
 handle_info(_Info, State) ->
     {noreply, State}.
 
