@@ -1,10 +1,11 @@
 -module(py_loop_owner_SUITE).
 -include_lib("common_test/include/ct.hrl").
 -export([all/0,init_per_suite/1,end_per_suite/1,guard_shared/1,guard_dedicated/1,
-         release_and_initialization/1,concurrent_claims/1,foreign_interpreter/1]).
+         release_and_initialization/1,concurrent_claims/1,foreign_interpreter/1,
+         owner_exit_during_processing/1]).
 
 all() -> [guard_shared,guard_dedicated,release_and_initialization,concurrent_claims,
-          foreign_interpreter].
+          foreign_interpreter,owner_exit_during_processing].
 init_per_suite(Config) ->
     {ok,_}=application:ensure_all_started(erlang_python),
     ok=py_callback:register(<<"owner_echo">>,fun([Value])->Value end),
@@ -52,6 +53,26 @@ foreign_interpreter(Config) ->
     {ok,Loop}=py_context:loop_ref(A),
     {error,arg_conversion_failed}=py_context:call(S,py_test_loop_owner,reject_active,[Loop,false]),
     stop_loop(A), ok=py_context:stop(A), ok=py_context:stop(S).
+
+owner_exit_during_processing(Config) ->
+    A=context(Config,#{mode=>worker,managed_loop=>dedicated}),
+    B=context(Config,#{mode=>worker}),
+    {Owner,Mon}=spawn_monitor(fun()->
+        ok=py_context:start_loop(A),
+        {ok,<<"armed">>}=py_context:submit_await(A,py_test_loop_teardown,arm,[],#{},5000)
+    end),
+    try
+        receive {'DOWN',Mon,process,Owner,normal}->ok
+        after 7000->ct:fail(owner_did_not_exit) end,
+        {ok,<<"closing">>}=py_context:call(B,py_test_loop_teardown,wait_closing,[]),
+        {ok,Ref}=py_context:submit(A,py_test_loop_teardown,retiring_factory,[],#{}),
+        Outcome=py_event_loop:await(Ref,2000),
+        {ok,<<"no-system-error">>}=py_context:call(B,py_test_loop_teardown,finish,[]),
+        {error,loop_stopped}=Outcome
+    after
+        py_context:call(B,py_test_loop_teardown,finish,[]),
+        py_context:stop(A), py_context:stop(B)
+    end.
 
 context(Config,Opts) ->
     {ok,C}=py_context:new(Opts),
