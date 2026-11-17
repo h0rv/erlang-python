@@ -34,4 +34,4 @@ async def check_exception() -> None:
 
 
 def exception_identity() -> None:
-    erlang.run(check_exception())
+    asyncio.run(check_exception(), loop_factory=erlang.new_event_loop)
