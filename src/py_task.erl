@@ -126,4 +126,6 @@ run_shared(#{ctx := Ctx, env := Env, object := Object, dispatch := Dispatch,
     Group ! {work_result, self(), Result},
     {stop, normal, State}.
 
-terminate(_, #{ctx := Ctx}) -> py_context:destroy(Ctx).
+terminate(_, #{ctx := Ctx}) ->
+    _ = py_context:stop_loop(Ctx),
+    py_context:destroy(Ctx).

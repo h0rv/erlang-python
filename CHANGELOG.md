@@ -37,6 +37,9 @@
 
 - TCP transports disable Nagle's algorithm, matching asyncio and avoiding
   delayed-ACK stalls between small writes. Unix sockets are unchanged.
+- Task children stop their managed event loop before destroying its context.
+  Completion no longer waits for an idle loop's polling timeout to deliver
+  an interrupt during cleanup.
 - Entry module import and function resolution failures return terminal
   `RemoteTaskError` results and release the task ticket.
 - Async functions passed to worker-mode task submission are rejected before
