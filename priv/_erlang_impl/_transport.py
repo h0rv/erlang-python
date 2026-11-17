@@ -21,6 +21,7 @@ for TCP, UDP, and Unix sockets backed by the Erlang event loop.
 
 import asyncio
 import errno
+import socket
 from asyncio import transports
 from collections import deque
 from collections.abc import Callable
@@ -54,6 +55,10 @@ class ErlangSocketTransport(transports._FlowControlMixin):
     def __init__(self, loop, sock, protocol, extra=None):
         super().__init__(extra, loop=loop)
         self._sock = sock
+        if (sock.family in {socket.AF_INET, socket.AF_INET6} and
+                sock.type == socket.SOCK_STREAM and
+                sock.proto == socket.IPPROTO_TCP):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self._protocol = protocol
         self._buffer = self._buffer_factory()
         self._buffer_offset = 0  # Track consumed bytes for O(1) buffer management
