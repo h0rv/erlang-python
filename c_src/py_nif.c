@@ -2445,7 +2445,18 @@ static void ctx_serve_request(py_context_t *ctx, ctx_request_t *req, bool nested
          * invariant on py_context::interrupt_mutex). */
         py_context_exec_enter(ctx);
         PyEval_RestoreThread(worker_thread_state);
-        ctx_execute_request(ctx);  /* Reuse execute functions */
+        PyObject *context = PyContext_New();
+        if (context == NULL || PyContext_Enter(context) < 0) {
+            ctx->response_term = make_py_error(ctx->shared_env);
+            ctx->response_ok = false;
+        } else {
+            ctx_execute_request(ctx);  /* Reuse execute functions */
+            if (PyContext_Exit(context) < 0) {
+                ctx->response_term = make_py_error(ctx->shared_env);
+                ctx->response_ok = false;
+            }
+        }
+        Py_XDECREF(context);
         worker_thread_state = PyEval_SaveThread();
         py_context_exec_leave(ctx);
     }

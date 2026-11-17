@@ -124,6 +124,7 @@ worker_thread_state_persists(_Config) ->
             "_state_probe = types.ModuleType('_worker_state_probe')\n"
             "_state_probe.local = threading.local()\n"
             "_state_probe.var = contextvars.ContextVar('worker_state', default='empty')\n"
+            "_state_probe.read = lambda: _state_probe.var.get()\n"
             "sys.modules['_worker_state_probe'] = _state_probe\n"
             "_state_probe.local.value = 'first'\n"
             "_state_probe.var.set('first')\n"
@@ -131,6 +132,11 @@ worker_thread_state_persists(_Config) ->
         >>),
         {ok, FirstId} = py_context:call(First, threading, get_native_id, []),
         {ok, true} = py_context:eval(First, <<"_state_native_id == threading.get_native_id()">>, #{}),
+        {ok, <<"empty">>} = py_context:call(First, '_worker_state_probe', read, []),
+        {ok, <<"eval">>} = py_context:eval(First, <<
+            "(_state_probe.var.set('eval'), _state_probe.var.get())[1]"
+        >>, #{}),
+        {ok, <<"empty">>} = py_context:call(First, '_worker_state_probe', read, []),
         ok = py_context:exec(Second, <<
             "import _worker_state_probe as _state_probe\n"
             "assert not hasattr(_state_probe.local, 'value')\n"
@@ -140,12 +146,12 @@ worker_thread_state_persists(_Config) ->
         >>),
         {ok, SecondId} = py_context:call(Second, threading, get_native_id, []),
         true = FirstId =/= SecondId,
-        {error, _} = py_context:eval(First, <<"1 / 0">>, #{}),
+        {error, _} = py_context:eval(First, <<"(_state_probe.var.set('error'), 1 / 0)">>, #{}),
         ok = py_context:exec(First, <<"pass">>),
-        {ok, [<<"first">>, <<"first">>, true]} = py_context:eval(First, <<
+        {ok, [<<"first">>, <<"empty">>, true]} = py_context:eval(First, <<
             "[_state_probe.local.value, _state_probe.var.get(), sys.exception() is None]"
         >>, #{}),
-        {ok, [<<"second">>, <<"second">>]} = py_context:eval(Second, <<
+        {ok, [<<"second">>, <<"empty">>]} = py_context:eval(Second, <<
             "[_state_probe.local.value, _state_probe.var.get()]"
         >>, #{})
     after
