@@ -16,6 +16,7 @@
 ]).
 
 -export([
+    event_loop_module_import_test/1,
     import_module_test/1,
     import_function_test/1,
     import_main_rejected_test/1,
@@ -58,6 +59,7 @@ all() ->
 
 groups() ->
     [{import_tests, [sequence], [
+        event_loop_module_import_test,
         import_module_test,
         import_function_test,
         import_main_rejected_test,
@@ -118,6 +120,12 @@ init_per_testcase(_TestCase, Config) ->
 
 end_per_testcase(_TestCase, _Config) ->
     ok.
+
+event_loop_module_import_test(_Config) ->
+    {ok, true} = py:eval(<<"
+(callable(__import__('_erlang_impl._loop', fromlist=['ErlangEventLoop']).ErlangEventLoop)
+and callable(__import__('_erlang_impl._supervision', fromlist=['NativeSupervisor']).NativeSupervisor))
+">>).
 
 %% @doc Test importing a module
 import_module_test(_Config) ->
