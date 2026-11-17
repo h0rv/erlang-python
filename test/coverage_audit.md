@@ -20,7 +20,7 @@ suite is visible. `scripts/check_code_map.sh` requires a row per module.
 | `py_shared_dict` | `py_SUITE` |
 | `py_isolated` | `py_isolated_*_SUITE` |
 | `py_context_router` | `py_context_router_SUITE`, `py_pool_SUITE` |
-| `py_worker_pool` | `py_worker_pool_SUITE` (per-call context isolation and error recovery on reused loops), `py_actor_data_SUITE`, `py_actor_temporary_SUITE` |
+| `py_worker_pool` | `py_worker_pool_SUITE` (policy-independent loops, per-call isolation, error recovery and holder death during factory callbacks), `py_actor_data_SUITE`, `py_actor_temporary_SUITE` |
 | `py_data_actor` | `py_actor_data_SUITE`, `py_actor_temporary_SUITE` |
 | `py_actor_group` | `py_actor_data_SUITE`, `py_actor_temporary_SUITE` |
 | `py_actor_registry` | `py_actor_data_SUITE` (explicit resource release on stop, kill, group close and in-flight kill) |

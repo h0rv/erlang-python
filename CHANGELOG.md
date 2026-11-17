@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- Holder-death barriers wait for factory callbacks to finish before pool worker
+  reuse and actor-object release.
+
 - Worker-local actor loops bypass the installed event loop policy, including
   Erlang-backed policies on Python 3.12–3.13. Loop creation failures settle tickets.
 

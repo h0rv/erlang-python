@@ -84,7 +84,12 @@ handle_info({'DOWN', Mon, process, Pid, _}, #{busy := Busy, workers := Workers} 
                     Pool = self(),
                     spawn(fun() ->
                         %% This message follows every request sent by the dead holder.
-                        _ = py_context:call(Ctx, builtins, id, [0], #{}, infinity),
+                        MRef = monitor(process, Ctx),
+                        Ctx ! {pool_barrier, self(), MRef},
+                        receive
+                            {MRef, ok} -> demonitor(MRef, [flush]);
+                            {'DOWN', MRef, process, Ctx, Reason} -> exit(Reason)
+                        end,
                         Pool ! {drained, Ctx, Pid}
                     end),
                     {noreply, State};

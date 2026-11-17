@@ -1,10 +1,10 @@
 -module(py_worker_pool_SUITE).
 -export([all/0, init_per_suite/1, end_per_suite/1,
          sleeping/1, cpu_parallel/1, reuse/1, capacity/1, portable_env/1, callbacks/1,
-         isolated_state/1, policy_independent/1]).
+         isolated_state/1, policy_independent/1, factory_drain/1]).
 
 all() -> [reuse, portable_env, capacity, callbacks, sleeping, cpu_parallel, isolated_state,
-          policy_independent].
+          policy_independent, factory_drain].
 init_per_suite(Config) ->
     application:load(erlang_python),
     application:set_env(erlang_python, worker_pool_max, 16),
@@ -49,6 +49,46 @@ policy_independent(_) -> with_context(fun(Ctx) ->
         py_worker_pool:checkin(First),
         py_worker_pool:checkin(Second),
         py_context:exec(Ctx, <<"asyncio.set_event_loop_policy(_old_policy)">>)
+    end
+end).
+
+factory_drain(_) -> with_context(fun(Ctx) ->
+    Parent = self(),
+    py_callback:register(review_factory_wait, fun([]) ->
+        Parent ! {factory_waiting, self()},
+        receive continue -> ok end
+    end),
+    {ok, Factory} = py_context:eval(Ctx,
+        <<"__import__('erlang')._actor_retain(__import__('py_test_worker_factory').factory)">>),
+    Holder = spawn(fun() ->
+        Gate = py_nif:actor_gate_new(1, 1024),
+        Object = py_nif:actor_object_new(),
+        ok = py_actor_registry:own(self(), Gate, Object),
+        Leased = py_worker_pool:checkout(undefined),
+        Parent ! {held, Gate, Object, Leased},
+        py_context:call(Leased, '_erlang_impl._actor_data', initialize,
+            [Factory, Object], #{}, infinity)
+    end),
+    {Gate, Object, Worker} = receive {held, G, O, W} -> {G, O, W} end,
+    Callback = receive {factory_waiting, Pid} -> Pid end,
+    try
+        exit(Holder, kill),
+        Drain = gen_server:send_request(py_worker_pool, {drain, Holder}),
+        timeout = gen_server:wait_response(Drain, 500),
+        Released = gen_server:send_request(py_actor_registry, {release, Gate}),
+        timeout = gen_server:wait_response(Released, 0),
+        #{busy := Busy} = sys:get_state(py_worker_pool),
+        {Holder, _} = maps:get(Worker, Busy),
+        Callback ! continue,
+        {reply, ok} = gen_server:wait_response(Drain, 5000),
+        {reply, ok} = gen_server:wait_response(Released, 5000),
+        {error, _} = py_context:call(Ctx, '_erlang_impl._actor_data', portable, [Object], #{}),
+        Worker = py_worker_pool:checkout(Worker),
+        {ok, 0} = py_context:call(Worker, builtins, len, [[]], #{}),
+        ok = py_worker_pool:checkin(Worker)
+    after
+        Callback ! continue,
+        py_callback:unregister(review_factory_wait)
     end
 end).
 
