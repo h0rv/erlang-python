@@ -78,3 +78,59 @@ _thread_state = _ThreadState()
 def loop_identity() -> tuple[int, int]:
     _thread_state.calls += 1
     return id(_worker_loop.get()), _thread_state.calls
+
+
+class SnapshotCounter:
+    def __init__(self, directory: str) -> None:
+        self.directory = directory
+        self.version = 0
+        self.value = b"0"
+        self.loaded = False
+
+    async def dispatch(self, payload: bytes) -> bytes:
+        if not self.loaded:
+            assert await erlang.async_call("_actor_state_open", self.directory) == "ok"
+            snapshot = await erlang.async_call("_actor_state_read", b"pooled-counter")
+            match snapshot:
+                case "missing":
+                    pass
+                case ("ok", int(version), bytes(value)):
+                    self.version, self.value = version, value
+                case _:
+                    raise RuntimeError("Invalid snapshot", snapshot)
+            self.loaded = True
+        if payload == b"read":
+            return self.value
+        result = await erlang.async_call(
+            "_actor_state_write", b"pooled-counter", self.version, payload
+        )
+        assert result == ("ok", self.version + 1)
+        self.version += 1
+        self.value = payload
+        return str(self.version).encode()
+
+
+async def persistent_round_trip(directory: str) -> bool:
+    async with DataActorGroup(max_children=1) as group:
+        actor = await group.spawn("counter", lambda: SnapshotCounter(directory))
+        async with asyncio.TaskGroup() as calls:
+            pending = [
+                calls.create_task(actor.call(value)) for value in (b"1", b"2", b"3")
+            ]
+        assert sorted(call.result() for call in pending) == [b"1", b"2", b"3"]
+        saved = await actor.call(b"read")
+        await actor.crash()
+        actor = await actor.rejoin()
+        assert await actor.call(b"read") == saved
+        assert await actor.call(b"4") == b"4"
+        assert await erlang.async_call(
+            "_actor_state_write", b"pooled-counter", 0, b"stale"
+        ) == ("error", ("version_conflict", 0, 4))
+    async with DataActorGroup(max_children=1) as group:
+        actor = await group.spawn("counter", lambda: SnapshotCounter(directory))
+        assert await actor.call(b"read") == b"4"
+    return True
+
+
+def persistent_state(directory: str) -> bool:
+    return asyncio.run(persistent_round_trip(directory))

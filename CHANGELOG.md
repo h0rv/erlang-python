@@ -4,6 +4,9 @@
 
 ### Added
 
+- Pooled actor snapshot regression covering asynchronous state callbacks,
+  serialized versioned writes, stale-write rejection and restoration after restart.
+
 - Explicit version-checked actor snapshots in local Mnesia `disc_copies` tables.
   Writes synchronize the transaction log before acknowledgement; stale versions
   cannot replace a newer snapshot. Queue and snapshot storage share startup.
