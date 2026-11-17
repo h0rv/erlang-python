@@ -3731,15 +3731,6 @@ ERL_NIF_TERM nif_process_ready_tasks(ErlNifEnv *env, int argc,
         Py_DECREF(args);
         Py_XDECREF(kwargs);
 
-        if (processing_loop_stopped(loop, py_loop, owner_generation)) {
-            if (coro != NULL && PyCoro_CheckExact(coro)) {
-                PyObject *closed = PyObject_CallMethod(coro, "close", NULL);
-                Py_XDECREF(closed);
-            }
-            Py_XDECREF(coro);
-            goto processing_stopped;
-        }
-
         if (coro == NULL) {
             /* The call itself raised: report the Python exception */
             send_task_failure(term_env, &caller_pid, tuple_elems[1], "call_failed");
@@ -3749,6 +3740,13 @@ ERL_NIF_TERM nif_process_ready_tasks(ErlNifEnv *env, int argc,
 
         /* Check if result is a coroutine (direct C API, avoids method call overhead) */
         bool is_coro = PyCoro_CheckExact(coro);
+
+        if (is_coro && processing_loop_stopped(loop, py_loop, owner_generation)) {
+            PyObject *closed = PyObject_CallMethod(coro, "close", NULL);
+            Py_XDECREF(closed);
+            Py_DECREF(coro);
+            goto processing_stopped;
+        }
 
         /* Create caller PID object */
         extern PyTypeObject ErlangPidType;

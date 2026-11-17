@@ -6,6 +6,8 @@ from contextlib import ExitStack, redirect_stderr
 from dataclasses import dataclass, field
 from unittest.mock import patch
 
+import erlang
+
 
 @dataclass
 class Teardown:
@@ -20,6 +22,11 @@ teardown = Teardown()
 
 
 async def arm() -> str:
+    teardown.closing.clear()
+    teardown.release.clear()
+    teardown.closed.clear()
+    teardown.stderr.seek(0)
+    teardown.stderr.truncate()
     loop = asyncio.get_running_loop()
     close = loop.close
 
@@ -47,11 +54,35 @@ def wait_closing() -> str:
     return "closing"
 
 
-def retiring_factory() -> Coroutine[object, object, str]:
+def retire() -> None:
     teardown.release.set()
     if not teardown.closed.wait(5):
         raise TimeoutError("Loop owner did not finish teardown")
+
+
+def retiring_factory() -> Coroutine[object, object, str]:
+    retire()
     return completed()
+
+
+def retiring_result() -> str:
+    retire()
+    return "completed"
+
+
+async def retiring_completed() -> str:
+    erlang.call("owner_destroy_loop")
+    return "completed"
+
+
+def retiring_empty() -> bytes:
+    retire()
+    return b""
+
+
+def retiring_error() -> None:
+    retire()
+    raise ValueError("completed failure")
 
 
 def finish() -> str:
