@@ -2787,6 +2787,27 @@ static int worker_context_init(py_context_t *ctx) {
  */
 #define CTX_THREAD_JOIN_TIMEOUT_SECS 30
 
+#if !defined(__linux__)
+/* Without pthread_timedjoin_np, poll with backoff so a thread that exits
+ * promptly is joined in about a millisecond rather than a fixed 100ms. */
+static bool wait_thread_stopped(_Atomic bool *running, int timeout_secs) {
+    struct timespec start, now;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    useconds_t delay_us = 500;
+    while (atomic_load(running)) {
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (now.tv_sec - start.tv_sec >= timeout_secs) {
+            return false;
+        }
+        usleep(delay_us);
+        if (delay_us < 50000) {
+            delay_us *= 2;
+        }
+    }
+    return true;
+}
+#endif
+
 static void ctx_thread_shutdown_worker(py_context_t *ctx) {
     if (!ctx->has_thread) {
         return;
@@ -2819,14 +2840,7 @@ static void ctx_thread_shutdown_worker(py_context_t *ctx) {
     int rc = pthread_timedjoin_np(ctx->thread, NULL, &deadline);
     join_succeeded = (rc == 0);
 #else
-    /* macOS/other: poll thread_running flag with timeout */
-    int wait_ms = 0;
-    while (atomic_load(&ctx->thread_running) &&
-           wait_ms < CTX_THREAD_JOIN_TIMEOUT_SECS * 1000) {
-        usleep(100000);  /* 100ms */
-        wait_ms += 100;
-    }
-    if (!atomic_load(&ctx->thread_running)) {
+    if (wait_thread_stopped(&ctx->thread_running, CTX_THREAD_JOIN_TIMEOUT_SECS)) {
         pthread_join(ctx->thread, NULL);
         join_succeeded = true;
     }
@@ -3468,14 +3482,7 @@ static void ctx_thread_shutdown_owngil(py_context_t *ctx) {
     int rc = pthread_timedjoin_np(ctx->thread, NULL, &deadline);
     join_succeeded = (rc == 0);
 #else
-    /* macOS/other: poll thread_running flag with timeout */
-    int wait_ms = 0;
-    while (atomic_load(&ctx->thread_running) &&
-           wait_ms < OWNGIL_SHUTDOWN_TIMEOUT_SECS * 1000) {
-        usleep(100000);  /* 100ms */
-        wait_ms += 100;
-    }
-    if (!atomic_load(&ctx->thread_running)) {
+    if (wait_thread_stopped(&ctx->thread_running, OWNGIL_SHUTDOWN_TIMEOUT_SECS)) {
         pthread_join(ctx->thread, NULL);
         join_succeeded = true;
     }
