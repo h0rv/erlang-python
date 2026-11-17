@@ -94,3 +94,27 @@ def test_socket__fatal_write_aborts_buffered_transport_once() -> None:
         assert len(loop.failures) == 1
         transport.abort()
         assert protocol.lost == 1
+
+
+class Received(asyncio.Protocol):
+    def __init__(self) -> None:
+        self.data: list[bytes] = []
+
+    @override
+    def data_received(self, data: bytes) -> None:
+        self.data.append(data)
+
+
+def test_socket__set_protocol_routes_later_reads_to_the_new_protocol() -> None:
+    loop, first, second = Loop(), Received(), Received()
+    writer, reader = socket.socketpair()
+    with writer, reader:
+        reader.setblocking(False)
+        transport = ErlangSocketTransport(loop, reader, first)
+        writer.sendall(b"upgrade")
+        transport._read_ready()
+        transport.set_protocol(second)
+        writer.sendall(b"frame")
+        transport._read_ready()
+        assert transport.get_protocol() is second
+        assert (first.data, second.data) == ([b"upgrade"], [b"frame"])

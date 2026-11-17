@@ -283,6 +283,14 @@ class ErlangSocketTransport(transports._FlowControlMixin):
         return self._extra.get(name, default)
 
     @override
+    def set_protocol(self, protocol):
+        self._protocol = protocol
+
+    @override
+    def get_protocol(self):
+        return self._protocol
+
+    @override
     def is_closing(self):
         return self._closing
 
