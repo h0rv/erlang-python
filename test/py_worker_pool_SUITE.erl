@@ -2,11 +2,13 @@
 -export([all/0, init_per_suite/1, end_per_suite/1,
          sleeping/1, cpu_parallel/1, reuse/1, capacity/1, portable_env/1, callbacks/1,
          isolated_state/1, policy_independent/1, factory_drain/1, exception_identity/1,
-         preferred_release/1, preferred_timeout/1, preferred_fifo/1, preferred_races/1]).
+         preferred_release/1, preferred_timeout/1, preferred_fifo/1, preferred_races/1,
+         background_tasks/1, background_cleanup/1, worker_wakeups/1]).
 
 all() -> [reuse, portable_env, capacity, callbacks, sleeping, cpu_parallel, isolated_state,
           policy_independent, factory_drain, exception_identity,
-          preferred_release, preferred_timeout, preferred_fifo, preferred_races].
+          preferred_release, preferred_timeout, preferred_fifo, preferred_races,
+          background_tasks, background_cleanup, worker_wakeups].
 init_per_suite(Config) ->
     application:load(erlang_python),
     application:set_env(erlang_python, worker_pool_max, 16),
@@ -27,6 +29,80 @@ with_context(Fun) ->
 
 sleeping(_) -> with_context(fun(Ctx) ->
     {ok, none} = py_context:call(Ctx, py_test_worker_pool, sleeping, [], #{}, 30000)
+end).
+
+background_tasks(_) -> with_context(fun(Ctx) ->
+    {ok, {true, true}} = py_context:call(Ctx, py_test_worker_tasks, background_progress, [], #{}, 30000)
+end).
+
+worker_wakeups(_) ->
+    with_context(fun(Ctx) ->
+        {ok, none} = py_context:call(Ctx, py_test_worker_tasks, queued_wakeups, [], #{}, 30000),
+        {ok, none} = py_context:call(Ctx, py_test_worker_tasks, prepare_shutdown, [], #{}, 30000)
+    end),
+    with_context(fun(Ctx) ->
+        {ok, none} = py_context:call(Ctx, py_test_worker_tasks, check_shutdown, [], #{}, 30000)
+    end),
+    with_context(fun(Worker) -> with_context(fun(Control) ->
+        Ref = py_context:get_nif_ref(Worker),
+        {ok, none} = py_context:call(Control, py_test_worker_tasks, reset_block, []),
+        Block = make_ref(),
+        {enqueued, Block} = py_nif:context_call_async(Ref, self(), Block,
+            <<"py_test_worker_tasks">>, <<"blocking_request">>, [], #{}),
+        {ok, none} = py_context:call(Control, py_test_worker_tasks, wait_block_started, []),
+        Requests = [make_ref() || _ <- lists:seq(1, 20000)],
+        try
+            [{enqueued, R} = py_nif:context_call_async(Ref, self(), R,
+                <<"builtins">>, <<"len">>, [[]], #{}) || R <- Requests]
+        after
+            {ok, none} = py_context:call(Control, py_test_worker_tasks, release_block, [])
+        end,
+        receive {py_result, Block, {ok, none}} -> ok after 30000 -> error(block_stuck) end,
+        [receive {py_result, R, {ok, 0}} -> ok after 30000 -> error(request_lost) end
+            || R <- Requests]
+    end) end).
+
+background_cleanup(_) -> with_context(fun(Ctx) ->
+    Hold = fun(Preferred) ->
+        Parent = self(),
+        Holder = spawn(fun() ->
+            Worker = py_worker_pool:checkout(Preferred),
+            Parent ! {leased_task_worker, self()},
+            receive release -> py_worker_pool:checkin(Worker) end
+        end),
+        receive {leased_task_worker, Holder} -> Holder end
+    end,
+    Release = fun(Holder) ->
+        Holder ! release,
+        py_worker_pool:drain(Holder)
+    end,
+    py_callback:register(worker_task_hold, fun([Actor]) ->
+        #{ctx := Worker} = sys:get_state(Actor), Hold(Worker)
+    end),
+    py_callback:register(worker_task_block, fun([Actor]) ->
+        #{ctx := Worker} = sys:get_state(Actor),
+        spawn(fun() ->
+            Worker = py_worker_pool:checkout(Worker),
+            {ok, none} = py_context:call(Worker, py_test_worker_tasks, blocking_request, [], #{}, 30000),
+            py_worker_pool:checkin(Worker)
+        end)
+    end),
+    py_callback:register(worker_task_object, fun([Actor]) ->
+        #{object := Object} = sys:get_state(Actor), Object
+    end),
+    py_callback:register(worker_task_hold_all, fun([]) ->
+        [Hold(undefined) || _ <- lists:seq(1, 16)]
+    end),
+    py_callback:register(worker_task_release, fun([Holder]) -> Release(Holder) end),
+    py_callback:register(worker_task_release_all, fun([Holders]) ->
+        [Release(Holder) || Holder <- Holders], ok
+    end),
+    try
+        {ok, none} = py_context:call(Ctx, py_test_worker_tasks, background_cleanup, [], #{}, 60000)
+    after
+        [py_callback:unregister(Name) || Name <- [worker_task_block, worker_task_object, worker_task_hold, worker_task_hold_all,
+            worker_task_release, worker_task_release_all]]
+    end
 end).
 
 isolated_state(_) -> with_context(fun(Ctx) ->

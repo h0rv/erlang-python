@@ -1,7 +1,9 @@
 import asyncio
-from collections.abc import Callable
+import os
+from collections.abc import Callable, Coroutine
+from contextvars import Context, ContextVar
 from dataclasses import dataclass
-from threading import local
+from threading import Event, RLock, local
 from typing import Literal, Protocol, Self, runtime_checkable
 
 import erlang
@@ -86,7 +88,15 @@ def portable(value: object) -> object:
 
 
 def initialize(factory: object, state: object) -> None:
-    erlang._actor_construct(state, factory)
+    owner = _ActorTasks()
+    token = _task_owner.set(owner)
+    try:
+        erlang._actor_construct(state, factory, owner)
+    except BaseException:
+        owner.close()
+        raise
+    finally:
+        _task_owner.reset(token)
 
 
 def call(
@@ -96,7 +106,10 @@ def call(
         container = erlang._actor_unwrap(state)
         if not isinstance(container, DataDispatcher):
             raise TypeError("Actor factory must return a data dispatcher")
-        return True, dispatch_worker(container, payload)
+        owner = erlang._actor_owner(state)
+        if not isinstance(owner, _ActorTasks):
+            raise TypeError("Expected an actor task owner")
+        return True, dispatch_worker(container, payload, owner)
     except BaseException as error:
         return False, erlang._actor_retain(error)
     finally:
@@ -110,11 +123,102 @@ def response(value: object) -> bytes:
     return result
 
 
-async def dispatch(container: DataDispatcher, payload: bytes) -> bytes:
-    result = await container.dispatch(payload)
-    if type(result) is not bytes:
-        raise TypeError("Actor dispatch must return immutable bytes")
-    return result
+async def dispatch(
+    container: DataDispatcher, payload: bytes, owner: "_ActorTasks"
+) -> bytes:
+    token = _task_owner.set(owner)
+    try:
+        result = await container.dispatch(payload)
+        if type(result) is not bytes:
+            raise TypeError("Actor dispatch must return immutable bytes")
+        return result
+    finally:
+        _task_owner.reset(token)
+
+
+class _ActorTasks:
+    def __init__(self) -> None:
+        self.lock = RLock()
+        self.tasks: dict[asyncio.AbstractEventLoop, set[asyncio.Task[object]]] = {}
+        self.sealed = False
+        self.closed = Event()
+
+    def track(self, task: asyncio.Task[object]) -> None:
+        loop = task.get_loop()
+        with self.lock:
+            self.tasks.setdefault(loop, set()).add(task)
+            sealed = self.sealed
+        task.add_done_callback(self.finished, context=Context())
+        if sealed:
+            task.cancel()
+
+    def finished(self, task: asyncio.Task[object]) -> None:
+        with self.lock:
+            tasks = self.tasks[task.get_loop()]
+            tasks.discard(task)
+            if not tasks:
+                del self.tasks[task.get_loop()]
+        if not task.cancelled():
+            task.exception()
+
+    async def cancel(self, loop: asyncio.AbstractEventLoop) -> None:
+        while True:
+            with self.lock:
+                tasks = tuple(self.tasks.get(loop, ()))
+            if not tasks:
+                return
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    def close(self) -> None:
+        with self.lock:
+            already_closing = self.sealed
+            self.sealed = True
+        if already_closing:
+            self.closed.wait()
+            return
+        while True:
+            with self.lock:
+                loops = tuple(self.tasks)
+            if not loops:
+                break
+            for loop in loops:
+                pending = self.cancel(loop)
+                if loop is _worker_loop.loop and not loop.is_running():
+                    loop.run_until_complete(pending)
+                else:
+                    asyncio.run_coroutine_threadsafe(pending, loop).result()
+        self.closed.set()
+
+
+_task_owner: ContextVar[_ActorTasks | None] = ContextVar(
+    "actor_task_owner", default=None
+)
+
+
+def release(owner: _ActorTasks) -> None:
+    owner.close()
+
+
+def _task_factory(
+    loop: asyncio.AbstractEventLoop,
+    coroutine: Coroutine[object, object, object],
+    *,
+    context: Context | None = None,
+    name: str | None = None,
+    eager_start: bool | None = None,
+) -> asyncio.Task[object]:
+    owner = _task_owner.get()
+    if context is not None:
+        owner = owner if owner is not None else context.get(_task_owner)
+        if owner is not None:
+            context = context.copy()
+            context.run(_task_owner.set, owner)
+    task = asyncio.Task(coroutine, loop=loop, context=context, name=name)
+    if owner is not None:
+        owner.track(task)
+    return task
 
 
 class _WorkerLoop(local):
@@ -124,21 +228,60 @@ class _WorkerLoop(local):
     def get(self) -> asyncio.AbstractEventLoop:
         if self.loop is None:
             self.loop = asyncio.SelectorEventLoop()
+            self.loop.set_task_factory(_task_factory)
         return self.loop
 
 
 _worker_loop = _WorkerLoop()
 
 
-def dispatch_worker(container: DataDispatcher, payload: bytes) -> bytes:
-    return _worker_loop.get().run_until_complete(dispatch(container, payload))
+def dispatch_worker(
+    container: DataDispatcher, payload: bytes, owner: _ActorTasks
+) -> bytes:
+    return _worker_loop.get().run_until_complete(dispatch(container, payload, owner))
 
 
 def close_worker_loop() -> None:
     loop = _worker_loop.loop
     if loop is not None:
+        loop.run_until_complete(_shutdown_worker(loop))
         loop.close()
         _worker_loop.loop = None
+
+
+async def _shutdown_worker(loop: asyncio.AbstractEventLoop) -> None:
+    current = asyncio.current_task()
+    while pending := tuple(
+        task for task in asyncio.all_tasks(loop) if task is not current
+    ):
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+    await loop.shutdown_asyncgens()
+    await loop.shutdown_default_executor()
+
+
+async def _wait_worker(fd: int) -> None:
+    loop = asyncio.get_running_loop()
+    ready = asyncio.Event()
+
+    def wake() -> None:
+        try:
+            while os.read(fd, 4096):
+                pass
+        except BlockingIOError:
+            pass
+        ready.set()
+
+    loop.add_reader(fd, wake)
+    try:
+        await ready.wait()
+    finally:
+        loop.remove_reader(fd)
+
+
+def wait_worker(fd: int) -> None:
+    _worker_loop.get().run_until_complete(_wait_worker(fd))
 
 
 def _resolved(reply: object) -> tuple[object, int, object]:

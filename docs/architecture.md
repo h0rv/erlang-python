@@ -150,6 +150,18 @@ are in the [decision records](decisions/overview.md).
 
 ## asyncio
 
+Actor worker threads drive their local selector loop between requests until a
+nonblocking wakeup pipe signals queued work. Calls drive the same loop until
+dispatch finishes, so detached tasks progress during asynchronous calls and idle
+time. Blocking Python code still pauses other tasks on that worker.
+
+Each actor generation retains a distinct task owner beside its native state
+reference. Teardown waits for foreground requests, then cancels and awaits that
+owner's tasks on every visited loop without checking out a worker. Cleanup waits
+without holding the state mutex or task-owner lock; a blocking request on a
+target worker must finish before that worker can process cancellation.
+Teardown waits indefinitely if a task ignores cancellation.
+
 Three different machineries, on purpose:
 
 - Embedded contexts share an `ErlangEventLoop` (`priv/_erlang_impl/_loop.py`)

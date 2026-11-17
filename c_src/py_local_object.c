@@ -3,6 +3,7 @@
 
 typedef struct {
     PyObject *value;
+    PyObject *task_owner;
     py_context_t *ctx;
     py_env_resource_t *env;
     bool actor_owned;
@@ -141,9 +142,10 @@ static void local_object_destructor(ErlNifEnv *env, void *resource) {
     if (ref->env != NULL) atomic_fetch_sub(&local_object_env_count, 1);
     /* Only main-interpreter references can be constructed. A context resource
      * is retained for identity, not kept running after explicit destruction. */
-    if (ref->value != NULL && runtime_is_running()) {
+    if ((ref->value != NULL || ref->actor_owned) && runtime_is_running()) {
         PyGILState_STATE gil = PyGILState_Ensure();
-        Py_DECREF(ref->value);
+        Py_XDECREF(ref->value);
+        if (ref->actor_owned) Py_XDECREF(ref->task_owner);
         PyGILState_Release(gil);
     }
     if (ref->env != NULL) enif_release_resource(ref->env);
@@ -169,8 +171,8 @@ static ERL_NIF_TERM nif_actor_object_new(ErlNifEnv *env, int argc, const ERL_NIF
 }
 
 static PyObject *python_actor_construct(PyObject *self, PyObject *args) {
-    PyObject *capsule, *factory_capsule;
-    if (!PyArg_ParseTuple(args, "OO", &capsule, &factory_capsule)) return NULL;
+    PyObject *capsule, *factory_capsule, *owner;
+    if (!PyArg_ParseTuple(args, "OOO", &capsule, &factory_capsule, &owner)) return NULL;
     if (PyInterpreterState_GetID(PyInterpreterState_Get()) != 0) {
         PyErr_SetString(PyExc_RuntimeError, "Actors require the main interpreter");
         return NULL;
@@ -190,6 +192,7 @@ static PyObject *python_actor_construct(PyObject *self, PyObject *args) {
     bool available = !ref->released && ref->value == NULL;
     if (available) {
         ref->value = Py_NewRef(value);
+        ref->task_owner = Py_NewRef(owner);
         atomic_fetch_add(&local_object_value_count, 1);
     }
     pthread_mutex_unlock(&ref->mutex);
@@ -201,6 +204,22 @@ static PyObject *python_actor_construct(PyObject *self, PyObject *args) {
     Py_RETURN_NONE;
 }
 
+static PyObject *python_actor_owner(PyObject *self, PyObject *capsule) {
+    (void)self;
+    local_object_t *ref = PyCapsule_GetPointer(capsule, LOCAL_OBJECT_CAPSULE);
+    if (ref == NULL) return NULL;
+    if (!ref->actor_owned) {
+        PyErr_SetString(PyExc_TypeError, "Expected an actor-owned reference");
+        return NULL;
+    }
+    pthread_mutex_lock(&ref->mutex);
+    PyObject *owner = Py_XNewRef(ref->task_owner);
+    pthread_mutex_unlock(&ref->mutex);
+    if (owner == NULL)
+        PyErr_SetString(PyExc_RuntimeError, "Actor object is uninitialized or released");
+    return owner;
+}
+
 static ERL_NIF_TERM nif_actor_object_release(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     (void)argc;
     local_object_t *ref;
@@ -208,12 +227,30 @@ static ERL_NIF_TERM nif_actor_object_release(ErlNifEnv *env, int argc, const ERL
         !ref->actor_owned) return enif_make_badarg(env);
     PyGILState_STATE gil = PyGILState_Ensure();
     pthread_mutex_lock(&ref->mutex);
+    PyObject *owner = Py_XNewRef(ref->task_owner);
+    pthread_mutex_unlock(&ref->mutex);
+    if (owner != NULL) {
+        PyObject *module = PyImport_ImportModule("_erlang_impl._actor_data");
+        PyObject *closed = module == NULL ? NULL : PyObject_CallMethod(module, "release", "O", owner);
+        Py_DECREF(owner);
+        Py_XDECREF(module);
+        if (closed == NULL) {
+            ERL_NIF_TERM error = make_py_error(env);
+            PyGILState_Release(gil);
+            return error;
+        }
+        Py_DECREF(closed);
+    }
+    pthread_mutex_lock(&ref->mutex);
     PyObject *value = ref->value;
+    owner = ref->task_owner;
     ref->value = NULL;
+    ref->task_owner = NULL;
     ref->released = true;
     pthread_mutex_unlock(&ref->mutex);
     if (value != NULL) atomic_fetch_sub(&local_object_value_count, 1);
     Py_XDECREF(value);
+    Py_XDECREF(owner);
     PyGILState_Release(gil);
     return ATOM_OK;
 }

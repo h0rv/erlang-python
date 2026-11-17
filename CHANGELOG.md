@@ -4,6 +4,12 @@
 
 ### Fixed
 
+- Worker-local actor loops run between requests, waking for queued work through
+  a nonblocking pipe. Actor generations own their descendant tasks even when
+  factories share a container or calls fall back to another worker. Teardown
+  cancels and awaits those tasks before releasing references; worker shutdown
+  also awaits task, async generator and executor cleanup.
+
 - Worker pool overlap regressions use rendezvous barriers and distinct thread
   identities instead of sleep deadlines and CPU speed ratios.
 
