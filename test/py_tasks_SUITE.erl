@@ -2,6 +2,7 @@
 -export([all/0, init_per_suite/1, end_per_suite/1, init_per_testcase/2, killed_child/1,
          killed_context/1, killed_group/1, queued_ticket/1, killed_before_execution/1,
          retained_exception_lifecycle/1, owngil_api/1, owngil_parallel/1,
+         owngil_completion_latency/1,
          owngil_prestart_cancel/1, owngil_running_cancel/1, owngil_killed_context/1,
          owngil_missing_envelope/1, unsupported_named_mode/1, owngil_surrogate_error/1,
          owngil_unicode_identifiers/1, owngil_import_failure/1,
@@ -11,6 +12,7 @@
          isolated_unacknowledged_down/1, isolated_exit_timeout/1]).
 all() -> [killed_child, killed_context, killed_group, queued_ticket, killed_before_execution,
           retained_exception_lifecycle, owngil_api, owngil_parallel,
+          owngil_completion_latency,
           owngil_prestart_cancel, owngil_running_cancel, owngil_killed_context,
           owngil_missing_envelope, unsupported_named_mode, owngil_surrogate_error,
           owngil_unicode_identifiers, owngil_import_failure,
@@ -226,6 +228,22 @@ resolution_failure(Module, Function, Type, Message) ->
         {ok, true} = py_context:submit_await(Ctx, py_test_task_entries, resolution_failure,
                                            [Module, Function, Type, Message], #{}, 15000)
     after py_context:destroy(Ctx) end.
+
+owngil_completion_latency(_) ->
+    with_named_group(1, fun(Source, Group, Gate) ->
+        [begin
+            {ok, Pid} = start_named(Source, Group, Gate, Function, Payload),
+            Before = erlang:monotonic_time(millisecond),
+            Expected = gen_server:call(Group, {wait, Pid}, 500),
+            ct:log("~p completion and cleanup took ~p ms", [Function,
+                erlang:monotonic_time(millisecond) - Before]),
+            #{count := 0, unsettled := 0} = py_nif:actor_gate_info(Gate)
+         end || {Function, Payload, Expected} <- [
+            {<<"echo">>, <<"work">>, {ok, {bytes, <<"work">>}}},
+            {<<"echo">>, <<>>, {ok, {bytes, <<>>}}},
+            {<<"failure">>, <<>>, {remote_error, <<"ValueError">>, <<"remote failure">>}}
+         ]]
+    end).
 
 owngil_parallel(_) ->
     with_named_group(2, fun(Source, Group, Gate) ->
