@@ -161,10 +161,10 @@ async def api() -> bool:
             gate,
             ticket,
             b"",
-            "isolated",
+            "unsupported",
             (echo.__module__, echo.__qualname__),
         )
-        assert reply == ("error", ("unsupported_task_mode", "isolated"))
+        assert reply == ("error", ("unsupported_task_mode", "unsupported"))
     finally:
         erlang._actor_abort(ticket)
     for payload in (b"", b"work", b"\x00\xff"):

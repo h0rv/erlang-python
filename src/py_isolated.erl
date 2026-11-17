@@ -201,10 +201,16 @@ handle_event(info, {Port, {exit_status, Status}}, State, #data{child = #child{po
     child_exited(exit_reason(Status), State, Data);
 handle_event(info, {Port, _}, _State, _Data) when is_port(Port) ->
     keep_state_and_data;
-handle_event(state_timeout, exit_status, {restarting, _} = State, #data{child = Child} = Data) ->
+handle_event(state_timeout, exit_status, {restarting, _} = State,
+             #data{child = Child, opts = Opts} = Data) ->
     logger:error("py_context ~p (isolated): child ~p did not exit after SIGKILL",
                  [Data#data.id, Child#child.os_pid]),
-    child_exited({signal, 9}, State, Data);
+    case maps:is_key(task_exit_observer, Opts) of
+        true ->
+            Reason = {child_exit_unacknowledged, {signal, 9}},
+            {stop, Reason, fail_pending(Reason, Data)};
+        false -> child_exited({signal, 9}, State, Data)
+    end;
 
 %% ---- requests --------------------------------------------------------------
 
@@ -1018,6 +1024,7 @@ exit_reason(Status) -> {exit_status, Status}.
 %% restart within the budget or stop.
 child_exited(Reason, State, #data{child = Child, opts = Opts} = Data0) ->
     close_child(Child),
+    notify_task_exit(Reason, Data0),
     FailReason = case {State, Reason} of
         {{restarting, killed}, _} -> killed;
         %% The memory watchdog announced the exit; our SIGKILL may win the race
@@ -1087,24 +1094,33 @@ stop_child(#data{child = #child{port = Port, os_pid = OsPid} = Child} = Data, Ho
         graceful ->
             _ = send_frame(Child, 0, ?STATUS_REQUEST, shutdown),
             receive
-                {Port, {exit_status, _}} -> ok
+                {Port, {exit_status, Status}} -> notify_task_exit(exit_reason(Status), Data)
             after ?SHUTDOWN_GRACE_MS ->
                 kill_port(Port, OsPid),
-                wait_exit(Port)
+                wait_exit(Port, Data)
             end;
         _ ->
             kill_port(Port, OsPid),
-            wait_exit(Port)
+            wait_exit(Port, Data)
     end,
     close_child(Child),
     Data1 = fail_pending({child_exited, stopped}, Data),
     Data1#data{child = undefined}.
 
-wait_exit(Port) ->
+wait_exit(Port, Data) ->
     receive
-        {Port, {exit_status, _}} -> ok
+        {Port, {exit_status, Status}} -> notify_task_exit(exit_reason(Status), Data)
     after 2000 ->
         ok
+    end.
+
+notify_task_exit(Reason, #data{opts = Opts}) ->
+    case maps:get(task_exit_observer, Opts, undefined) of
+        {Group, Task} when is_pid(Group), is_pid(Task) ->
+            Group ! {task_child_exited, Task, self(), Reason},
+            Task ! {isolated_child_exited, self(), Reason},
+            ok;
+        _ -> ok
     end.
 
 close_child(#child{port = Port, sock = S, listener = L}) ->

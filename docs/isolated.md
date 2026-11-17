@@ -24,6 +24,29 @@ memory bound. The public API is the one you already use with `worker` and
 | Startup | microseconds | milliseconds | ~40 ms |
 | Zero-copy `py_buffer`, channels, `erlang.schedule`, object refs | yes | yes | no (see Limits) |
 
+## Named tasks
+
+`erlang.tasks.start(group, gate, fn, payload, mode="isolated")` accepts the same
+plain, importable top-level `async def fn(payload: bytes) -> bytes` contract as
+`mode="owngil"`. The default `worker` mode still requires a factory returning
+`Body`. Entry modules must be on the configured Python paths. Named tasks
+validate the entry before admission and resolve it inside the child.
+
+Each isolated task owns one child with `restart => false`; losing the child
+never retries the task. Exceptions and import/lookup failures return
+`RemoteTaskError(type_name, message)`. A confirmed child exit without a terminal
+reply returns `{task_crashed, Reason}` to Erlang and `(False, TaskCrashed(reason))`
+from Python's `erlang.tasks.outcome`. For example, `os.abort()` produces reason
+`("signal", 6)`. The process has stopped, but its external effects remain unknown.
+The admission ticket is released and the group remains open. A terminal reply
+already received wins over a later exit. Timeouts and context deaths without
+child-exit acknowledgement retain the existing uncertain-inflight handling.
+
+Cancellation is cooperative, through the task's owning loop. CPU/native-blocked
+work can delay it. Only a terminal cancelled reply acknowledges cancellation
+and yields `CancelledError`; an interrupt that escalates to killing the child
+without that reply yields `TaskCrashed`, even after a cancellation request.
+
 ## Start a context
 
 ```erlang

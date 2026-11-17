@@ -153,6 +153,14 @@ class RemoteTaskError(RuntimeError):
         super().__init__(type_name, message)
 
 
+class TaskCrashed(RuntimeError):
+    """The child exited: execution stopped, but external effects are unknown."""
+
+    def __init__(self, reason: object) -> None:
+        self.reason = reason
+        super().__init__(reason)
+
+
 async def execute(body: Body, ticket: object, payload: bytes) -> bytes:
     try:
         return await body.run(payload)
@@ -218,22 +226,24 @@ async def start(
     factory: Callable[[], Body] | Callable[[bytes], Awaitable[bytes]],
     payload: bytes,
     *,
-    mode: Literal["worker", "owngil"] = "worker",
+    mode: Literal["worker", "owngil", "isolated"] = "worker",
 ) -> object:
-    """Start a worker factory or name a top-level async byte function for owngil.
+    """Start a worker factory or a named async byte function in owngil/isolated mode.
 
-    Owngil resolves the function in its own interpreter. Cancellation is cooperative;
+    Named tasks resolve the function in their interpreter. Cancellation is cooperative;
     CPU/native-blocked bodies delay it. Remote errors transfer type/message text only.
+    Isolated tasks never restart. A child exit without a terminal reply is TaskCrashed,
+    even after a cancel request; only a cancelled reply acknowledges cancellation.
     """
     if mode != "worker":
         if not isinstance(factory, FunctionType) or not iscoroutinefunction(factory):
-            raise TypeError("owngil tasks require an async Python function")
+            raise TypeError(mode + " tasks require an async Python function")
         if (
             not isinstance(factory.__module__, str)
             or not factory.__qualname__.isidentifier()
             or not all(part.isidentifier() for part in factory.__module__.split("."))
         ):
-            raise TypeError("owngil tasks require importable top-level functions")
+            raise TypeError(mode + " tasks require importable top-level functions")
         ticket = erlang._actor_reserve(gate, len(payload))
         try:
             return result(
@@ -267,6 +277,8 @@ async def start(
 async def outcome(group: object, pid: object) -> Outcome:
     reply = await erlang.async_call("_task_wait", group, pid)
     if isinstance(reply, tuple):
+        if len(reply) == 2 and reply[0] == "task_crashed":
+            return False, TaskCrashed(reply[1])
         if reply == ("cancelled",):
             return False, asyncio.CancelledError()
         if len(reply) == 3 and reply[0] == "remote_error":
