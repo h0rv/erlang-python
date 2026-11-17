@@ -1,10 +1,10 @@
 -module(py_actor_data_SUITE).
 -export([all/0, init_per_suite/1, end_per_suite/1,
          basic/1, cancelled/1, restart/1, ticket_orders/1, busy_kill/1,
-         context_kill/1, queued_abort/1, concurrent_children/1, group_kill/1,
+         context_kill/1, abandoned_commit/1, queued_abort/1, concurrent_children/1, group_kill/1,
          callback_overflow/1, state_graphs/1]).
 all() -> [basic, cancelled, restart, ticket_orders, busy_kill,
-          context_kill, queued_abort, concurrent_children, group_kill, callback_overflow,
+          context_kill, abandoned_commit, queued_abort, concurrent_children, group_kill, callback_overflow,
           state_graphs].
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(erlang_python), Config.
@@ -38,8 +38,8 @@ end) end).
 
 restart(_) ->
     py_callback:register(actor_data_kill, fun([Pid]) ->
-        [{{Group, Id}, Pid, Old, _, _}] = ets:match_object(py_actor_generations,
-            {{'_', '_'}, Pid, '_', '_', '_'}),
+        [{{Group, Id}, Pid, Old, _, _, _}] = ets:match_object(py_actor_generations,
+            {{'_', '_'}, Pid, '_', '_', '_', '_'}),
         exit(Pid, kill),
         await_generation(Group, Id, Old, 1000)
     end),
@@ -89,7 +89,7 @@ busy_kill(_) -> kill_busy(actor).
 context_kill(_) -> kill_busy(context).
 kill_busy(Victim) -> with_gate(fun() -> with_context(fun(Ctx) ->
     {Group, Actor, Generation, Gate} = owned(Ctx),
-    [{_, _, _, _, Owned}] = ets:lookup(py_actor_generations, {Group, <<"counter">>}),
+    [{_, _, _, _, Owned, _}] = ets:lookup(py_actor_generations, {Group, <<"counter">>}),
     Ticket = reserve(Ctx, Gate, 4),
     Parent = self(),
     spawn(fun() ->
@@ -146,7 +146,7 @@ end).
 
 group_kill(_) -> with_context(fun(Ctx) ->
     {Group, Actor, _, _} = owned(Ctx),
-    [{_, _, _, _, Owned}] = ets:lookup(py_actor_generations, {Group, <<"counter">>}),
+    [{_, _, _, _, Owned, _}] = ets:lookup(py_actor_generations, {Group, <<"counter">>}),
     ActorMon = monitor(process, Actor),
     ContextMon = monitor(process, Owned),
     exit(Group, kill),
@@ -160,6 +160,31 @@ registry_empty(Group, N) ->
     case ets:lookup(py_actor_generations, {Group, <<"counter">>}) of
         [] -> ok;
         _ -> receive after 1 -> registry_empty(Group, N - 1) end
+    end.
+
+abandoned_commit(_) -> with_context(fun(Ctx) ->
+    {Group, Actor, _, Gate} = owned(Ctx),
+    Ticket = reserve(Ctx, Gate, 1),
+    ok = sys:suspend(Actor),
+    Parent = self(),
+    spawn(fun() ->
+        Result = try py_callback:execute(<<"_actor_data_call">>,
+            [Actor, Gate, Ticket, <<"1">>]) catch exit:Reason -> {exit, Reason} end,
+        Parent ! {finished, Result}
+    end),
+    await_ticket(Ticket, committed, 1000),
+    %% The committed call is still in the suspended actor's mailbox.
+    exit(Actor, kill),
+    receive {finished, {error, {exit, _, _}}} -> ok after 5000 -> error(call_survived) end,
+    await_ticket(Ticket, reaped, 5000),
+    #{unsettled := 0} = py_nif:actor_gate_info(Gate),
+    ok = gen_server:stop(Group, normal, 5000)
+end).
+await_ticket(Ticket, State, 0) -> error({ticket_timeout, State, py_nif:actor_ticket_info(Ticket)});
+await_ticket(Ticket, State, N) ->
+    case py_nif:actor_ticket_info(Ticket) of
+        State -> ok;
+        _ -> receive after 1 -> await_ticket(Ticket, State, N - 1) end
     end.
 
 queued_abort(_) -> with_context(fun(Ctx) ->

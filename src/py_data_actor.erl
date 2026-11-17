@@ -17,8 +17,9 @@ init({Group, Id, Factory, Count, Bytes}) ->
                 <<"__import__('_erlang_impl._actor_data', fromlist=['dispatch']).dispatch">>, #{}, Env),
             Gate = py_nif:actor_gate_new(Count, Bytes),
             Generation = erlang:unique_integer([monotonic, positive]),
+            Native = py_context:get_nif_ref(Ctx),
             true = ets:insert(py_actor_generations,
-                {{Group, Id}, self(), Generation, Gate, Ctx}),
+                {{Group, Id}, self(), Generation, Gate, Ctx, Native}),
             {ok, #{ctx => Ctx, monitor => Mon, env => Env,
                    object => Object, gate => Gate, dispatch => Dispatch, kwargs => Kwargs}};
         Error -> py_context:destroy(Ctx), {stop, Error}
