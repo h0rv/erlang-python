@@ -13,6 +13,7 @@ from erlang.tasks import (
     shutdown,
     start,
 )
+from py_test_entrée import résumé
 
 
 @entrypoint
@@ -40,6 +41,33 @@ async def surrogate_error() -> bool:
     assert error.message == "remote\\udcff failure"
     pid = await start(group, gate, echo, b"completed", mode="owngil")
     assert await outcome(group, pid) == (True, b"completed")
+    await shutdown(group, 1000)
+    await dispose(group)
+    return True
+
+
+async def unicode_identifiers() -> bool:
+    group, gate = await open_group(1, 100)
+    for module, name in (
+        ("", "echo"),
+        ("py_test_task_entries.", "echo"),
+        ("py_test_task_entries", "echo\n"),
+        ("py_test_task_entries", "1résumé"),
+        ("py_test_task_entries", "résumé.unknown"),
+        ("py_test_task_entries", "\u037a"),
+        ("py_test_task_entries", "\u2e2f"),
+        ("py_test_task_entries", "\N{SNOWMAN}"),
+    ):
+        ticket = erlang._actor_reserve(gate, 0)
+        try:
+            reply = await erlang.async_call(
+                "_task_start", group, gate, ticket, b"", "owngil", (module, name)
+            )
+            assert reply == ("error", "invalid_task_entry")
+        finally:
+            erlang._actor_abort(ticket)
+    pid = await start(group, gate, résumé, b"unicode", mode="owngil")
+    assert await outcome(group, pid) == (True, b"unicode")
     await shutdown(group, 1000)
     await dispose(group)
     return True

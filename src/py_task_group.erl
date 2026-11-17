@@ -49,14 +49,27 @@ task_mode(<<"worker">>) -> worker;
 task_mode(Mode) -> Mode.
 
 validate_entry(owngil, {Module, Function}) when is_binary(Module), is_binary(Function) ->
-    case {re:run(Module, <<"^[A-Za-z_][A-Za-z_0-9]*(\\.[A-Za-z_][A-Za-z_0-9]*)*$">>,
-                 [{capture, none}]),
-          re:run(Function, <<"^[A-Za-z_][A-Za-z_0-9]*$">>, [{capture, none}])} of
-        {match, match} -> ok;
+    case lists:all(fun python_identifier/1, binary:split(Module, <<".">>, [global]))
+         andalso python_identifier(Function) of
+        true -> ok;
         _ -> {error, invalid_task_entry}
     end;
 validate_entry(owngil, _) -> {error, invalid_task_entry};
 validate_entry(Mode, _) -> {error, {unsupported_task_mode, Mode}}.
+
+python_identifier(Name) ->
+    %% ID_Start/Continue with Other_ID exceptions and NFKC closure (Python XID).
+    %% U+2E2F is Pattern_Syntax despite its letter category.
+    Start = <<"[\\p{L}\\p{Nl}_\\x{1885}\\x{1886}\\x{2118}\\x{212E}]">>,
+    Continue = <<"[\\p{L}\\p{Nl}\\p{Mn}\\p{Mc}\\p{Nd}\\p{Pc}"
+                 "\\x{B7}\\x{387}\\x{1369}-\\x{1371}\\x{19DA}"
+                 "\\x{200C}\\x{200D}\\x{2118}\\x{212E}\\x{30FB}\\x{FF65}]">>,
+    Pattern = <<"\\A(?!.*\\x{2E2F})", Start/binary, Continue/binary, "*\\z">>,
+    Options = [unicode, ucp, {capture, none}],
+    try
+        re:run(Name, Pattern, Options) =:= match andalso
+        re:run(unicode:characters_to_nfkc_binary(Name), Pattern, Options) =:= match
+    catch error:badarg -> false end.
 
 init({Count, Bytes}) when is_integer(Count), Count > 0, is_integer(Bytes), Bytes > 0 ->
     process_flag(trap_exit, true),
