@@ -21,6 +21,10 @@
 
 ### Changed
 
+- `ErlangSocketTransport` implements `set_protocol()` and `get_protocol()`.
+  Uvicorn's WebSocket upgrade swaps the HTTP protocol for a WebSocket
+  protocol on the same transport and previously raised `NotImplementedError`.
+
 - Owngil named tasks accept plain top-level async byte functions and resolve
   their module and function names in the target interpreter.
 
