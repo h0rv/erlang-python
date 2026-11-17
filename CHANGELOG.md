@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Fixed
+
+- Worker-local actor loops bypass the installed event loop policy, including
+  Erlang-backed policies on Python 3.12–3.13. Loop creation failures settle tickets.
+
 ### Added
 
 - Pooled actor regression for per-call context variable isolation and recovery

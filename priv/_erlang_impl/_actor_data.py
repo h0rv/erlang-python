@@ -123,7 +123,7 @@ class _WorkerLoop(local):
 
     def get(self) -> asyncio.AbstractEventLoop:
         if self.loop is None:
-            self.loop = asyncio.new_event_loop()
+            self.loop = asyncio.SelectorEventLoop()
         return self.loop
 
 
@@ -131,7 +131,12 @@ _worker_loop = _WorkerLoop()
 
 
 def dispatch_worker(container: DataDispatcher, ticket: object, payload: bytes) -> bytes:
-    return _worker_loop.get().run_until_complete(dispatch(container, ticket, payload))
+    try:
+        loop = _worker_loop.get()
+    except BaseException:
+        erlang._actor_complete(ticket)
+        raise
+    return loop.run_until_complete(dispatch(container, ticket, payload))
 
 
 def close_worker_loop() -> None:
