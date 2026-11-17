@@ -2746,7 +2746,8 @@ static PyObject *send_async_callback_request(PyObject *self, PyObject *args) {
      * before copying payload bytes into the callback message environment. */
     bool task_start = strcmp(func_name, "_task_start") == 0;
     bool actor_data = strcmp(func_name, "_actor_data_call") == 0 || task_start;
-    if (actor_data && actor_data_prepare(msg_env, call_args, task_start ? 5 : 4) < 0) {
+    Py_ssize_t task_arity = PyTuple_Size(call_args) == 6 ? 6 : 5;
+    if (actor_data && actor_data_prepare(msg_env, call_args, task_start ? task_arity : 4) < 0) {
         enif_free_env(msg_env);
         return NULL;
     }
