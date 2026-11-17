@@ -1,13 +1,17 @@
 -module(py_durable_queue).
 -behaviour(gen_server).
--export([start_link/0, register_callbacks/0, open/3, put/3, claim/3, ack/2, release/2]).
+-export([start_link/0, register_callbacks/0, open/3, open/4, put/3, claim/3, ack/2, release/2,
+         is_open/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 -record(dq_item, {id, queue, key, payload, attempt = 0, state = queued, not_before = 0}).
 -record(dq_meta, {key, value}).
 
 start_link() -> gen_server:start_link({local, ?MODULE}, ?MODULE, manager, []).
 register_callbacks() ->
-    py_callback:register('_queue_open', fun([Dir, Queue, Max]) -> open(Dir, Queue, Max) end),
+    py_callback:register('_queue_open', fun
+        ([Dir, Queue, Max]) -> open(Dir, Queue, Max);
+        ([Dir, Queue, Max, Replicas]) -> open(Dir, Queue, Max, Replicas)
+    end),
     py_callback:register('_queue_put', fun([Queue, Key, Payload]) ->
         put(Queue, case Key of none -> undefined; _ -> Key end, Payload) end),
     py_callback:register('_queue_claim', fun([Queue, Lease, Wait]) ->
@@ -19,10 +23,25 @@ register_callbacks() ->
     py_callback:register('_queue_ack', fun([Id, Token]) -> ack(Id, Token) end),
     py_callback:register('_queue_release', fun([Id, Token]) -> release(Id, Token) end), ok.
 
-open(Dir, Queue, Max) when is_binary(Dir), is_binary(Queue), byte_size(Queue) > 0,
-                           is_integer(Max), Max > 0 ->
-    safe_call(?MODULE, {open, filename:absname(unicode:characters_to_list(Dir)), Queue, Max});
-open(_, _, _) -> {error, invalid_argument}.
+open(Dir, Queue, Max) -> open(Dir, Queue, Max, []).
+open(Dir, Queue, Max, Replicas) when is_binary(Dir), is_binary(Queue), byte_size(Queue) > 0,
+                           is_integer(Max), Max > 0, is_list(Replicas) ->
+    case lists:all(fun(N) -> is_binary(N) andalso byte_size(N) > 0 end, Replicas) of
+        true ->
+            Nodes = case Replicas of
+                [] -> [node()];
+                _ -> lists:usort([binary_to_atom(N, utf8) || N <- Replicas])
+            end,
+            case lists:member(node(), Nodes) of
+                true -> safe_call(?MODULE, {open,
+                    filename:absname(unicode:characters_to_list(Dir)), Queue, Max, Nodes});
+                false -> {error, local_replica_required}
+            end;
+        false -> {error, invalid_argument}
+    end;
+open(_, _, _, _) -> {error, invalid_argument}.
+is_open(Queue) ->
+    case safe_call(?MODULE, {lookup, Queue}) of {ok, _} -> true; _ -> false end.
 put(Queue, Key, Payload) when is_binary(Queue), is_binary(Payload),
                               (is_binary(Key) orelse Key =:= undefined) ->
     case byte_size(Payload) =< 1048576 of
@@ -55,11 +74,12 @@ safe_call(Pid, Request) ->
 
 init(manager) -> process_flag(trap_exit, true), {ok, #{kind => manager, queues => #{}}};
 init({queue, Queue, Max}) ->
+    {ok, _} = mnesia:subscribe({table, dq_item, simple}),
     {ok, #{kind => queue, name => Queue, max => Max, waiters => [], timer => undefined}}.
 
-handle_call({open, Dir, Queue, Max}, From, #{kind := manager, queues := Queues} = S) ->
+handle_call({open, Dir, Queue, Max, Nodes}, From, #{kind := manager, queues := Queues} = S) ->
     Result = try
-        ok = ensure_store(Dir),
+        ok = ensure_store(Dir, Nodes),
         transaction(fun() ->
             case mnesia:read(dq_meta, {queue, Queue}, write) of
                 [] -> mnesia:write(#dq_meta{key = {queue, Queue}, value = {Max, 0}}), ok;
@@ -134,6 +154,7 @@ reply_write(From, {ok, Result}) -> py_durable_queue_sync:reply(From, Result);
 reply_write(From, Error) -> gen_server:reply(From, Error).
 handle_cast(_, S) -> {noreply, S}.
 handle_info(wake, S) -> {noreply, wake(S)};
+handle_info({mnesia_table_event, _}, #{kind := queue} = S) -> {noreply, wake(S)};
 handle_info({'DOWN', Mon, process, _, _}, #{waiters := Ws} = S) ->
     {noreply, arm(S#{waiters := [W || W = {_, _, _, M} <- Ws, M =/= Mon]})};
 handle_info({'EXIT', Pid, _}, #{kind := manager, queues := Qs} = S) ->
@@ -203,22 +224,31 @@ arm(#{timer := Timer, waiters := Ws, name := Queue} = S) ->
 
 transaction(Fun) ->
     try
-        ok = single_tables(),
+        ok = symmetric_tables(persistent_term:get({?MODULE, replicas})),
         case mnesia:sync_transaction(Fun) of
             {atomic, R} -> {ok, R};
             {aborted, R} -> {error, R}
         end
     catch Class:Reason -> {error, {store_failed, Class, Reason}} end.
 
-ensure_store(Dir) ->
+ensure_store(Dir, Nodes) ->
+    case persistent_term:get({?MODULE, replicas}, Nodes) of
+        Nodes -> ok;
+        _ -> error(replica_set_mismatch)
+    end,
+    Seed = hd(Nodes),
     case mnesia:system_info(is_running) of
         no ->
             ok = filelib:ensure_dir(filename:join(Dir, "schema.DAT")),
             ok = application:set_env(mnesia, dir, Dir),
-            case mnesia:create_schema([node()]) of
-                ok -> ok;
-                {error, {_, {already_exists, _}}} -> ok;
-                Other -> error({schema, Other})
+            case node() =:= Seed of
+                true ->
+                    case mnesia:create_schema([node()]) of
+                        ok -> ok;
+                        {error, {_, {already_exists, _}}} -> ok;
+                        Other -> error({schema, Other})
+                    end;
+                false -> ok
             end,
             ok = application:start(mnesia);
         yes -> ok;
@@ -227,21 +257,86 @@ ensure_store(Dir) ->
     case filename:absname(mnesia:system_info(directory)) of
         Dir -> ok; _ -> error(mnesia_directory_mismatch)
     end,
-    disc_copies = mnesia:table_info(schema, storage_type),
-    [begin
-        case mnesia:create_table(T, [{attributes, Attrs}, {type, ordered_set}, {disc_copies, [node()]}]) of
-            {atomic, ok} -> ok;
-            {aborted, {already_exists, T}} -> ok;
-            Error -> error({table, Error})
+    [net_kernel:connect_node(N) || N <- Nodes, N =/= node()],
+    {ok, _} = mnesia:change_config(extra_db_nodes, Nodes -- [node()]),
+    Deadline = erlang:monotonic_time(millisecond) + 30000,
+    case node() =:= Seed of
+        true ->
+            [begin
+                case mnesia:create_table(T, [{attributes, Attrs}, {type, ordered_set},
+                                            {disc_copies, [node()]}, {majority, false}]) of
+                    {atomic, ok} -> ok;
+                    {aborted, {already_exists, T}} -> ok;
+                    Error -> error({table, Error})
+                end
+             end || {T,Attrs} <- [{dq_item,record_info(fields,dq_item)},
+                                  {dq_meta,record_info(fields,dq_meta)}]],
+            ok = mnesia:wait_for_tables([dq_item,dq_meta],30000),
+            check_replicas(Nodes, true);
+        false ->
+            await_seed(Seed, Nodes, Deadline),
+            {ok, _} = mnesia:change_config(extra_db_nodes, Nodes -- [node()]),
+            case mnesia:change_table_copy_type(schema, node(), disc_copies) of
+                {atomic, ok} -> ok;
+                {aborted, {already_exists, schema, _, disc_copies}} -> ok;
+                SchemaError -> error({schema_copy, SchemaError})
+            end,
+            [case mnesia:add_table_copy(T, node(), disc_copies) of
+                {atomic, ok} -> ok;
+                {aborted, {already_exists, T, _}} -> ok;
+                CopyError -> error({table_copy, T, CopyError})
+             end || T <- [dq_meta, dq_item]],
+            ok = mnesia:wait_for_tables([dq_item,dq_meta],30000),
+            check_replicas(Nodes, false)
+    end,
+    await_layout(Nodes, Deadline),
+    persistent_term:put({?MODULE, replicas}, Nodes), ok.
+
+check_replicas(Nodes, Create) ->
+    case mnesia:sync_transaction(fun() ->
+        case mnesia:read(dq_meta, replicas, write) of
+            [] when Create -> mnesia:write(#dq_meta{key = replicas, value = Nodes});
+            [#dq_meta{value = Nodes}] -> ok;
+            _ -> mnesia:abort(replica_set_mismatch)
         end
-     end || {T,Attrs} <- [{dq_item,record_info(fields,dq_item)}, {dq_meta,record_info(fields,dq_meta)}]],
-    ok = mnesia:wait_for_tables([dq_item,dq_meta],30000), single_tables().
-single_tables() ->
+    end) of
+        {atomic, ok} -> ok;
+        Error -> error({replicas, Error})
+    end.
+
+await_seed(Seed, Nodes, Deadline) ->
+    Ready = try erpc:call(Seed, mnesia, dirty_read, [dq_meta, replicas], 1000)
+            catch _:_ -> unavailable end,
+    case Ready of
+        [#dq_meta{value = Nodes}] -> ok;
+        [#dq_meta{}] -> error(replica_set_mismatch);
+        _ ->
+            case erlang:monotonic_time(millisecond) < Deadline of
+                true -> timer:sleep(50), net_kernel:connect_node(Seed),
+                        await_seed(Seed, Nodes, Deadline);
+                false -> error({seed_unavailable, Seed})
+            end
+    end.
+
+await_layout(Nodes, Deadline) ->
+    try symmetric_tables(Nodes)
+    catch error:Reason ->
+        case erlang:monotonic_time(millisecond) < Deadline of
+            true -> timer:sleep(50), await_layout(Nodes, Deadline);
+            false -> error({replica_layout_timeout, Reason})
+        end
+    end.
+
+symmetric_tables(Nodes) ->
     [begin
         Layout = {mnesia:table_info(T, disc_copies), mnesia:table_info(T, ram_copies),
                   mnesia:table_info(T, disc_only_copies), mnesia:table_info(T, majority)},
         case Layout of
-            {[Local], [], [], false} when Local =:= node() -> ok;
-            _ -> error({single_node_required, T, Layout})
+            {Disc, [], [], false} ->
+                case lists:sort(Disc) =:= Nodes of
+                    true -> ok;
+                    false -> error({replica_set_mismatch, T, Layout})
+                end;
+            _ -> error({unsupported_replica_layout, T, Layout})
         end
      end || T <- [dq_item,dq_meta]], ok.
