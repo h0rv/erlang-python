@@ -29,13 +29,13 @@ suite is visible. `scripts/check_code_map.sh` requires a row per module.
 | `py_nif` | all |
 | `py_callback` | `py_callback_encoding_SUITE`, `py_thread_callback_SUITE` |
 | `py_thread_handler` | `py_thread_callback_SUITE`, `py_reentrant_SUITE` |
-| `py_event_loop` | `py_event_loop_SUITE`, `py_async_task_SUITE` |
+| `py_event_loop` | `py_event_loop_SUITE`, `py_async_task_SUITE`, `py_readiness_capacity_SUITE` |
 | `py_event_loop_pool` | `py_event_loop_pool_SUITE` |
 | `py_event_worker` | `py_event_loop_SUITE`, `py_fd_ops_SUITE` |
 | `py_event_worker_sup` | `py_event_loop_SUITE` |
 | `py_event_worker_registry` | `py_event_loop_SUITE` |
 | `py_reactor_context` | `py_reactor_SUITE` |
-| `py_channel` | `py_channel_SUITE`, `py_byte_channel_SUITE` |
+| `py_channel` | `py_channel_SUITE`, `py_byte_channel_SUITE`, `py_readiness_capacity_SUITE` |
 | `py_byte_channel` | `py_channel_SUITE`, `py_byte_channel_SUITE` |
 | `py_buffer` | `py_buffer_SUITE`, `py_isolated_buffer_SUITE` |
 | `py_shm` | `py_isolated_shm_SUITE` |

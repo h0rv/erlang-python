@@ -25,12 +25,12 @@ exercised by suites). Guides are in `docs/`, suites in `test/`. Start with
 | `py_nif` | Erlang stubs and docs for every NIF | live | api-reference | all |
 | `py_callback` | Registry of Erlang funs callable as `erlang.call('name', ...)` | live | README (callbacks) | `py_callback_encoding_SUITE`, `py_thread_callback_SUITE` |
 | `py_thread_handler` | Coordinator that gives each Python thread calling Erlang a handler process and a pipe | live | threading | `py_thread_callback_SUITE`, `py_reentrant_SUITE` |
-| `py_event_loop` | Main-interpreter asyncio loop: `run`, `create_task`, `await`, and the loop callbacks Python needs | live | asyncio | `py_event_loop_SUITE`, `py_async_task_SUITE` |
+| `py_event_loop` | Main-interpreter asyncio loop: `run`, `create_task`, `await`, and the loop callbacks Python needs | live | asyncio | `py_event_loop_SUITE`, `py_async_task_SUITE`, `py_readiness_capacity_SUITE` |
 | `py_event_loop_pool` | Several main-interpreter loops with process affinity | live | asyncio | `py_event_loop_pool_SUITE` |
 | `py_event_worker` | One process per running loop receiving `enif_select` readiness and timers | live | event_loop_architecture | `py_event_loop_SUITE`, `py_fd_ops_SUITE` |
 | `py_event_worker_sup`, `py_event_worker_registry` | Supervisor and name registry of the event workers | live | event_loop_architecture | `py_event_loop_SUITE` |
 | `py_reactor_context` | FD-owning context for the protocol-based reactor | live | reactor | `py_reactor_SUITE` |
-| `py_channel`, `py_byte_channel` | Term and byte queues between Erlang and Python coroutines (NIF resources) | live | channel | `py_channel_SUITE`, `py_byte_channel_SUITE` |
+| `py_channel`, `py_byte_channel` | Term and byte queues between Erlang and Python coroutines (NIF resources) | live | channel | `py_channel_SUITE`, `py_byte_channel_SUITE`, `py_readiness_capacity_SUITE` |
 | `py_buffer` | Native streaming input buffer; shared variant delegates to `py_shm` | live | buffer, isolated | `py_buffer_SUITE`, `py_isolated_buffer_SUITE` |
 | `py_shm` | Shared memory regions over iommap and the ring behind shared buffers | live | isolated | `py_isolated_shm_SUITE` |
 | `py_import` | Registry of imports and `sys.path` entries applied to every interpreter | live | imports | `py_import_SUITE` |
@@ -60,7 +60,7 @@ files. Editing `py_convert.c` alone does not compile it alone; build with
 | `py_callback.c` | The `erlang` Python module: `call`, `send`, `whereis`, `Atom`/`Pid`/`Ref` types, schedule markers, callback pipes, channel and shared dict methods | live |
 | `py_thread_worker.c` | Python threads calling Erlang through `py_thread_handler` | live |
 | `py_subinterp_thread.c` | Sub-interpreter thread pool used by owngil contexts and loop pools | live |
-| `py_event_loop.c` | `ErlangEventLoop` support: `enif_select` readers/writers, timers, task injection, reactor dispatch, fd registry; also ~570 lines of test-only fd/TCP/UDP NIFs | live; test section |
+| `py_event_loop.c` | `ErlangEventLoop` support: `enif_select` readers/writers, OS-limited FD poll leases, preallocated channel-readiness events with a separate unreserved-event budget, timers, task injection, reactor dispatch, fd registry; also ~570 lines of test-only fd/TCP/UDP NIFs | live; test section |
 | `py_channel.c`, `py_buffer.c`, `py_reactor_buffer.c`, `py_shared_dict.c` | The corresponding resources and their Python-facing methods | live |
 | `py_logging.c` | Logging and tracing NIFs | live |
 | `py_mem_limit.c` | Per-interpreter memory caps (owngil) | live |

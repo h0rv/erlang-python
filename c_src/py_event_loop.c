@@ -35,6 +35,7 @@
  */
 
 #include "py_nif.h"
+#include <limits.h>
 #include <unistd.h>
 #include "py_event_loop.h"
 #include "py_reactor_buffer.h"
@@ -589,16 +590,7 @@ cleanup_native:
  */
 static void fd_registry_forget(fd_resource_t *res);
 
-#define FD_POLL_LEASE_LIMIT 4096u
 static atomic_uint g_fd_poll_leases = 0;
-
-static bool fd_poll_lease_reserve(void) {
-    unsigned count = atomic_load(&g_fd_poll_leases);
-    do {
-        if (count >= FD_POLL_LEASE_LIMIT) return false;
-    } while (!atomic_compare_exchange_weak(&g_fd_poll_leases, &count, count + 1));
-    return true;
-}
 
 static void fd_poll_lease_release(fd_resource_t *res) {
     if (res->lease_counted) {
@@ -1247,6 +1239,7 @@ ERL_NIF_TERM nif_event_loop_new(ErlNifEnv *env, int argc,
 
     atomic_store(&loop->next_callback_id, 1);
     atomic_store(&loop->pending_count, 0);
+    loop->unreserved_pending = 0;
     loop->pending_head = NULL;
     loop->pending_tail = NULL;
     loop->pending_capacity = INITIAL_PENDING_CAPACITY;
@@ -1823,6 +1816,7 @@ ERL_NIF_TERM nif_get_pending(ErlNifEnv *env, int argc,
     loop->pending_head = NULL;
     loop->pending_tail = NULL;
     atomic_store(&loop->pending_count, 0);
+    loop->unreserved_pending = 0;
 
     /* Clear the hash set since we're consuming all pending events */
     pending_hash_clear(loop);
@@ -4852,8 +4846,10 @@ static inline void pending_hash_clear(erlang_event_loop_t *loop) {
 pending_event_t *event_loop_reserve_pending(erlang_event_loop_t *loop, bool *overloaded) {
     pthread_mutex_lock(&loop->mutex);
     pending_event_t *event = NULL;
-    *overloaded = loop->reserved_pending >= MAX_RESERVED_PENDING ||
-        (size_t)atomic_load(&loop->pending_count) + loop->reserved_pending >= MAX_PENDING_CAPACITY;
+    /* Keep the int event count representable even if every waiter wakes,
+     * with a full ordinary-event budget alongside it. Memory is allocated now. */
+    *overloaded = (size_t)atomic_load(&loop->pending_count) + loop->reserved_pending >=
+        INT_MAX - MAX_PENDING_CAPACITY;
     if (!*overloaded) {
         event = get_pending_event(loop);
         if (event != NULL) loop->reserved_pending++;
@@ -4873,7 +4869,7 @@ static bool add_pending_impl(erlang_event_loop_t *loop, event_type_t type,
                             uint64_t callback_id, int fd, pending_event_t *reserved) {
     pthread_mutex_lock(&loop->mutex);
     size_t current_count = atomic_load(&loop->pending_count);
-    if (reserved == NULL && current_count + loop->reserved_pending >= MAX_PENDING_CAPACITY) {
+    if (reserved == NULL && loop->unreserved_pending >= MAX_PENDING_CAPACITY) {
         pthread_mutex_unlock(&loop->mutex);
         return false;
     }
@@ -4916,6 +4912,7 @@ static bool add_pending_impl(erlang_event_loop_t *loop, event_type_t type,
     pending_hash_insert(loop, callback_id, type);
 
     atomic_fetch_add(&loop->pending_count, 1);
+    if (reserved == NULL) loop->unreserved_pending++;
 
     /*
      * Coalesced wakeup (uvloop-style): Only signal if no wakeup is pending.
@@ -4973,6 +4970,7 @@ void event_loop_clear_pending(erlang_event_loop_t *loop) {
     loop->pending_head = NULL;
     loop->pending_tail = NULL;
     atomic_store(&loop->pending_count, 0);
+    loop->unreserved_pending = 0;
 
     /* Clear the hash set since all pending events are cleared */
     pending_hash_clear(loop);
@@ -7051,6 +7049,7 @@ static PyObject *py_get_pending(PyObject *self, PyObject *args) {
     loop->pending_head = NULL;
     loop->pending_tail = NULL;
     atomic_store(&loop->pending_count, 0);
+    loop->unreserved_pending = 0;
     pending_hash_clear(loop);
 
     pthread_mutex_unlock(&loop->mutex);
@@ -7370,12 +7369,6 @@ static PyObject *fd_python_add(erlang_event_loop_t *loop, int logical_fd,
         enif_release_resource(res);
         return PyErr_NoMemory();
     }
-    if (!fd_poll_lease_reserve()) {
-        enif_release_resource(res);
-        PyErr_SetString(PyExc_RuntimeError, "Native FD poll lease limit reached");
-        return NULL;
-    }
-    res->lease_counted = true;
     res->poll_lease = true;
     res->logical_fd = logical_fd;
     /* A duplicate shares status flags. Never set O_NONBLOCK here: doing so
@@ -7387,6 +7380,8 @@ static PyObject *fd_python_add(erlang_event_loop_t *loop, int logical_fd,
         enif_release_resource(res);
         return NULL;
     }
+    atomic_fetch_add(&g_fd_poll_leases, 1);
+    res->lease_counted = true;
     res->owner_pid = loop->worker_pid;
     res->read_callback_id = reading ? callback_id : 0;
     res->write_callback_id = reading ? 0 : callback_id;
@@ -7687,6 +7682,7 @@ static PyObject *py_run_once(PyObject *self, PyObject *args) {
             loop->pending_head = NULL;
             loop->pending_tail = NULL;
             atomic_store(&loop->pending_count, 0);
+            loop->unreserved_pending = 0;
             pending_hash_clear(loop);
             pthread_mutex_unlock(&loop->mutex);
             return NULL;
@@ -7709,6 +7705,7 @@ static PyObject *py_run_once(PyObject *self, PyObject *args) {
     loop->pending_head = NULL;
     loop->pending_tail = NULL;
     atomic_store(&loop->pending_count, 0);
+    loop->unreserved_pending = 0;
 
     /* Clear the hash set since we're consuming all pending events */
     pending_hash_clear(loop);
@@ -7843,6 +7840,7 @@ static PyObject *py_loop_new(PyObject *self, PyObject *args) {
 
     atomic_store(&loop->next_callback_id, 1);
     atomic_store(&loop->pending_count, 0);
+    loop->unreserved_pending = 0;
     loop->pending_head = NULL;
     loop->pending_tail = NULL;
     loop->shutdown = false;
@@ -8247,6 +8245,7 @@ static PyObject *py_run_once_for(PyObject *self, PyObject *args) {
     loop->pending_head = NULL;
     loop->pending_tail = NULL;
     atomic_store(&loop->pending_count, 0);
+    loop->unreserved_pending = 0;
     pending_hash_clear(loop);
 
     pthread_mutex_unlock(&loop->mutex);
@@ -8788,6 +8787,7 @@ static PyObject *py_get_pending_for(PyObject *self, PyObject *args) {
     loop->pending_head = NULL;
     loop->pending_tail = NULL;
     atomic_store(&loop->pending_count, 0);
+    loop->unreserved_pending = 0;
     pending_hash_clear(loop);
 
     pthread_mutex_unlock(&loop->mutex);
@@ -8953,6 +8953,7 @@ int create_default_event_loop(ErlNifEnv *env) {
 
     atomic_store(&loop->next_callback_id, 1);
     atomic_store(&loop->pending_count, 0);
+    loop->unreserved_pending = 0;
     loop->pending_head = NULL;
     loop->pending_tail = NULL;
     loop->shutdown = false;

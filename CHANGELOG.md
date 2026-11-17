@@ -56,6 +56,14 @@
 
 ### Fixed
 
+- Python FD poll leases use the operating system's descriptor limit instead of
+  a process-wide 4,096-lease ceiling. Duplication failures retain their `OSError`
+  and errno, and leases still close only after selection retirement.
+- Native channel readiness waiters allocate their event credit at registration
+  without an 8,192-waiter ceiling. Preallocated wakeups do not consume the
+  separate 16,384-event unreserved queue budget; cancellation and queue drains
+  return their respective credits.
+
 - Data actor shutdown explicitly releases its Python object after native work
   drains, including killed actors. Stale worker-heap terms no longer retain
   actor resources until Erlang garbage collection.

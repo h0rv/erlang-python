@@ -51,11 +51,8 @@ typedef struct _is PyInterpreterState;
 /** @brief Initial pending events capacity (soft limit for backpressure) */
 #define INITIAL_PENDING_CAPACITY 256
 
-/** @brief Maximum pending events capacity (hard safety cap) */
+/** @brief Maximum unreserved pending events (backpressure budget) */
 #define MAX_PENDING_CAPACITY 16384
-
-/* Idle channel waiters must leave capacity for ordinary I/O and timer events. */
-#define MAX_RESERVED_PENDING (MAX_PENDING_CAPACITY / 2)
 
 /** @brief Legacy alias for initial capacity */
 #define MAX_PENDING_EVENTS INITIAL_PENDING_CAPACITY
@@ -376,6 +373,9 @@ typedef struct erlang_event_loop {
 
     /* Slots reserved by native readiness waiters, guarded by mutex. */
     size_t reserved_pending;
+
+    /* Queued events without preallocated readiness credit, guarded by mutex. */
+    size_t unreserved_pending;
 
     /** @brief Flag indicating shutdown requested */
     volatile bool shutdown;
