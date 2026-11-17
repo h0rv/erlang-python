@@ -69,6 +69,7 @@ init([]) ->
     ok = py_channel:register_callbacks(),
     ok = py_shm:register_callbacks(),
     ok = py_task_group:register_callbacks(),
+    ok = py_durable_queue:register_callbacks(),
 
     %% Callback registry - must start before contexts
     CallbackSpec = #{
@@ -190,7 +191,9 @@ init([]) ->
     Children = [CallbackSpec, ShmSpec, ThreadHandlerSpec, LoggerSpec, TracerSpec,
                 ContextSupSpec, ContextRouterInitSpec,
                 WorkerRegistrySpec, WorkerSupSpec, EventLoopSpec,
-                EventLoopPoolSpec, ActorRegistrySpec, ActorRootSpec],
+                EventLoopPoolSpec, ActorRegistrySpec, ActorRootSpec,
+                #{id => py_durable_queue_sync, start => {py_durable_queue_sync, start_link, []}},
+                #{id => py_durable_queue, start => {py_durable_queue, start_link, []}}],
 
     {ok, {
         #{strategy => one_for_all, intensity => 5, period => 10},
