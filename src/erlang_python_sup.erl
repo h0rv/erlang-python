@@ -192,6 +192,8 @@ init([]) ->
 
     Children = [CallbackSpec, ShmSpec, ThreadHandlerSpec, LoggerSpec, TracerSpec,
                 ContextSupSpec, ContextRouterInitSpec,
+                #{id => py_worker_pool, start => {py_worker_pool, start_link, []},
+                  shutdown => infinity},
                 WorkerRegistrySpec, WorkerSupSpec, EventLoopSpec,
                 EventLoopPoolSpec, ActorRegistrySpec, ActorRootSpec,
                 #{id => py_durable_queue_sync, start => {py_durable_queue_sync, start_link, []}},

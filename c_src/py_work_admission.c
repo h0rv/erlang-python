@@ -2,6 +2,13 @@
 
 /* Native invocation ownership only. Lock order: loop task_queue_mutex, then
  * gate mutex. The owner DOWN callback never acquires a GIL or loop mutex. */
+typedef struct admission_waiter {
+    ErlNifPid pid;
+    ErlNifEnv *env;
+    ERL_NIF_TERM ref;
+    struct admission_waiter *next;
+} admission_waiter_t;
+
 struct work_admission {
     pthread_mutex_t mutex;
     bool mutex_initialized;
@@ -14,6 +21,7 @@ struct work_admission {
     /* Work transferred to an external dispatch queue, whose completion may
      * outlive its owner process. Protected by the same admission mutex. */
     uint64_t unsettled;
+    admission_waiter_t *waiters;
     bool closed;
 };
 
@@ -22,6 +30,13 @@ static ErlNifResourceType *WORK_ADMISSION_RESOURCE_TYPE;
 static void work_admission_dtor(ErlNifEnv *env, void *obj) {
     (void)env;
     work_admission_t *gate = obj;
+    admission_waiter_t *waiter = gate->waiters;
+    while (waiter != NULL) {
+        admission_waiter_t *next = waiter->next;
+        enif_free_env(waiter->env);
+        enif_free(waiter);
+        waiter = next;
+    }
     if (gate->mutex_initialized) pthread_mutex_destroy(&gate->mutex);
 }
 

@@ -101,6 +101,49 @@ static ERL_NIF_TERM nif_actor_gate_close(ErlNifEnv *env, int argc, const ERL_NIF
     work_admission_close(gate);
     return ATOM_OK;
 }
+static void actor_gate_settled(work_admission_t *gate) {
+    if (--gate->unsettled != 0) return;
+    admission_waiter_t *waiter = gate->waiters;
+    gate->waiters = NULL;
+    while (waiter != NULL) {
+        admission_waiter_t *next = waiter->next;
+        ERL_NIF_TERM message = enif_make_tuple2(waiter->env,
+            enif_make_atom(waiter->env, "actor_gate_drained"), waiter->ref);
+        enif_send(NULL, &waiter->pid, waiter->env, message);
+        enif_free_env(waiter->env);
+        enif_free(waiter);
+        waiter = next;
+    }
+}
+static ERL_NIF_TERM nif_actor_gate_wait(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void)argc;
+    work_admission_t *gate;
+    if (!enif_get_resource(env, argv[0], WORK_ADMISSION_RESOURCE_TYPE, (void **)&gate))
+        return enif_make_badarg(env);
+    pthread_mutex_lock(&gate->mutex);
+    if (gate->unsettled == 0) {
+        pthread_mutex_unlock(&gate->mutex);
+        return ATOM_OK;
+    }
+    admission_waiter_t *waiter = enif_alloc(sizeof(*waiter));
+    if (waiter == NULL) {
+        pthread_mutex_unlock(&gate->mutex);
+        return make_error(env, "alloc_failed");
+    }
+    waiter->env = enif_alloc_env();
+    if (waiter->env == NULL) {
+        enif_free(waiter);
+        pthread_mutex_unlock(&gate->mutex);
+        return make_error(env, "alloc_failed");
+    }
+    enif_self(env, &waiter->pid);
+    ERL_NIF_TERM ref = enif_make_ref(env);
+    waiter->ref = enif_make_copy(waiter->env, ref);
+    waiter->next = gate->waiters;
+    gate->waiters = waiter;
+    pthread_mutex_unlock(&gate->mutex);
+    return enif_make_tuple2(env, ATOM_OK, ref);
+}
 static ERL_NIF_TERM nif_actor_ticket_info(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     (void)argc;
     actor_ticket_t *ticket;
@@ -129,7 +172,7 @@ static ERL_NIF_TERM nif_task_ticket_reap(ErlNifEnv *env, int argc, const ERL_NIF
     if (ticket->state == ACTOR_COMMITTED) {
         ticket->state = TASK_REAPED;
         pthread_mutex_lock(&ticket->gate->mutex);
-        ticket->gate->unsettled--;
+        actor_gate_settled(ticket->gate);
         pthread_mutex_unlock(&ticket->gate->mutex);
         work_ticket_dispose(ticket->work);
         ticket->work = NULL;
@@ -151,7 +194,7 @@ static ERL_NIF_TERM nif_task_ticket_complete(ErlNifEnv *env, int argc, const ERL
     }
     ticket->state = ACTOR_COMPLETE;
     pthread_mutex_lock(&ticket->gate->mutex);
-    ticket->gate->unsettled--;
+    actor_gate_settled(ticket->gate);
     pthread_mutex_unlock(&ticket->gate->mutex);
     work_ticket_dispose(ticket->work);
     ticket->work = NULL;
@@ -191,7 +234,7 @@ static void actor_ticket_reject(actor_ticket_t *ticket) {
     if (ticket->state == ACTOR_RESERVED || ticket->state == ACTOR_ENQUEUED) {
         if (ticket->state == ACTOR_ENQUEUED) {
             pthread_mutex_lock(&ticket->gate->mutex);
-            ticket->gate->unsettled--;
+            actor_gate_settled(ticket->gate);
             pthread_mutex_unlock(&ticket->gate->mutex);
         }
         ticket->state = ACTOR_ABORTED;
@@ -313,7 +356,7 @@ static PyObject *python_actor_complete(PyObject *self, PyObject *capsule) {
     }
     ticket->state = ACTOR_COMPLETE;
     pthread_mutex_lock(&ticket->gate->mutex);
-    ticket->gate->unsettled--;
+    actor_gate_settled(ticket->gate);
     pthread_mutex_unlock(&ticket->gate->mutex);
     work_ticket_dispose(ticket->work);
     ticket->work = NULL;

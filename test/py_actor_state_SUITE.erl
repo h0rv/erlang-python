@@ -1,9 +1,10 @@
 -module(py_actor_state_SUITE).
 -export([all/0, groups/0, init_per_group/2, end_per_group/2,
          init_per_suite/1, end_per_suite/1, explicit_versions/1,
-         concurrent_writers/1, disk_restart/1, bounds/1, callback_round_trip/1]).
+         concurrent_writers/1, disk_restart/1, bounds/1, callback_round_trip/1,
+         pooled_actor/1]).
 
-all() -> [explicit_versions, concurrent_writers, disk_restart, bounds,
+all() -> [explicit_versions, concurrent_writers, disk_restart, bounds, pooled_actor,
           {group, worker}, {group, isolated}].
 
 groups() -> [{worker, [], [callback_round_trip]}, {isolated, [], [callback_round_trip]}].
@@ -56,6 +57,18 @@ bounds(_) ->
     {error, invalid_argument} = py_actor_state:write(<<"x">>, 0, binary:copy(<<0>>, 1048577)),
     {error, invalid_argument} = py_actor_state:read(binary:copy(<<0>>, 4097)),
     missing = py_actor_state:read(<<"x">>).
+
+pooled_actor(Config) ->
+    {ok, Context} = py_context:new(#{mode => worker}),
+    TestDir = filename:dirname(code:which(?MODULE)),
+    try
+        ok = py_context:exec(Context, iolist_to_binary(io_lib:format(
+            "import sys; sys.path.insert(0, ~p)", [TestDir]))),
+        {ok, true} = py_context:call(Context, py_test_worker_pool, persistent_state,
+            [list_to_binary(proplists:get_value(store, Config))], #{}, 30000)
+    after
+        py_context:stop(Context)
+    end.
 
 callback_round_trip(Config) ->
     Mode = proplists:get_value(mode, Config),
