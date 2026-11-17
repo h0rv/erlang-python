@@ -5,10 +5,24 @@ import threading
 import time
 
 import erlang
+from _erlang_impl._tasks import _entries
 
 
 async def echo(payload: bytes) -> bytes:
     await asyncio.sleep(0)
+    return payload
+
+
+async def must_not_run(payload: bytes) -> bytes:
+    raise AssertionError("A sealed entry executed")
+
+
+async def sealed(token: int) -> bool:
+    return _entries[token].sealed
+
+
+async def asleep(payload: bytes) -> bytes:
+    await asyncio.sleep(60)
     return payload
 
 

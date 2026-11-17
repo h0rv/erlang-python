@@ -6,7 +6,7 @@
          owngil_missing_envelope/1, unsupported_named_mode/1, owngil_surrogate_error/1,
          owngil_unicode_identifiers/1, owngil_import_failure/1,
          owngil_missing_attribute/1, owngil_non_entry/1, worker_rejects_async/1,
-         isolated_api/1, isolated_crash/1, isolated_running_cancel/1,
+         isolated_api/1, isolated_crash/1, isolated_prestart_cancel/1, isolated_running_cancel/1,
          isolated_shutdown/1, isolated_cancel_killed/1, isolated_result_wins/1,
          isolated_unacknowledged_down/1, isolated_exit_timeout/1]).
 all() -> [killed_child, killed_context, killed_group, queued_ticket, killed_before_execution,
@@ -15,7 +15,7 @@ all() -> [killed_child, killed_context, killed_group, queued_ticket, killed_befo
           owngil_missing_envelope, unsupported_named_mode, owngil_surrogate_error,
           owngil_unicode_identifiers, owngil_import_failure,
           owngil_missing_attribute, owngil_non_entry, worker_rejects_async,
-          isolated_api, isolated_crash, isolated_running_cancel, isolated_shutdown,
+          isolated_api, isolated_crash, isolated_prestart_cancel, isolated_running_cancel, isolated_shutdown,
           isolated_cancel_killed, isolated_result_wins, isolated_unacknowledged_down,
           isolated_exit_timeout].
 init_per_suite(Config) ->
@@ -242,6 +242,12 @@ owngil_parallel(_) ->
     end).
 
 owngil_prestart_cancel(_) ->
+    named_prestart_cancel(owngil, <<"py_test_task_entries">>).
+
+isolated_prestart_cancel(_) ->
+    named_prestart_cancel(isolated, <<"py_test_isolated_task_entries">>).
+
+named_prestart_cancel(Mode, Module) ->
     with_named_group(1, fun(Source, Group, Gate) ->
         {ok, Ticket} = py_context:call(Source, py_test_actor_data, reserve, [Gate, 4]),
         ok = py_nif:actor_ticket_commit(Ticket, Gate, 4),
@@ -249,7 +255,7 @@ owngil_prestart_cancel(_) ->
         Id = make_ref(),
         Token = erlang:unique_integer([positive]),
         Spec = #{id => Id, start => {py_task, start_link,
-            [Group, owngil, {<<"py_test_task_entries">>, <<"must_not_run">>}, Token, Ticket, <<"work">>]},
+            [Group, Mode, {Module, <<"must_not_run">>}, Token, Ticket, <<"work">>]},
             restart => temporary, shutdown => infinity},
         {ok, Pid} = supervisor:start_child(Sup, Spec),
         {Ctx, Object, Native} = gen_server:call(Pid, info),
@@ -264,7 +270,7 @@ owngil_prestart_cancel(_) ->
         end),
         try
             ok = gen_server:call(Group, {cancel, Pid}),
-            wait_entry_sealed(Ctx, Token, 100),
+            wait_entry_sealed(Ctx, Module, Token, 100),
             {ok, true} = py_context:submit_await(Ctx, '_erlang_impl._tasks', seal_entry, [Token]),
             committed = py_nif:actor_ticket_info(Ticket),
             #{count := 1, unsettled := 1} = py_nif:actor_gate_info(Gate),
@@ -272,7 +278,19 @@ owngil_prestart_cancel(_) ->
         after sys:resume(Pid) end,
         {cancelled} = gen_server:call(Group, {wait, Pid}, 10000),
         complete = py_nif:actor_ticket_info(Ticket),
-        clean = py_nif:context_cleanup_status(Native)
+        case Mode of
+            isolated -> false = is_process_alive(Ctx);
+            owngil -> clean = py_nif:context_cleanup_status(Native)
+        end,
+        #{count := 0, unsettled := 0, closed := false} = py_nif:actor_gate_info(Gate),
+        {ok, Next} = start_named(Source, Group, Gate, Mode, Module, <<"echo">>, <<"reuse">>),
+        {ok, {bytes, <<"reuse">>}} = gen_server:call(Group, {wait, Next}, 5000),
+        {ok, Pending} = start_named(Source, Group, Gate, Mode, Module, <<"asleep">>, <<>>),
+        Before = erlang:monotonic_time(millisecond),
+        ok = gen_server:call(Group, {shutdown, 2000}, 3000),
+        true = erlang:monotonic_time(millisecond) - Before < 2000,
+        {cancelled} = gen_server:call(Group, {wait, Pending}, 1000),
+        #{count := 0, unsettled := 0} = py_nif:actor_gate_info(Gate)
     end).
 
 owngil_running_cancel(_) ->
@@ -356,11 +374,11 @@ start_named(Source, Group, Gate, Mode, Module, Function, Payload) ->
                                {Module, Function}}, infinity)
     after {ok, none} = py_context:call(Source, py_test_actor_data, abort, [Ticket]) end.
 
-wait_entry_sealed(_, _, 0) -> error(cancellation_not_delivered);
-wait_entry_sealed(Ctx, Token, N) ->
-    case py_context:submit_await(Ctx, py_test_task_entries, sealed, [Token]) of
+wait_entry_sealed(_, _, _, 0) -> error(cancellation_not_delivered);
+wait_entry_sealed(Ctx, Module, Token, N) ->
+    case py_context:submit_await(Ctx, Module, sealed, [Token]) of
         {ok, true} -> ok;
-        {ok, false} -> receive after 5 -> wait_entry_sealed(Ctx, Token, N - 1) end
+        {ok, false} -> receive after 5 -> wait_entry_sealed(Ctx, Module, Token, N - 1) end
     end.
 
 isolated_api(_) ->

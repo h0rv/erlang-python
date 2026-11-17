@@ -19,6 +19,7 @@ init({named, Group, Mode, Entry, Token, Ticket, Payload}) ->
     {ok, Ctx} = py_context:new(Opts),
     Native = case Mode of isolated -> isolated; owngil -> py_context:get_nif_ref(Ctx) end,
     {ok, none} = py_context:call(Ctx, '_erlang_impl._tasks', prepare_entry, [Token]),
+    case Mode of isolated -> ok = py_context:start_loop(Ctx); owngil -> ok end,
     Mon = monitor(process, Ctx),
     {ok, #{group => Group, ctx => Ctx, native => Native, mon => Mon, mode => Mode,
            entry => Entry, token => Token, object => {named, Token},
@@ -45,11 +46,8 @@ handle_cast(_, State) -> {noreply, State}.
 %% Cancellation goes through its separate control context, never this busy turn.
 handle_info(run, #{mode := isolated, entry := {Module, Function}, token := Token,
                    ctx := Ctx, payload := Payload} = State) ->
-    Reply = case py_context:start_loop(Ctx) of
-        ok -> py_context:submit(Ctx, '_erlang_impl._tasks', execute_entry,
-                                [Module, Function, Token, {bytes, Payload}]);
-        Error -> Error
-    end,
+    Reply = py_context:submit(Ctx, '_erlang_impl._tasks', execute_entry,
+                              [Module, Function, Token, {bytes, Payload}]),
     case Reply of
         {ok, Ref} -> {noreply, State#{task_ref => Ref}};
         _ -> self() ! {named_result, Reply}, {noreply, State}
