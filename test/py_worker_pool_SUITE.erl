@@ -3,12 +3,12 @@
          sleeping/1, cpu_parallel/1, reuse/1, capacity/1, portable_env/1, callbacks/1,
          isolated_state/1, policy_independent/1, factory_drain/1, exception_identity/1,
          preferred_release/1, preferred_timeout/1, preferred_fifo/1, preferred_races/1,
-         background_tasks/1, background_cleanup/1, worker_wakeups/1]).
+         background_tasks/1, background_cleanup/1, worker_wakeups/1, late_tasks/1]).
 
 all() -> [reuse, portable_env, capacity, callbacks, sleeping, cpu_parallel, isolated_state,
           policy_independent, factory_drain, exception_identity,
           preferred_release, preferred_timeout, preferred_fifo, preferred_races,
-          background_tasks, background_cleanup, worker_wakeups].
+          background_tasks, background_cleanup, worker_wakeups, late_tasks].
 init_per_suite(Config) ->
     application:load(erlang_python),
     application:set_env(erlang_python, worker_pool_max, 16),
@@ -33,6 +33,10 @@ end).
 
 background_tasks(_) -> with_context(fun(Ctx) ->
     {ok, {true, true}} = py_context:call(Ctx, py_test_worker_tasks, background_progress, [], #{}, 30000)
+end).
+
+late_tasks(_) -> with_context(fun(Ctx) ->
+    {ok, none} = py_context:call(Ctx, py_test_worker_tasks, late_tasks, [], #{}, 30000)
 end).
 
 worker_wakeups(_) ->

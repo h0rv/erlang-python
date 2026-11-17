@@ -146,6 +146,9 @@ class _ActorTasks:
     def track(self, task: asyncio.Task[object]) -> None:
         loop = task.get_loop()
         with self.lock:
+            if self.closed.is_set():
+                task.cancel()
+                return
             self.tasks.setdefault(loop, set()).add(task)
         task.add_done_callback(self.finished, context=Context())
 
@@ -158,38 +161,38 @@ class _ActorTasks:
         if not task.cancelled():
             task.exception()
 
-    async def cancel(
-        self, loop: asyncio.AbstractEventLoop, initial: tuple[asyncio.Task[object], ...]
-    ) -> None:
-        for task in initial:
+    async def cancel(self, tasks: tuple[asyncio.Task[object], ...]) -> None:
+        for task in tasks:
             task.cancel()
-        while True:
-            with self.lock:
-                tasks = tuple(self.tasks.get(loop, ()))
-            if not tasks:
-                return
-            await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     def close(self) -> None:
         with self.lock:
             already_closing = self.sealed
             self.sealed = True
-            initial = {loop: tuple(tasks) for loop, tasks in self.tasks.items()}
         if already_closing:
             self.closed.wait()
             return
         while True:
             with self.lock:
-                loops = tuple(self.tasks)
-            if not loops:
-                break
-            for loop in loops:
-                pending = self.cancel(loop, initial.pop(loop, ()))
+                pending = {loop: tuple(tasks) for loop, tasks in self.tasks.items()}
+                if not pending:
+                    self.closed.set()
+                    return
+            waiting = [
+                (
+                    loop,
+                    Context().run(
+                        asyncio.run_coroutine_threadsafe, self.cancel(tasks), loop
+                    ),
+                )
+                for loop, tasks in pending.items()
+            ]
+            for loop, future in waiting:
                 if loop is _worker_loop.loop and not loop.is_running():
-                    loop.run_until_complete(pending)
-                else:
-                    asyncio.run_coroutine_threadsafe(pending, loop).result()
-        self.closed.set()
+                    loop.run_until_complete(asyncio.wrap_future(future, loop=loop))
+            for _, future in waiting:
+                future.result()
 
 
 _task_owner: ContextVar[_ActorTasks | None] = ContextVar(
@@ -251,12 +254,11 @@ def close_worker_loop() -> None:
 
 async def _shutdown_worker(loop: asyncio.AbstractEventLoop) -> None:
     current = asyncio.current_task()
-    for task in asyncio.all_tasks(loop):
-        if task is not current:
-            task.cancel()
     while pending := tuple(
         task for task in asyncio.all_tasks(loop) if task is not current
     ):
+        for task in pending:
+            task.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
     await loop.shutdown_asyncgens()
     await loop.shutdown_default_executor()

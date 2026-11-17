@@ -54,6 +54,7 @@ class Resource:
 @dataclass
 class TaskChecks:
     cancelled: list[threading.Event] = field(default_factory=list)
+    orphans: list[threading.Event] = field(default_factory=list)
     released: bool = False
     resources: list[ref[Resource]] = field(default_factory=list)
     state: object | None = None
@@ -83,6 +84,23 @@ class PendingActor:
                 )
                 del child
                 await child_ready.wait()
+            ready.set()
+            await asyncio.Event().wait()
+        finally:
+            await asyncio.gather(asyncio.sleep(0))
+            assert self.resource_ref() is self.resource
+            if self.checks.state is not None:
+                assert erlang._actor_unwrap(self.checks.state) is self
+            ready = asyncio.Event()
+            orphan = asyncio.create_task(self.orphan(ready))
+            del orphan
+            await ready.wait()
+            cancelled.set()
+
+    async def orphan(self, ready: asyncio.Event) -> None:
+        cancelled = threading.Event()
+        self.checks.orphans.append(cancelled)
+        try:
             ready.set()
             await asyncio.Event().wait()
         finally:
@@ -147,6 +165,8 @@ async def check_cleanup() -> None:
                 finally:
                     await erlang.async_call("worker_task_release_all", holders)
             assert all(event.is_set() for event in checks.cancelled)
+            assert len(checks.orphans) == len(checks.cancelled)
+            assert all(event.is_set() for event in checks.orphans)
             assert checks.released
         assert all(owner.sealed and not owner.tasks for owner in checks.owners)
     for _ in range(4):
@@ -161,6 +181,8 @@ async def check_cleanup() -> None:
                     calls.create_task(actor.call(b"start"))
         assert len(checks.cancelled) == 32
         assert all(event.is_set() for event in checks.cancelled)
+        assert len(checks.orphans) == 32
+        assert all(event.is_set() for event in checks.orphans)
         assert all(resource() is None for resource in checks.resources)
         assert all(owner.sealed and not owner.tasks for owner in checks.owners)
 
@@ -177,11 +199,39 @@ async def check_cleanup() -> None:
         assert not any(event.is_set() for event in shared_checks.cancelled[2:])
         await second.call(b"start")
     assert all(event.is_set() for event in shared_checks.cancelled)
+    assert all(event.is_set() for event in shared_checks.orphans)
     assert all(owner.sealed and not owner.tasks for owner in shared_checks.owners)
 
 
 def background_cleanup() -> None:
     asyncio.run(check_cleanup())
+
+
+def late_tasks() -> None:
+    loop = _worker_loop.get()
+    owner = _ActorTasks()
+    tasks: list[asyncio.Task[None]] = []
+    ran = False
+
+    async def late() -> None:
+        nonlocal ran
+        ran = True
+
+    def create() -> None:
+        tasks.append(asyncio.create_task(late()))
+
+    token = _task_owner.set(owner)
+    try:
+        loop.call_soon(create)
+        owner.close()
+    finally:
+        _task_owner.reset(token)
+    assert owner.closed.is_set()
+    loop.run_until_complete(asyncio.sleep(0))
+    assert len(tasks) == 1
+    assert tasks[0].cancelled()
+    assert not ran
+    assert not owner.tasks
 
 
 block_started = threading.Event()
@@ -252,15 +302,20 @@ async def shutdown_pending(ready: asyncio.Event) -> None:
         await asyncio.Event().wait()
     finally:
         await asyncio.gather(asyncio.sleep(0))
-        task = asyncio.create_task(shutdown_cleanup())
+        ready = asyncio.Event()
+        task = asyncio.create_task(shutdown_cleanup(ready))
         shutdown_tasks.add(task)
         task.add_done_callback(shutdown_tasks.discard)
+        await ready.wait()
 
 
-async def shutdown_cleanup() -> None:
-    for _ in range(4):
-        await asyncio.sleep(0)
-    shutdown_finished.set()
+async def shutdown_cleanup(ready: asyncio.Event) -> None:
+    try:
+        ready.set()
+        await asyncio.Event().wait()
+    finally:
+        await asyncio.gather(asyncio.sleep(0))
+        shutdown_finished.set()
 
 
 async def arm_shutdown() -> None:
