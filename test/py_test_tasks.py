@@ -46,6 +46,19 @@ async def retained_exception_lifecycle() -> bool:
     return True
 
 
+def slow_factory() -> Body:
+    erlang.call("task_test_slow_start")
+
+    async def invoke(payload: bytes) -> bytes:
+        return payload
+
+    return Body(invoke)
+
+
+def failed_factory() -> Body:
+    raise ValueError("task initialization failed")
+
+
 def unstarted_body() -> Body:
     async def invoke(payload: bytes) -> bytes:
         raise AssertionError("A sealed task executed its callable")

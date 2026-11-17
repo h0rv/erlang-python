@@ -35,6 +35,12 @@
 
 ### Fixed
 
+- Task-group admission reserves capacity while child initialization runs off
+  the group server. Slow interpreter starts no longer block other results,
+  waits, or admissions; failed starts release their reservation after cleanup.
+  Context creation waits on a dirty I/O scheduler instead of blocking a
+  normal BEAM scheduler during interpreter startup.
+
 - TCP transports disable Nagle's algorithm, matching asyncio and avoiding
   delayed-ACK stalls between small writes. Unix sockets are unchanged.
 - Task children stop their managed event loop before destroying its context.
