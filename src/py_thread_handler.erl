@@ -111,7 +111,7 @@ handle_cast(_Msg, State) ->
 handle_info({'$py_send', Destination, Message}, State) ->
     try erlang:send(Destination, Message, [nosuspend, noconnect])
     catch error:badarg -> ok end,
-    {noreply, State};
+    {noreply, State, 0};
 %% Handle spawn request from Python thread
 handle_info({thread_worker_spawn, WorkerId, WriteFd}, #state{handlers = Handlers} = State) ->
     %% Spawn a dedicated handler process for this thread
