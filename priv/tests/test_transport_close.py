@@ -69,8 +69,11 @@ def _make_loop():
     loop._callbacks_by_cid = {}
     loop._fd_resources = {}
     loop._timers = {}
-    loop._timer_refs = {}
-    loop._handle_to_callback_id = {}
+    loop._scheduled = []
+    loop._timer_cancelled_count = 0
+    loop._timer_ref = None
+    loop._timer_deadline = None
+    loop._timer_callback_id = None
     loop._ready = __import__('collections').deque()
     loop._ready_append = loop._ready.append
     loop._ready_popleft = loop._ready.popleft

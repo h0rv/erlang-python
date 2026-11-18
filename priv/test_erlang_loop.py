@@ -38,6 +38,9 @@ import threading
 import time
 import unittest
 import weakref
+from unittest.mock import patch
+
+from _erlang_impl import _loop as loop_impl
 
 # Import the event loop
 try:
@@ -55,6 +58,106 @@ def find_free_port():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(('127.0.0.1', 0))
         return s.getsockname()[1]
+
+
+class TimerHeapTests(unittest.TestCase):
+    def setUp(self):
+        self.mock = loop_impl._MockNifModule()
+        self.module_patch = patch.dict(sys.modules, py_event_loop=self.mock)
+        self.module_patch.start()
+        self.loop = loop_impl.ErlangEventLoop()
+
+    def tearDown(self):
+        self.loop.close()
+        self.module_patch.stop()
+
+    def test_cancel_churn_has_no_native_timer_calls(self):
+        with (
+            patch.object(self.mock, '_schedule_timer_for') as schedule,
+            patch.object(self.mock, '_cancel_timer_for') as cancel,
+        ):
+            for _ in range(10000):
+                self.loop.call_later(5, self.fail).cancel()
+            self.loop._run_once(0)
+            schedule.assert_not_called()
+            cancel.assert_not_called()
+        self.assertEqual(self.loop._scheduled, [])
+        self.assertEqual(self.loop._timer_cancelled_count, 0)
+
+    def test_idle_timer_fires_without_native_timer(self):
+        start = time.monotonic()
+        with patch.object(self.mock, '_schedule_timer_for') as schedule:
+            self.loop.call_later(0.03, self.loop.stop)
+            self.loop.run_forever()
+            schedule.assert_not_called()
+        self.assertGreaterEqual(time.monotonic() - start, 0.03)
+        self.assertLess(time.monotonic() - start, 0.5)
+
+    def test_shared_driver_keeps_one_wakeup_during_churn(self):
+        with (
+            patch.object(self.mock, '_schedule_timer_for', return_value=42) as schedule,
+            patch.object(self.mock, '_cancel_timer_for') as cancel,
+        ):
+            for _ in range(1000):
+                handle = self.loop.call_later(5, self.fail)
+                self.loop._run_once(0)
+                handle.cancel()
+            self.assertEqual(schedule.call_count, 1)
+            cancel.assert_not_called()
+
+    def test_cancelled_heap_compaction_preserves_live_timer(self):
+        live = self.loop.call_later(1, self.fail)
+        for _ in range(1000):
+            self.loop.call_later(5, self.fail).cancel()
+        self.loop._prepare_timers()
+        self.assertEqual(self.loop._scheduled, [live])
+        self.assertEqual(self.loop._timer_cancelled_count, 0)
+
+    def test_closed_loop_rejects_timer(self):
+        self.loop.close()
+        with self.assertRaises(RuntimeError):
+            self.loop.call_later(1, self.fail)
+
+    def test_failed_wakeup_can_be_retried(self):
+        self.loop.call_later(1, self.fail)
+        with (
+            patch.object(self.mock, '_schedule_timer_for', side_effect=RuntimeError('unavailable')),
+            self.assertRaisesRegex(RuntimeError, 'unavailable'),
+        ):
+            self.loop._run_once(0)
+        self.assertIsNone(self.loop._timer_ref)
+        self.assertIsNone(self.loop._timer_deadline)
+        self.loop._run_once(0)
+        self.assertIsNotNone(self.loop._timer_ref)
+
+    def test_shared_wakeup_rearms_after_firing(self):
+        fired = []
+        with patch.object(self.mock, '_schedule_timer_for', side_effect=[41, 42]) as schedule:
+            self.loop.call_later(0.02, fired.append, 'first')
+            self.loop.call_later(1, fired.append, 'second')
+            self.loop._run_once(0)
+            callback_id = self.loop._timer_callback_id
+            time.sleep(0.03)
+            self.loop._dispatch(callback_id, 3)
+            self.loop._run_once(0)
+            self.loop._run_once(0)
+            self.assertEqual(fired, ['first'])
+            self.assertEqual(schedule.call_count, 2)
+
+    def test_earlier_deadline_replaces_wakeup_and_ignores_stale_event(self):
+        with (
+            patch.object(self.mock, '_schedule_timer_for', side_effect=[41, 42]) as schedule,
+            patch.object(self.mock, '_cancel_timer_for') as cancel,
+        ):
+            self.loop.call_later(5, self.fail)
+            self.loop._run_once(0)
+            old_id = self.loop._timer_callback_id
+            self.loop.call_later(1, self.fail)
+            self.loop._run_once(0)
+            self.loop._dispatch(old_id, 3)
+            self.assertEqual(self.loop._timer_ref, 42)
+            self.assertEqual(schedule.call_count, 2)
+            cancel.assert_called_once_with(self.loop._loop_capsule, 41)
 
 
 class ErlangLoopTestCase(unittest.TestCase):
@@ -796,6 +899,7 @@ def run_tests():
     suite = unittest.TestSuite()
 
     # Add all test classes
+    suite.addTests(loader.loadTestsFromTestCase(TimerHeapTests))
     suite.addTests(loader.loadTestsFromTestCase(TestCallSoon))
     suite.addTests(loader.loadTestsFromTestCase(TestCallLater))
     suite.addTests(loader.loadTestsFromTestCase(TestRunMethods))

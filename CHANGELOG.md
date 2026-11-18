@@ -4,6 +4,10 @@
 
 ### Fixed
 
+- Asyncio timers use a Python deadline heap instead of one Erlang timer per
+  handle. Native waits use the next deadline; shared worker loops retain one
+  earliest-deadline wakeup. Cancelling handles no longer calls Erlang.
+
 - Worker-local actor loops run between requests, waking for queued work through
   a nonblocking pipe. Actor generations own their descendant tasks even when
   factories share a container or calls fall back to another worker. Teardown

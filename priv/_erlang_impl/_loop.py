@@ -22,12 +22,14 @@ for I/O multiplexing.
 Architecture:
 - Single event loop per interpreter (no multi-loop complexity)
 - Uses enif_select for fd monitoring
-- Uses erlang:send_after for timers
+- Uses a Python timer heap and deadline-based native waits
 - Full GIL release during waits
 """
 
 import asyncio
 import contextvars
+import heapq
+import math
 import os
 import socket
 import sys
@@ -84,7 +86,7 @@ class ErlangEventLoop(asyncio.AbstractEventLoop):
 
     The loop works by:
     1. add_reader/add_writer register fds with enif_select
-    2. call_later creates timers via erlang:send_after
+    2. call_later adds deadlines to a Python heap
     3. _run_once waits for events (GIL released in C)
     4. Callbacks are dispatched when events occur
     """
@@ -96,7 +98,8 @@ class ErlangEventLoop(asyncio.AbstractEventLoop):
         '_callbacks_by_cid',  # callback_id -> (callback, args, event_type) for O(1) dispatch
         '_fd_resources',  # logical fd -> owned native poll lease key
         '_fd_retirement_failed', '_closing_sockets', '_fd_publications',
-        '_timers', '_timer_refs', '_handle_to_callback_id',
+        '_timers', '_scheduled', '_timer_cancelled_count',
+        '_timer_ref', '_timer_deadline', '_timer_callback_id',
         '_ready',
         '_handle_pool', '_handle_pool_max', '_running', '_stopping', '_closed',
         '_thread_id', '_clock_resolution', '_exception_handler', '_current_handle',
@@ -180,9 +183,11 @@ class ErlangEventLoop(asyncio.AbstractEventLoop):
         self._fd_retirement_failed: set[int] = set()
         self._closing_sockets: dict[int, socket.socket] = {}
         self._timers = {}   # callback_id -> handle
-        self._timer_refs = {}  # callback_id -> timer_ref (for cancellation)
-        # Note: No timer heap - Erlang handles timer expiry via send_after
-        self._handle_to_callback_id = {}  # handle -> callback_id
+        self._scheduled = []
+        self._timer_cancelled_count = 0
+        self._timer_ref = None
+        self._timer_deadline = None
+        self._timer_callback_id = None
         self._ready = deque()  # Callbacks ready to run
 
         # Cache deque methods for hot path
@@ -412,17 +417,18 @@ class ErlangEventLoop(asyncio.AbstractEventLoop):
 
     def _close_owned(self):
         # Cancel all timers
-        for callback_id, handle in list(self._timers.items()):
+        for handle in self._scheduled:
             handle.cancel()
-            timer_ref = self._timer_refs.get(callback_id)
-            if timer_ref is not None:
-                try:
-                    self._pel._cancel_timer_for(self._loop_capsule, timer_ref)
-                except (AttributeError, RuntimeError):
-                    pass
+            handle._scheduled = False
+        self._scheduled.clear()
+        self._timer_cancelled_count = 0
+        for handle in self._timers.values():
+            handle.cancel()
+        if self._timer_ref is not None:
+            self._pel._cancel_timer_for(self._loop_capsule, self._timer_ref)
+        self._timer_ref = None
+        self._timer_deadline = None
         self._timers.clear()
-        self._timer_refs.clear()
-        self._handle_to_callback_id.clear()
 
         # Pending publications own keys even when no logical map was published.
         while self._fd_publications:
@@ -522,30 +528,16 @@ class ErlangEventLoop(asyncio.AbstractEventLoop):
 
         # For zero or past times, run at the next iteration. Return a real
         # TimerHandle (never pooled): callers cancel it after it ran.
-        delay_ms = int((when - self.time()) * 1000)
-        if delay_ms <= 0:
+        if when <= self.time():
             if context is None:
                 context = contextvars.copy_context()
             handle = events.TimerHandle(when, callback, args, self, context)
             self._ready_append(handle)
             return handle
 
-        callback_id = self._next_id()
-
         handle = events.TimerHandle(when, callback, args, self, context)
-        self._timers[callback_id] = handle
-        self._handle_to_callback_id[id(handle)] = callback_id
-
-        # Schedule with Erlang's native timer system.
-        # No Python-side timer heap needed - Erlang handles expiry via send_after.
-        try:
-            timer_ref = self._pel._schedule_timer_for(self._loop_capsule, delay_ms, callback_id)
-            self._timer_refs[callback_id] = timer_ref
-        except AttributeError:
-            pass
-        except RuntimeError as e:
-            raise RuntimeError(f"Timer scheduling failed: {e}") from e
-
+        heapq.heappush(self._scheduled, handle)
+        handle._scheduled = True
         return handle
 
     def time(self):
@@ -1322,21 +1314,20 @@ class ErlangEventLoop(asyncio.AbstractEventLoop):
                 self._current_handle = None
                 return_handle(handle)
 
-        # Calculate timeout based on hint or pending work.
-        # Note: No timer heap - Erlang handles timer expiry via send_after.
-        # We use a fixed poll timeout when waiting for events.
+        self._prepare_timers()
+
         if timeout_hint is not None:
             # C code told us to use this timeout (e.g., 0 after scheduling coros)
             timeout = timeout_hint
         elif ready or self._stopping:
             timeout = 0
-        elif self._timers:
-            # Timers pending - use moderate timeout (Erlang dispatches timer events)
-            timeout = 100
         else:
             # No timers - use longer poll timeout
             timeout = 1000
 
+        if self._scheduled:
+            delay = max(0, math.ceil((self._scheduled[0]._when - time.monotonic()) * 1000))
+            timeout = min(timeout, delay)
         # Poll for events
         try:
             pending = self._pel._run_once_native_for(self._loop_capsule, timeout)
@@ -1345,6 +1336,51 @@ class ErlangEventLoop(asyncio.AbstractEventLoop):
                 dispatch(callback_id, event_type)
         except RuntimeError as e:
             raise RuntimeError(f"Event loop poll failed: {e}") from e
+        self._prepare_timers()
+        if timeout_hint is not None and not self._running:
+            self._arm_timer_wakeup()
+
+    def _prepare_timers(self):
+        scheduled = self._scheduled
+        if len(scheduled) > 100 and self._timer_cancelled_count > len(scheduled) * 0.5:
+            live = []
+            for handle in scheduled:
+                if handle._cancelled:
+                    handle._scheduled = False
+                else:
+                    live.append(handle)
+            heapq.heapify(live)
+            self._scheduled = scheduled = live
+            self._timer_cancelled_count = 0
+        else:
+            while scheduled and scheduled[0]._cancelled:
+                handle = heapq.heappop(scheduled)
+                handle._scheduled = False
+                self._timer_cancelled_count -= 1
+        now = time.monotonic() + self._clock_resolution
+        while scheduled and scheduled[0]._when <= now:
+            handle = heapq.heappop(scheduled)
+            handle._scheduled = False
+            if handle._cancelled:
+                self._timer_cancelled_count -= 1
+            else:
+                self._ready_append(handle)
+
+    def _arm_timer_wakeup(self):
+        if not self._scheduled:
+            return
+        deadline = self._scheduled[0]._when
+        if self._timer_deadline is not None and deadline >= self._timer_deadline:
+            return
+        if self._timer_ref is not None:
+            self._pel._cancel_timer_for(self._loop_capsule, self._timer_ref)
+            self._timer_ref = None
+            self._timer_deadline = None
+        self._timer_callback_id = self._next_id()
+        delay = max(1, math.ceil((deadline - time.monotonic()) * 1000))
+        self._timer_ref = self._pel._schedule_timer_for(
+            self._loop_capsule, delay, self._timer_callback_id)
+        self._timer_deadline = deadline
 
     def _dispatch(self, callback_id, event_type):
         """Dispatch a callback based on event type.
@@ -1357,12 +1393,13 @@ class ErlangEventLoop(asyncio.AbstractEventLoop):
             if entry is not None:
                 self._ready_append(self._get_handle(self._run_fd_callback, (callback_id,)))
         elif event_type == EVENT_TYPE_TIMER:
+            if callback_id == self._timer_callback_id:
+                self._timer_ref = None
+                self._timer_deadline = None
+                return
             handle = self._timers.pop(callback_id, None)
-            if handle is not None:
-                self._timer_refs.pop(callback_id, None)
-                self._handle_to_callback_id.pop(id(handle), None)
-                if not handle._cancelled:
-                    self._ready_append(handle)
+            if handle is not None and not handle._cancelled:
+                self._ready_append(handle)
 
     def _run_fd_callback(self, callback_id: int) -> None:
         entry = self._callbacks_by_cid.get(callback_id)
@@ -1394,15 +1431,8 @@ class ErlangEventLoop(asyncio.AbstractEventLoop):
 
     def _timer_handle_cancelled(self, handle):
         """Called when a TimerHandle is cancelled."""
-        callback_id = self._handle_to_callback_id.pop(id(handle), None)
-        if callback_id is not None:
-            self._timers.pop(callback_id, None)
-            timer_ref = self._timer_refs.pop(callback_id, None)
-            if timer_ref is not None:
-                try:
-                    self._pel._cancel_timer_for(self._loop_capsule, timer_ref)
-                except (AttributeError, RuntimeError):
-                    pass
+        if handle._scheduled:
+            self._timer_cancelled_count += 1
 
     def _set_coroutine_origin_tracking(self, enabled):
         """Enable/disable coroutine origin tracking."""
