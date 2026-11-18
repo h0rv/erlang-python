@@ -43,6 +43,7 @@ class ErlangSocketTransport(transports._FlowControlMixin):
     __slots__ = (
         '_sock', '_protocol', '_buffer', '_buffer_offset', '_closing',
         '_conn_lost', '_write_ready', '_paused', '_extra', '_fileno', '_extra_loaded',
+        '_read_size',
     )
 
     # These inherited CPython methods are not declared in typeshed.
@@ -66,6 +67,7 @@ class ErlangSocketTransport(transports._FlowControlMixin):
         self._conn_lost = 0
         self._write_ready = True
         self._paused = False
+        self._read_size = min(self.max_size, 64 * 1024)
         self._fileno = sock.fileno()
         self._extra = extra or {}
         self._extra['socket'] = sock
@@ -100,7 +102,7 @@ class ErlangSocketTransport(transports._FlowControlMixin):
             return
 
         try:
-            data = self._sock.recv(self.max_size)
+            data = self._sock.recv(self._read_size)
         except (BlockingIOError, InterruptedError):
             # EAGAIN - no more data available
             return
@@ -116,6 +118,8 @@ class ErlangSocketTransport(transports._FlowControlMixin):
             return
 
         if data:
+            if len(data) == self._read_size:
+                self._read_size = min(self._read_size * 2, self.max_size)
             self._protocol.data_received(data)
         else:
             # Connection closed (EOF received)

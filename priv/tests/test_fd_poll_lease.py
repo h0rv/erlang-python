@@ -645,11 +645,61 @@ def test_transport_reads_once_per_notification(result: bytes | OSError) -> None:
     transport = ErlangSocketTransport(loop, sock, protocol)
     try:
         transport._read_ready()
-        sock.recv.assert_called_once_with(transport.max_size)
+        sock.recv.assert_called_once_with(min(transport.max_size, 64 * 1024))
         if result == b"data":
             protocol.data_received.assert_called_once_with(b"data")
         elif result == b"":
             protocol.eof_received.assert_called_once()
+    finally:
+        transport.close()
+        loop.close()
+
+
+@pytest.mark.parametrize("limit", [16 * 1024, 256 * 1024])
+def test_transport_small_reads_keep_initial_allocation(limit: int) -> None:
+    loop = ErlangEventLoop()
+    sock = Mock(spec=socket.socket)
+    sock.fileno.return_value = 42
+    sock.recv.return_value = b"request"
+    protocol = Mock(spec=asyncio.Protocol)
+    with patch.object(ErlangSocketTransport, "max_size", limit):
+        transport = ErlangSocketTransport(loop, sock, protocol)
+        try:
+            for _ in range(10):
+                transport._read_ready()
+            assert sock.recv.call_count == 10
+            assert all(
+                args.args == (min(limit, 64 * 1024),)
+                for args in sock.recv.call_args_list
+            )
+            assert protocol.data_received.call_count == 10
+        finally:
+            transport.close()
+            loop.close()
+
+
+def test_transport_full_reads_grow_to_existing_limit() -> None:
+    loop = ErlangEventLoop()
+    sock = Mock(spec=socket.socket)
+    sock.fileno.return_value = 42
+    sizes = [64 * 1024, 128 * 1024, 256 * 1024, 256 * 1024]
+    chunks = [b"x" * size for size in sizes] + [b"tail"]
+    sock.recv.side_effect = [*chunks, b""]
+    protocol = Mock(spec=asyncio.Protocol)
+    protocol.eof_received.return_value = True
+    transport = ErlangSocketTransport(loop, sock, protocol)
+    try:
+        for _ in range(len(chunks) + 1):
+            transport._read_ready()
+        assert [args.args[0] for args in sock.recv.call_args_list] == [
+            *sizes,
+            transport.max_size,
+            transport.max_size,
+        ]
+        assert [
+            args.args[0] for args in protocol.data_received.call_args_list
+        ] == chunks
+        protocol.eof_received.assert_called_once()
     finally:
         transport.close()
         loop.close()
