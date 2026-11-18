@@ -5,13 +5,13 @@
 all() -> [poll_leases, failed_dup, reserved_events].
 
 init_per_suite(Config) ->
-    application:load(erlang_python),
-    application:set_env(erlang_python, num_contexts, 1),
-    application:set_env(erlang_python, event_loop_pool_size, 1),
+    Config1 = py_ct_env:override(Config, #{num_contexts => 1, event_loop_pool_size => 1}),
     {ok, _} = application:ensure_all_started(erlang_python),
-    Config.
+    Config1.
 
-end_per_suite(_) -> application:stop(erlang_python).
+end_per_suite(Config) ->
+    ok = application:stop(erlang_python),
+    py_ct_env:restore(Config).
 
 poll_leases(_) -> run_case(poll_leases).
 failed_dup(_) -> run_case(failed_dup).
