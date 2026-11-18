@@ -114,3 +114,35 @@ async def connect_completion() -> bool:
         loop._close_socket(client)
         server.close()
     return True
+
+
+async def callback_rearm() -> bool:
+    loop = owner()
+    left, right = socket.socketpair()
+    left.setblocking(False)
+    right.setblocking(False)
+    pieces: list[bytes] = []
+    done = loop.create_future()
+    fd = left.fileno()
+
+    def replacement() -> None:
+        pieces.append(left.recv(1))
+        if len(pieces) == 3:
+            loop.remove_reader(fd)
+            done.set_result(True)
+
+    def readable() -> None:
+        pieces.append(left.recv(1))
+        loop.add_reader(fd, replacement)
+
+    try:
+        loop.add_reader(fd, readable)
+        assert right.send(b"abc") == 3
+        async with asyncio.timeout(2):
+            await done
+        assert pieces == [b"a", b"b", b"c"]
+        assert fd not in loop._readers
+        return True
+    finally:
+        loop._close_socket(left)
+        right.close()

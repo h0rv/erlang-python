@@ -71,7 +71,7 @@ class _PooledHandle(events.Handle):
     Only fd event dispatch creates these; they never leave the loop, so no
     one can cancel one after it ran and hit its next occupant.
     """
-    __slots__ = ()
+    __slots__ = ('_fd_callback_id',)
 
 
 class ErlangEventLoop(asyncio.AbstractEventLoop):
@@ -1303,6 +1303,8 @@ class ErlangEventLoop(asyncio.AbstractEventLoop):
                 break
             handle = popleft()
             if handle._cancelled:
+                if type(handle) is _PooledHandle:
+                    self._rearm_fd_callback(handle._fd_callback_id)
                 return_handle(handle)
                 continue
             self._current_handle = handle
@@ -1398,7 +1400,9 @@ class ErlangEventLoop(asyncio.AbstractEventLoop):
             # O(1) direct lookup by callback_id
             entry = self._callbacks_by_cid.get(callback_id)
             if entry is not None:
-                self._ready_append(self._get_handle(self._run_fd_callback, (callback_id,)))
+                handle = self._get_handle(self._run_fd_callback, (callback_id,))
+                handle._fd_callback_id = callback_id
+                self._ready_append(handle)
         elif event_type == EVENT_TYPE_TIMER:
             if callback_id == self._timer_callback_id:
                 self._timer_ref = None
@@ -1412,12 +1416,19 @@ class ErlangEventLoop(asyncio.AbstractEventLoop):
         entry = self._callbacks_by_cid.get(callback_id)
         if entry is None:
             return
-        if (
-            entry.key in self._fd_retirement_failed
-            or entry.fd in self._fd_publications
-        ):
-            return
-        entry.callback(*entry.args)
+        try:
+            if (
+                entry.key not in self._fd_retirement_failed
+                and entry.fd not in self._fd_publications
+            ):
+                entry.callback(*entry.args)
+        finally:
+            self._rearm_fd_callback(callback_id)
+
+    def _rearm_fd_callback(self, callback_id: int) -> None:
+        entry = self._callbacks_by_cid.get(callback_id)
+        if entry is not None:
+            self._pel._rearm_fd(entry.key, callback_id)
 
     def _get_ready_count(self):
         """Return the number of ready callbacks.
@@ -1635,6 +1646,9 @@ class _MockNifModule:
 
     def _update_fd_read(self, fd_key, callback_id):
         """Update read callback on existing fd_resource."""
+        pass
+
+    def _rearm_fd(self, fd_key, callback_id):
         pass
 
     def _update_fd_write(self, fd_key, callback_id):

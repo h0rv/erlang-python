@@ -12,6 +12,10 @@
 
 ### Fixed
 
+- FD readiness stays one-shot until the Python callback completes. Lease-checked
+  acknowledgements re-arm active watchers without readiness message storms;
+  socket transports make one read or write attempt per notification.
+
 - Asyncio timers use a Python deadline heap instead of one Erlang timer per
   handle. Native waits use the next deadline; shared worker loops retain one
   earliest-deadline wakeup. Cancelling handles no longer calls Erlang.

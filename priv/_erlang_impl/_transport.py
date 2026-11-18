@@ -87,13 +87,10 @@ class ErlangSocketTransport(transports._FlowControlMixin):
             except Exception:
                 pass
 
-    # Maximum reads per callback to avoid starving other events
-    _max_reads_per_call = 16
-
     def _read_ready(self):
         """Called when data is available to read.
 
-        Drains socket until EAGAIN with a budget to avoid starvation.
+        Remaining data is delivered by the next level-triggered notification.
         """
         if self._conn_lost:
             return
@@ -102,35 +99,34 @@ class ErlangSocketTransport(transports._FlowControlMixin):
         if self._sock.fileno() == -1:
             return
 
-        for _ in range(self._max_reads_per_call):
-            try:
-                data = self._sock.recv(self.max_size)
-            except (BlockingIOError, InterruptedError):
-                # EAGAIN - no more data available
+        try:
+            data = self._sock.recv(self.max_size)
+        except (BlockingIOError, InterruptedError):
+            # EAGAIN - no more data available
+            return
+        except OSError as exc:
+            # Handle bad file descriptor (socket closed)
+            if exc.errno == errno.EBADF:
+                self._conn_lost += 1
                 return
-            except OSError as exc:
-                # Handle bad file descriptor (socket closed)
-                if exc.errno == errno.EBADF:
-                    self._conn_lost += 1
-                    return
-                self._fatal_error(exc, 'Fatal read error')
-                return
-            except Exception as exc:
-                self._fatal_error(exc, 'Fatal read error')
-                return
+            self._fatal_error(exc, 'Fatal read error')
+            return
+        except Exception as exc:
+            self._fatal_error(exc, 'Fatal read error')
+            return
 
-            if data:
-                self._protocol.data_received(data)
-            else:
-                # Connection closed (EOF received)
-                self._loop._stop_reading(self._fileno)
-                keep_open = self._protocol.eof_received()
-                # If eof_received returns False/None, close the transport
-                if not keep_open:
-                    self._closing = True
-                    self._conn_lost += 1
-                    self._call_connection_lost(None)
-                return
+        if data:
+            self._protocol.data_received(data)
+        else:
+            # Connection closed (EOF received)
+            self._loop._stop_reading(self._fileno)
+            keep_open = self._protocol.eof_received()
+            # If eof_received returns False/None, close the transport
+            if not keep_open:
+                self._closing = True
+                self._conn_lost += 1
+                self._call_connection_lost(None)
+            return
 
     @override
     def write(self, data):
@@ -163,54 +159,49 @@ class ErlangSocketTransport(transports._FlowControlMixin):
         self._buffer.extend(data)
         self._maybe_pause_protocol()
 
-    # Maximum writes per callback to avoid starving other events
-    _max_writes_per_call = 16
-
     def _write_ready_cb(self):
         """Called when socket is ready for writing.
 
-        Drains buffer until EAGAIN with a budget to avoid starvation.
+        Remaining data is sent on the next level-triggered notification.
         """
         # Guard against closed socket (fd == -1)
         if self._sock.fileno() == -1:
             self._conn_lost += 1
             return
 
-        for _ in range(self._max_writes_per_call):
-            remaining = len(self._buffer) - self._buffer_offset
-            if remaining <= 0:
-                self._loop._stop_writing(self._fileno)
-                if self._closing:
-                    self._call_connection_lost(None)
-                return
+        remaining = len(self._buffer) - self._buffer_offset
+        if remaining <= 0:
+            self._loop._stop_writing(self._fileno)
+            if self._closing:
+                self._call_connection_lost(None)
+            return
 
-            data_view = memoryview(self._buffer)[self._buffer_offset:]
-            try:
-                n = self._sock.send(data_view)
-            except (BlockingIOError, InterruptedError):
-                # EAGAIN - socket buffer full
+        data_view = memoryview(self._buffer)[self._buffer_offset:]
+        try:
+            n = self._sock.send(data_view)
+        except (BlockingIOError, InterruptedError):
+            # EAGAIN - socket buffer full
+            return
+        except OSError as exc:
+            # Handle bad file descriptor (socket closed)
+            if exc.errno == errno.EBADF:
+                self._conn_lost += 1
                 return
-            except OSError as exc:
-                # Handle bad file descriptor (socket closed)
-                if exc.errno == errno.EBADF:
-                    self._conn_lost += 1
-                    return
-                self._loop._stop_writing(self._fileno)
-                self._fatal_error(exc, 'Fatal write error')
-                return
-            except Exception as exc:
-                self._loop._stop_writing(self._fileno)
-                self._fatal_error(exc, 'Fatal write error')
-                return
+            self._loop._stop_writing(self._fileno)
+            self._fatal_error(exc, 'Fatal write error')
+            return
+        except Exception as exc:
+            self._loop._stop_writing(self._fileno)
+            self._fatal_error(exc, 'Fatal write error')
+            return
 
-            finally:
-                data_view.release()
+        finally:
+            data_view.release()
 
-            if n:
-                self._buffer_offset += n  # O(1) offset update instead of O(n) deletion
-                self._maybe_resume_protocol()
+        if n:
+            self._buffer_offset += n  # O(1) offset update instead of O(n) deletion
+            self._maybe_resume_protocol()
 
-        # Check if buffer is fully consumed after budget exhausted
         if self._buffer_offset >= len(self._buffer):
             # Reset buffer when fully consumed
             self._buffer = self._buffer_factory()

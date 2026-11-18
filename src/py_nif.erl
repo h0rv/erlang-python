@@ -112,14 +112,9 @@
     dispatch_callback/3,
     dispatch_timer/2,
     get_fd_callback_id/2,
-    reselect_reader/2,
-    reselect_writer/2,
-    reselect_reader_fd/1,
-    reselect_writer_fd/1,
     %% FD lifecycle management (uvloop-like API)
     handle_fd_event/2,
-    handle_fd_event_and_reselect/2,
-    fd_arm/2,
+    fd_arm/3,
     stop_reader/1,
     start_reader/1,
     stop_writer/1,
@@ -809,56 +804,23 @@ dispatch_timer(_LoopRef, _CallbackId) ->
 get_fd_callback_id(_FdRes, _Type) ->
     ?NIF_STUB.
 
-%% @doc Re-register an fd resource for read monitoring.
-%% Called after an event is delivered since enif_select is one-shot.
--spec reselect_reader(reference(), reference()) -> ok | {error, term()}.
-reselect_reader(_LoopRef, _FdRes) ->
-    ?NIF_STUB.
-
-%% @doc Re-register an fd resource for write monitoring.
-%% Called after an event is delivered since enif_select is one-shot.
--spec reselect_writer(reference(), reference()) -> ok | {error, term()}.
-reselect_writer(_LoopRef, _FdRes) ->
-    ?NIF_STUB.
-
-%% @doc Re-register an fd resource for read monitoring using fd_res->loop.
-%% This variant doesn't require LoopRef since the fd resource already
-%% has a back-reference to its parent loop.
--spec reselect_reader_fd(reference()) -> ok | {error, term()}.
-reselect_reader_fd(_FdRes) ->
-    ?NIF_STUB.
-
-%% @doc Re-register an fd resource for write monitoring using fd_res->loop.
-%% This variant doesn't require LoopRef since the fd resource already
-%% has a back-reference to its parent loop.
--spec reselect_writer_fd(reference()) -> ok | {error, term()}.
-reselect_writer_fd(_FdRes) ->
-    ?NIF_STUB.
-
 %%% ============================================================================
 %%% FD Lifecycle Management (uvloop-like API)
 %%% ============================================================================
 
-%% @doc Handle a select event (dispatch + auto-reselect).
+%% @doc Queue a select event until Python acknowledges its callback.
 %% Called by py_event_worker when receiving {select, FdRes, Ref, ready_input/output}.
-%% This combines get_fd_callback_id + dispatch_callback + reselect into one NIF call.
+%% This combines get_fd_callback_id + dispatch_callback into one NIF call.
 %% Type: read | write
 -spec handle_fd_event(reference(), read | write) -> ok | {error, term()}.
 handle_fd_event(_FdRef, _Type) ->
     ?NIF_STUB.
 
-%% @doc Handle FD event and immediately reselect for next event.
-%% Combined operation that eliminates one roundtrip - dispatch and reselect in one NIF call.
-%% Type: read | write
--spec handle_fd_event_and_reselect(reference(), read | write) -> ok | {error, term()}.
-handle_fd_event_and_reselect(_FdRef, _Type) ->
-    ?NIF_STUB.
-
 %% @doc Re-arm a read or write select for an existing fd resource.
 %% Sent to the event worker by the Python loop, which cannot re-select a
 %% scheduler-polled fd from its own thread.
--spec fd_arm(reference(), read | write) -> ok | {error, term()}.
-fd_arm(_FdRef, _Type) ->
+-spec fd_arm(reference(), read | write, non_neg_integer()) -> ok | {error, term()}.
+fd_arm(_FdRef, _Type, _CallbackId) ->
     ?NIF_STUB.
 
 %% @doc Stop/pause read monitoring without closing the FD.

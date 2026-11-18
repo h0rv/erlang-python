@@ -1983,8 +1983,7 @@ ERL_NIF_TERM nif_dispatch_timer(ErlNifEnv *env, int argc,
  * Called by py_event_worker when receiving {select, FdRes, Ref, ready_input/output}.
  *
  * NOTE: Does NOT auto-reselect to avoid infinite loops with level-triggered FDs.
- * Python should call start_reader/start_writer after processing the callback
- * to re-enable monitoring for the next event.
+ * Python acknowledges the current callback lease after processing it.
  *
  * Type: read | write
  */
@@ -2012,6 +2011,11 @@ ERL_NIF_TERM nif_handle_fd_event(ErlNifEnv *env, int argc,
     uint64_t callback_id;
     bool is_active;
 
+    pthread_mutex_lock(&fd_res->mutex);
+    if (atomic_load(&fd_res->closing_state) != FD_STATE_OPEN) {
+        pthread_mutex_unlock(&fd_res->mutex);
+        return ATOM_OK;
+    }
     if (is_read) {
         callback_id = fd_res->read_callback_id;
         is_active = fd_res->reader_active;
@@ -2020,98 +2024,25 @@ ERL_NIF_TERM nif_handle_fd_event(ErlNifEnv *env, int argc,
         is_active = fd_res->writer_active;
     }
 
+    pthread_mutex_unlock(&fd_res->mutex);
     if (!is_active || callback_id == 0) {
         return ATOM_OK;  /* Watcher was stopped, ignore */
     }
 
     /* Add to pending queue */
     event_type_t event_type = is_read ? EVENT_TYPE_READ : EVENT_TYPE_WRITE;
-    event_loop_add_pending(loop, event_type, callback_id, fd_res->fd);
-
-    /* Note: No auto-reselect here. Python event loop should call start_reader/start_writer
-     * after reading/writing data to re-enable monitoring. This prevents infinite loops
-     * when FD remains ready (level-triggered behavior). */
+    if (!event_loop_add_pending(loop, event_type, callback_id, fd_res->fd)) {
+        ERL_NIF_TERM arm_args[] = {
+            argv[0], argv[1], enif_make_uint64(env, callback_id)
+        };
+        return nif_fd_arm(env, 3, arm_args);
+    }
 
     return ATOM_OK;
 }
 
 /**
- * handle_fd_event_and_reselect(FdRes, Type) -> ok | {error, Reason}
- *
- * Combined operation: handles FD event AND reselects for next event.
- * This eliminates one roundtrip - the worker can dispatch and reselect
- * in a single NIF call.
- *
- * Safe because:
- * - Duplicate detection in pending queue prevents flooding
- * - OTP 28+ has optimized pollset for frequently re-enabled FDs
- *
- * Type: read | write
- */
-ERL_NIF_TERM nif_handle_fd_event_and_reselect(ErlNifEnv *env, int argc,
-                                               const ERL_NIF_TERM argv[]) {
-    (void)argc;
-
-    fd_resource_t *fd_res;
-    if (!enif_get_resource(env, argv[0], FD_RESOURCE_TYPE, (void **)&fd_res)) {
-        return make_error(env, "invalid_fd_ref");
-    }
-
-    erlang_event_loop_t *loop = fd_res->loop;
-    if (loop == NULL) {
-        return make_error(env, "no_loop");
-    }
-
-    /* Determine type and get callback ID */
-    bool is_read = enif_compare(argv[1], ATOM_READ) == 0;
-    uint64_t callback_id;
-    bool is_active;
-
-    /* The state check and the reselect must be one step: the Python thread
-     * closes fds through py_release_fd_resource, which moves the state to
-     * CLOSING under this same mutex before it issues ERL_NIF_SELECT_STOP.
-     * Without the lock we could pass the check, lose the race, and reselect
-     * a closed (or already reused) fd number. */
-    pthread_mutex_lock(&loop->mutex);
-
-    if (atomic_load(&fd_res->closing_state) != FD_STATE_OPEN) {
-        pthread_mutex_unlock(&loop->mutex);
-        return ATOM_OK;  /* Silently ignore events on closing FDs */
-    }
-
-    if (is_read) {
-        callback_id = fd_res->read_callback_id;
-        is_active = fd_res->reader_active;
-    } else {
-        callback_id = fd_res->write_callback_id;
-        is_active = fd_res->writer_active;
-    }
-
-    if (!is_active || callback_id == 0) {
-        pthread_mutex_unlock(&loop->mutex);
-        return ATOM_OK;  /* Watcher was stopped, ignore */
-    }
-
-    /* Immediately reselect for next event.
-     * Use ATOM_UNDEFINED instead of enif_make_ref to avoid per-event allocation.
-     * The ref is ignored by the worker anyway. */
-    ErlNifPid *target_pid = &loop->worker_pid;
-    int select_flags = is_read ? ERL_NIF_SELECT_READ : ERL_NIF_SELECT_WRITE;
-    int result = enif_select(env, (ErlNifEvent)fd_res->fd, select_flags,
-                fd_res, target_pid, ATOM_UNDEFINED);
-
-    pthread_mutex_unlock(&loop->mutex);
-    if (result < 0) return make_error(env, "reselect_failed");
-
-    /* Add to pending queue (has duplicate detection; takes loop->mutex itself) */
-    event_type_t event_type = is_read ? EVENT_TYPE_READ : EVENT_TYPE_WRITE;
-    event_loop_add_pending(loop, event_type, callback_id, fd_res->fd);
-
-    return ATOM_OK;
-}
-
-/**
- * fd_arm(FdRef, read | write) -> ok
+ * fd_arm(FdRef, read | write, CallbackId) -> ok
  *
  * Re-arm a read or write select for an fd whose resource already exists.
  * Called by the loop's py_event_worker on behalf of ErlangEventLoop
@@ -2133,17 +2064,20 @@ ERL_NIF_TERM nif_fd_arm(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
         return make_error(env, "no_loop");
     }
     bool is_read = enif_compare(argv[1], ATOM_READ) == 0;
+    ErlNifUInt64 callback_id;
+    if (!enif_get_uint64(env, argv[2], &callback_id)) return enif_make_badarg(env);
 
-    pthread_mutex_lock(&loop->mutex);
+    pthread_mutex_lock(&fd_res->mutex);
     if (atomic_load(&fd_res->closing_state) != FD_STATE_OPEN ||
-        (is_read ? !fd_res->reader_active : !fd_res->writer_active)) {
-        pthread_mutex_unlock(&loop->mutex);
+        (is_read ? !fd_res->reader_active : !fd_res->writer_active) ||
+        callback_id != (is_read ? fd_res->read_callback_id : fd_res->write_callback_id)) {
+        pthread_mutex_unlock(&fd_res->mutex);
         return ATOM_OK;  /* Closed or disarmed again in the meantime */
     }
     int select_flags = is_read ? ERL_NIF_SELECT_READ : ERL_NIF_SELECT_WRITE;
-    int result = enif_select(env, (ErlNifEvent)fd_res->fd, select_flags,
-                fd_res, &loop->worker_pid, ATOM_UNDEFINED);
-    pthread_mutex_unlock(&loop->mutex);
+    int result = fd_select_locked(env, fd_res, select_flags,
+                                 &loop->worker_pid, ATOM_UNDEFINED);
+    pthread_mutex_unlock(&fd_res->mutex);
     return result < 0 ? make_error(env, "reselect_failed") : ATOM_OK;
 }
 
@@ -5013,175 +4947,7 @@ ERL_NIF_TERM nif_get_fd_callback_id(ErlNifEnv *env, int argc,
     return enif_make_uint64(env, callback_id);
 }
 
-/**
- * reselect_reader(LoopRef, FdRes) -> ok | {error, Reason}
- *
- * Re-register an fd for read monitoring after an event is delivered.
- * enif_select is one-shot, so we need to re-register after each event.
- */
-ERL_NIF_TERM nif_reselect_reader(ErlNifEnv *env, int argc,
-                                  const ERL_NIF_TERM argv[]) {
-    (void)argc;
 
-    erlang_event_loop_t *loop;
-    if (!enif_get_resource(env, argv[0], EVENT_LOOP_RESOURCE_TYPE,
-                           (void **)&loop)) {
-        return make_error(env, "invalid_loop");
-    }
-
-    fd_resource_t *fd_res;
-    if (!enif_get_resource(env, argv[1], FD_RESOURCE_TYPE, (void **)&fd_res)) {
-        return make_error(env, "invalid_fd_ref");
-    }
-
-    /* Don't reselect if reader was removed or FD is closing */
-    if (!fd_res->reader_active) {
-        return ATOM_OK;
-    }
-    if (atomic_load(&fd_res->closing_state) != FD_STATE_OPEN) {
-        return ATOM_OK;
-    }
-
-    /* Re-register with Erlang scheduler for read monitoring.
-     * Use ATOM_UNDEFINED instead of enif_make_ref to avoid per-event allocation. */
-    ErlNifPid *target_pid = &loop->worker_pid;
-    int ret = enif_select(env, (ErlNifEvent)fd_res->fd, ERL_NIF_SELECT_READ,
-                          fd_res, target_pid, ATOM_UNDEFINED);
-
-    if (ret < 0) {
-        return make_error(env, "reselect_failed");
-    }
-
-    return ATOM_OK;
-}
-
-/**
- * reselect_writer(LoopRef, FdRes) -> ok | {error, Reason}
- *
- * Re-register an fd for write monitoring after an event is delivered.
- * enif_select is one-shot, so we need to re-register after each event.
- */
-ERL_NIF_TERM nif_reselect_writer(ErlNifEnv *env, int argc,
-                                  const ERL_NIF_TERM argv[]) {
-    (void)argc;
-
-    erlang_event_loop_t *loop;
-    if (!enif_get_resource(env, argv[0], EVENT_LOOP_RESOURCE_TYPE,
-                           (void **)&loop)) {
-        return make_error(env, "invalid_loop");
-    }
-
-    fd_resource_t *fd_res;
-    if (!enif_get_resource(env, argv[1], FD_RESOURCE_TYPE, (void **)&fd_res)) {
-        return make_error(env, "invalid_fd_ref");
-    }
-
-    /* Don't reselect if writer was removed or FD is closing */
-    if (!fd_res->writer_active) {
-        return ATOM_OK;
-    }
-    if (atomic_load(&fd_res->closing_state) != FD_STATE_OPEN) {
-        return ATOM_OK;
-    }
-
-    /* Re-register with Erlang scheduler for write monitoring.
-     * Use ATOM_UNDEFINED instead of enif_make_ref to avoid per-event allocation. */
-    ErlNifPid *target_pid = &loop->worker_pid;
-    int ret = enif_select(env, (ErlNifEvent)fd_res->fd, ERL_NIF_SELECT_WRITE,
-                          fd_res, target_pid, ATOM_UNDEFINED);
-
-    if (ret < 0) {
-        return make_error(env, "reselect_failed");
-    }
-
-    return ATOM_OK;
-}
-
-/**
- * reselect_reader_fd(FdRes) -> ok | {error, Reason}
- *
- * Re-register an fd for read monitoring using fd_res->loop.
- * This variant doesn't require LoopRef since the fd resource
- * already has a back-reference to its parent loop.
- */
-ERL_NIF_TERM nif_reselect_reader_fd(ErlNifEnv *env, int argc,
-                                     const ERL_NIF_TERM argv[]) {
-    (void)argc;
-
-    fd_resource_t *fd_res;
-    if (!enif_get_resource(env, argv[0], FD_RESOURCE_TYPE, (void **)&fd_res)) {
-        return make_error(env, "invalid_fd_ref");
-    }
-
-    /* Don't reselect if reader was removed or FD is closing */
-    if (!fd_res->reader_active) {
-        return ATOM_OK;
-    }
-    if (atomic_load(&fd_res->closing_state) != FD_STATE_OPEN) {
-        return ATOM_OK;
-    }
-
-    /* Use the loop stored in the fd resource */
-    erlang_event_loop_t *loop = fd_res->loop;
-    if (loop == NULL || !event_loop_ensure_worker(loop)) {
-        return make_error(env, "no_loop");
-    }
-
-    /* Re-register with Erlang scheduler for read monitoring.
-     * Use ATOM_UNDEFINED instead of enif_make_ref to avoid per-event allocation. */
-    ErlNifPid *target_pid = &loop->worker_pid;
-    int ret = enif_select(env, (ErlNifEvent)fd_res->fd, ERL_NIF_SELECT_READ,
-                          fd_res, target_pid, ATOM_UNDEFINED);
-
-    if (ret < 0) {
-        return make_error(env, "reselect_failed");
-    }
-
-    return ATOM_OK;
-}
-
-/**
- * reselect_writer_fd(FdRes) -> ok | {error, Reason}
- *
- * Re-register an fd for write monitoring using fd_res->loop.
- * This variant doesn't require LoopRef since the fd resource
- * already has a back-reference to its parent loop.
- */
-ERL_NIF_TERM nif_reselect_writer_fd(ErlNifEnv *env, int argc,
-                                     const ERL_NIF_TERM argv[]) {
-    (void)argc;
-
-    fd_resource_t *fd_res;
-    if (!enif_get_resource(env, argv[0], FD_RESOURCE_TYPE, (void **)&fd_res)) {
-        return make_error(env, "invalid_fd_ref");
-    }
-
-    /* Don't reselect if writer was removed or FD is closing */
-    if (!fd_res->writer_active) {
-        return ATOM_OK;
-    }
-    if (atomic_load(&fd_res->closing_state) != FD_STATE_OPEN) {
-        return ATOM_OK;
-    }
-
-    /* Use the loop stored in the fd resource */
-    erlang_event_loop_t *loop = fd_res->loop;
-    if (loop == NULL || !event_loop_ensure_worker(loop)) {
-        return make_error(env, "no_loop");
-    }
-
-    /* Re-register with Erlang scheduler for write monitoring.
-     * Use ATOM_UNDEFINED instead of enif_make_ref to avoid per-event allocation. */
-    ErlNifPid *target_pid = &loop->worker_pid;
-    int ret = enif_select(env, (ErlNifEvent)fd_res->fd, ERL_NIF_SELECT_WRITE,
-                          fd_res, target_pid, ATOM_UNDEFINED);
-
-    if (ret < 0) {
-        return make_error(env, "reselect_failed");
-    }
-
-    return ATOM_OK;
-}
 
 /**
  * stop_reader(FdRef) -> ok | {error, Reason}
@@ -8351,6 +8117,47 @@ static PyObject *py_remove_writer_for(PyObject *self, PyObject *args) {
     return fd_python_retire(key, false);
 }
 
+static int fd_request_arm(fd_resource_t *res, bool reading, uint64_t callback_id) {
+    ErlNifEnv *env = enif_alloc_env();
+    if (env == NULL) {
+        PyErr_NoMemory();
+        return -1;
+    }
+    ERL_NIF_TERM msg = enif_make_tuple4(env,
+        enif_make_atom(env, "fd_arm"), enif_make_resource(env, res),
+        reading ? ATOM_READ : ATOM_WRITE, enif_make_uint64(env, callback_id));
+    int sent = enif_send(NULL, &res->loop->worker_pid, env, msg);
+    enif_free_env(env);
+    if (!sent) {
+        PyErr_SetString(PyExc_RuntimeError, "Event loop worker is gone");
+        return -1;
+    }
+    return 0;
+}
+
+static PyObject *py_rearm_fd(PyObject *self, PyObject *args) {
+    (void)self;
+    unsigned long long key, callback_id;
+    if (!PyArg_ParseTuple(args, "KK", &key, &callback_id)) return NULL;
+    fd_resource_t *res = fd_reg_get(key);
+    if (res == NULL) Py_RETURN_NONE;
+    erlang_event_loop_t *loop = res->loop;
+    int result = 0;
+    if (loop != NULL) {
+        pthread_mutex_lock(&res->mutex);
+        if (atomic_load(&res->closing_state) == FD_STATE_OPEN) {
+            if (res->reader_active && res->read_callback_id == callback_id)
+                result = fd_request_arm(res, true, callback_id);
+            else if (res->writer_active && res->write_callback_id == callback_id)
+                result = fd_request_arm(res, false, callback_id);
+        }
+        pthread_mutex_unlock(&res->mutex);
+    }
+    enif_release_resource(res);
+    if (result < 0) return NULL;
+    Py_RETURN_NONE;
+}
+
 /**
  * Update read callback on existing fd_resource and re-register with enif_select.
  * Python function: _update_fd_read(fd_key, callback_id) -> None
@@ -8393,27 +8200,11 @@ static PyObject *py_update_fd_read(PyObject *self, PyObject *args) {
     fd_res->reader_active = true;
     pthread_mutex_unlock(&fd_res->mutex);
 
-    /* Re-arm from the worker process, not from this Python thread: see
-     * nif_fd_arm for why a READ re-select must run on a scheduler thread. */
-    ErlNifEnv *arm_env = enif_alloc_env();
-    if (arm_env == NULL) {
-        fd_res->reader_active = false;
+    int result = fd_request_arm(fd_res, true, callback_id);
+    if (result < 0) {
         enif_release_resource(fd_res);
-        PyErr_SetString(PyExc_MemoryError, "Failed to allocate env");
         return NULL;
     }
-    ERL_NIF_TERM arm_msg = enif_make_tuple3(arm_env,
-        enif_make_atom(arm_env, "fd_arm"),
-        enif_make_resource(arm_env, fd_res),
-        ATOM_READ);
-    if (!enif_send(NULL, &fd_res->loop->worker_pid, arm_env, arm_msg)) {
-        enif_free_env(arm_env);
-        fd_res->reader_active = false;
-        enif_release_resource(fd_res);
-        PyErr_SetString(PyExc_RuntimeError, "Event loop worker is gone");
-        return NULL;
-    }
-    enif_free_env(arm_env);
 
     enif_release_resource(fd_res);
     Py_RETURN_NONE;
@@ -8461,14 +8252,9 @@ static PyObject *py_update_fd_write(PyObject *self, PyObject *args) {
     fd_res->writer_active = true;
     pthread_mutex_unlock(&fd_res->mutex);
 
-    /* Same target as _add_writer_for: the loop's worker process. */
-    ErlNifPid *target_pid = &fd_res->loop->worker_pid;
-    int ret = enif_select(fd_res->loop->msg_env, (ErlNifEvent)fd_res->fd,
-                          ERL_NIF_SELECT_WRITE, fd_res, target_pid, ATOM_UNDEFINED);
-    if (ret < 0) {
-        fd_res->writer_active = false;
+    int result = fd_request_arm(fd_res, false, callback_id);
+    if (result < 0) {
         enif_release_resource(fd_res);
-        PyErr_SetString(PyExc_RuntimeError, "Failed to register fd for writing");
         return NULL;
     }
 
@@ -8494,11 +8280,13 @@ static PyObject *py_clear_fd_read(PyObject *self, PyObject *args) {
         Py_RETURN_NONE;  /* Already cleaned up / invalid id */
     }
 
+    pthread_mutex_lock(&fd_res->mutex);
     if (fd_res->reader_active) {
-        int result = enif_select(fd_res->loop->msg_env, (ErlNifEvent)fd_res->fd,
+        int result = fd_select_locked(fd_res->loop->msg_env, fd_res,
                     ERL_NIF_SELECT_CANCEL | ERL_NIF_SELECT_READ,
-                    fd_res, NULL, ATOM_UNDEFINED);
+                    NULL, ATOM_UNDEFINED);
         if (result < 0) {
+            pthread_mutex_unlock(&fd_res->mutex);
             enif_release_resource(fd_res);
             PyErr_SetString(PyExc_RuntimeError, "FD read cancellation failed");
             return NULL;
@@ -8506,6 +8294,7 @@ static PyObject *py_clear_fd_read(PyObject *self, PyObject *args) {
         fd_res->reader_active = false;
         fd_res->read_callback_id = 0;
     }
+    pthread_mutex_unlock(&fd_res->mutex);
 
     enif_release_resource(fd_res);
     Py_RETURN_NONE;
@@ -8529,11 +8318,13 @@ static PyObject *py_clear_fd_write(PyObject *self, PyObject *args) {
         Py_RETURN_NONE;  /* Already cleaned up / invalid id */
     }
 
+    pthread_mutex_lock(&fd_res->mutex);
     if (fd_res->writer_active) {
-        int result = enif_select(fd_res->loop->msg_env, (ErlNifEvent)fd_res->fd,
+        int result = fd_select_locked(fd_res->loop->msg_env, fd_res,
                     ERL_NIF_SELECT_CANCEL | ERL_NIF_SELECT_WRITE,
-                    fd_res, NULL, ATOM_UNDEFINED);
+                    NULL, ATOM_UNDEFINED);
         if (result < 0) {
+            pthread_mutex_unlock(&fd_res->mutex);
             enif_release_resource(fd_res);
             PyErr_SetString(PyExc_RuntimeError, "FD write cancellation failed");
             return NULL;
@@ -8541,6 +8332,7 @@ static PyObject *py_clear_fd_write(PyObject *self, PyObject *args) {
         fd_res->writer_active = false;
         fd_res->write_callback_id = 0;
     }
+    pthread_mutex_unlock(&fd_res->mutex);
 
     enif_release_resource(fd_res);
     Py_RETURN_NONE;
@@ -8832,6 +8624,7 @@ static PyMethodDef PyEventLoopMethods[] = {
     {"_add_writer_for", py_add_writer_for, METH_VARARGS, "Register fd for write monitoring on specific loop"},
     {"_remove_writer_for", py_remove_writer_for, METH_VARARGS, "Stop monitoring fd for writes on specific loop"},
     /* Shared fd resource management (for read+write on same fd) */
+    {"_rearm_fd", py_rearm_fd, METH_VARARGS, "Acknowledge an FD callback and re-arm its current lease"},
     {"_update_fd_read", py_update_fd_read, METH_VARARGS, "Update read callback on fd resource"},
     {"_update_fd_write", py_update_fd_write, METH_VARARGS, "Update write callback on fd resource"},
     {"_clear_fd_read", py_clear_fd_read, METH_VARARGS, "Clear read monitoring on fd resource"},
@@ -9084,13 +8877,8 @@ int init_subinterpreter_event_loop(ErlNifEnv *env) {
     {"dispatch_callback", 3, nif_dispatch_callback, 0}, \
     {"dispatch_timer", 2, nif_dispatch_timer, 0}, \
     {"get_fd_callback_id", 2, nif_get_fd_callback_id, 0}, \
-    {"reselect_reader", 2, nif_reselect_reader, 0}, \
-    {"reselect_writer", 2, nif_reselect_writer, 0}, \
-    {"reselect_reader_fd", 1, nif_reselect_reader_fd, 0}, \
-    {"reselect_writer_fd", 1, nif_reselect_writer_fd, 0}, \
     {"handle_fd_event", 2, nif_handle_fd_event, 0}, \
-    {"handle_fd_event_and_reselect", 2, nif_handle_fd_event_and_reselect, 0}, \
-    {"fd_arm", 2, nif_fd_arm, 0}, \
+    {"fd_arm", 3, nif_fd_arm, 0}, \
     {"stop_reader", 1, nif_stop_reader, 0}, \
     {"start_reader", 1, nif_start_reader, 0}, \
     {"stop_writer", 1, nif_stop_writer, 0}, \

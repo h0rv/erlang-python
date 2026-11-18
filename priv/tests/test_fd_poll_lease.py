@@ -5,7 +5,7 @@ import sys
 from enum import StrEnum
 from types import ModuleType
 from typing import override
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -24,6 +24,7 @@ with patch.dict(sys.modules, {"erlang": ModuleType("erlang")}):
         _MockLoopCapsule,
         _MockNifModule,
     )
+    from _erlang_impl._transport import ErlangSocketTransport
 
 
 class Failure(StrEnum):
@@ -581,3 +582,97 @@ def test_callback_publication_failure_rolls_back_a_new_native_lease(
         native.finish()
         left.close()
         right.close()
+
+
+@pytest.mark.parametrize("writing", [False, True])
+@pytest.mark.parametrize(
+    "outcome", ["normal", "error", "cancel", "skip", "remove", "replace"]
+)
+def test_fd_callback_acknowledges_only_current_lease(
+    writing: bool, outcome: str
+) -> None:
+    loop = ErlangEventLoop()
+    left, right = socket.socketpair()
+    calls: list[str] = []
+    add = loop.add_writer if writing else loop.add_reader
+    remove = loop.remove_writer if writing else loop.remove_reader
+    watchers = loop._writers if writing else loop._readers
+    fd = left.fileno()
+
+    def callback() -> None:
+        calls.append("ran")
+        if outcome == "error":
+            raise RuntimeError("callback failed")
+        if outcome == "remove":
+            remove(fd)
+        if outcome == "replace":
+            add(fd, calls.append, "replacement")
+
+    try:
+        add(fd, callback)
+        cid = watchers[fd][2]
+        key = loop._fd_resources[fd]
+        with patch.object(loop._pel, "_rearm_fd") as rearm:
+            loop._dispatch(cid, EVENT_TYPE_READ)
+            if outcome == "cancel":
+                loop._ready[0].cancel()
+            if outcome == "skip":
+                loop._fd_retirement_failed.add(key)
+            loop._run_once(0)
+            if outcome in ("remove", "replace"):
+                rearm.assert_not_called()
+            else:
+                rearm.assert_called_once_with(key, cid)
+        assert calls == ([] if outcome in ("cancel", "skip") else ["ran"])
+    finally:
+        loop._fd_retirement_failed.clear()
+        loop.close()
+        left.close()
+        right.close()
+
+
+@pytest.mark.parametrize("result", [b"data", b"", BlockingIOError(), OSError(5, "I/O")])
+def test_transport_reads_once_per_notification(result: bytes | OSError) -> None:
+    loop = ErlangEventLoop()
+    sock = Mock(spec=socket.socket)
+    sock.fileno.return_value = 42
+    protocol = Mock(spec=asyncio.Protocol)
+    protocol.eof_received.return_value = True
+    if isinstance(result, OSError):
+        sock.recv.side_effect = result
+    else:
+        sock.recv.return_value = result
+    transport = ErlangSocketTransport(loop, sock, protocol)
+    try:
+        transport._read_ready()
+        sock.recv.assert_called_once_with(transport.max_size)
+        if result == b"data":
+            protocol.data_received.assert_called_once_with(b"data")
+        elif result == b"":
+            protocol.eof_received.assert_called_once()
+    finally:
+        transport.close()
+        loop.close()
+
+
+@pytest.mark.parametrize("result", [1, 3, BlockingIOError(), OSError(5, "I/O")])
+def test_transport_writes_once_per_notification(result: int | OSError) -> None:
+    loop = ErlangEventLoop()
+    sock = Mock(spec=socket.socket)
+    sock.fileno.return_value = 42
+    if isinstance(result, OSError):
+        sock.send.side_effect = result
+    else:
+        sock.send.return_value = result
+    transport = ErlangSocketTransport(loop, sock, Mock(spec=asyncio.Protocol))
+    transport._buffer.extend(b"abc")
+    try:
+        transport._write_ready_cb()
+        sock.send.assert_called_once()
+        if result == 1:
+            assert transport._buffer_offset == 1
+        elif result == 3:
+            assert transport.get_write_buffer_size() == 0
+    finally:
+        transport.abort()
+        loop.close()
