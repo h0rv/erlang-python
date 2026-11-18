@@ -27,6 +27,7 @@
     test_concurrent_fd_and_timer/1,
     test_event_loop_wakeup/1,
     test_get_pending_clears_queue/1,
+    test_pending_event_identity/1,
     %% TCP tests
     test_tcp_listener_create/1,
     test_tcp_connect_accept/1,
@@ -53,6 +54,7 @@ all() ->
         test_concurrent_fd_and_timer,
         test_event_loop_wakeup,
         test_get_pending_clears_queue,
+        test_pending_event_identity,
         %% TCP tests
         test_tcp_listener_create,
         test_tcp_connect_accept,
@@ -386,6 +388,29 @@ test_get_pending_clears_queue(_Config) ->
 
     py_event_worker:stop(WorkerPid),
     py_nif:event_loop_destroy(LoopRef),
+    ok.
+
+test_pending_event_identity(_Config) ->
+    {ok, LoopRef} = py_nif:event_loop_new(),
+    Low = 7,
+    High = (1 bsl 63) bor Low,
+    try
+        [] = py_nif:get_pending(LoopRef),
+        lists:foreach(fun({First, Second}) ->
+            ok = py_nif:dispatch_timer(LoopRef, First),
+            ok = py_nif:dispatch_timer(LoopRef, Second),
+            ok = py_nif:dispatch_timer(LoopRef, First),
+            ok = py_nif:dispatch_timer(LoopRef, Second),
+            [{First, timer}, {Second, timer}] = py_nif:get_pending(LoopRef),
+            [] = py_nif:get_pending(LoopRef)
+        end, [{Low, High}, {High, Low}]),
+        ok = py_nif:dispatch_timer(LoopRef, Low),
+        ok = py_nif:dispatch_callback(LoopRef, Low, read),
+        ok = py_nif:dispatch_callback(LoopRef, Low, read),
+        [{Low, timer}, {Low, read}] = py_nif:get_pending(LoopRef)
+    after
+        py_nif:event_loop_destroy(LoopRef)
+    end,
     ok.
 
 test_concurrent_fd_and_timer(_Config) ->
