@@ -22,6 +22,24 @@ register_callbacks() ->
         safe_call(Group, {wait, Pid})
     end),
     py_callback:register('_task_cancel', fun([Group, Pid]) -> safe_call(Group, {cancel, Pid}) end),
+    py_callback:register('_task_snapshot', fun([Group, Pid]) ->
+        case safe_call(Group, {isolated_context, Pid}) of
+            {ok, Ctx} -> py_context:thread_snapshot(Ctx);
+            Error -> Error
+        end
+    end),
+    py_callback:register('_task_terminate', fun([Group, Pid]) ->
+        case safe_call(Group, {isolated_context, Pid}) of
+            {ok, Ctx} ->
+                %% The normal task exit protocol, not this RPC, acknowledges
+                %% OS child exit, ticket settlement and ownership release.
+                spawn(fun() -> py_context:kill(Ctx) end),
+                ok;
+            {error, task_finished} -> ok;
+            {error, unknown_task} -> ok;
+            Error -> Error
+        end
+    end),
     py_callback:register('_task_shutdown', fun([Group, Budget]) -> safe_call(Group, {shutdown, Budget}) end),
     py_callback:register('_task_info', fun([Group]) -> safe_call(Group, info) end),
     py_callback:register('_task_dispose', fun([Group]) ->
@@ -124,6 +142,14 @@ handle_call({cancel, Pid}, _, #{jobs := Jobs, control := Control} = State) ->
             {reply, ok, State#{jobs := Jobs#{Pid := request_cancel(Job, Control)}}};
         _ -> {reply, ok, State}
     end;
+handle_call({isolated_context, Pid}, _, #{jobs := Jobs} = State) ->
+    Reply = case maps:find(Pid, Jobs) of
+        {ok, #{ready := true}} -> {error, task_finished};
+        {ok, #{native := isolated, ctx := Ctx}} -> {ok, Ctx};
+        {ok, _} -> {error, not_isolated};
+        error -> {error, unknown_task}
+    end,
+    {reply, Reply, State};
 handle_call({shutdown, Budget}, From, #{gate := Gate, jobs := Jobs, control := Control,
                                       closing := none} = State)
         when is_integer(Budget), Budget > 0 ->

@@ -55,6 +55,13 @@ async def blocked(payload: bytes) -> bytes:
     return payload
 
 
+async def runaway(payload: bytes) -> bytes:
+    await erlang.async_call("isolated_task_entered", payload)
+    value = 0
+    while True:
+        value += 1
+
+
 async def result_then_crash(payload: bytes) -> bytes:
     await erlang.async_call("isolated_task_entered", payload)
     await asyncio.sleep(0.1)
