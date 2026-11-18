@@ -78,7 +78,7 @@
 ]).
 
 %% Internal exports
--export([kill/1, pass_fd/2, child_info/1, reap_dead/2]).
+-export([kill/1, pass_fd/2, child_info/1, thread_snapshot/1, reap_dead/2]).
 
 -export([init/3, init/4, init_ref_tab/0]).
 %% Used by py_context_embedded
@@ -561,6 +561,17 @@ child_info(Ctx) when is_pid(Ctx) ->
             await_ctrl_reply(Ctx, MRef, 5000);
         _ ->
             {error, not_isolated}
+    end.
+
+%% Diagnostic only: serviced by the child's reader thread, not its event loop.
+%% A native extension holding the GIL can still prevent a reply.
+thread_snapshot(Ctx) when is_pid(Ctx) ->
+    case lookup_nif_ref(Ctx) of
+        {ok, isolated} ->
+            MRef = erlang:monitor(process, Ctx),
+            Ctx ! {thread_snapshot, self(), MRef},
+            await_ctrl_reply(Ctx, MRef, 5000);
+        _ -> {error, not_isolated}
     end.
 
 %% @private Interrupt on behalf of a timed-out request. An isolated context

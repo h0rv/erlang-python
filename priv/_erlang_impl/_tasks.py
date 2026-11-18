@@ -316,6 +316,22 @@ async def shutdown(group: object, milliseconds: int) -> None:
         result(value)
 
 
+async def thread_snapshot(group: object, pid: object) -> tuple[int, int, bytes]:
+    value = result(await erlang.async_call("_task_snapshot", group, pid))
+    match value:
+        case (int(os_pid), int(cpu_ns), bytes(stacks)) if os_pid > 0 and cpu_ns >= 0:
+            return os_pid, cpu_ns, stacks
+        case _:
+            raise RuntimeError("Invalid isolated task snapshot", value)
+
+
+async def terminate(group: object, pid: object) -> None:
+    """Request killing the isolated child; outcome() acknowledges its exit."""
+    value = await erlang.async_call("_task_terminate", group, pid)
+    if value != "ok":
+        result(value)
+
+
 async def dispose(group: object) -> None:
     value = await erlang.async_call("_task_dispose", group)
     if value != "ok":

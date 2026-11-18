@@ -55,6 +55,7 @@ import socket
 import struct
 import sys
 import threading
+import time
 import traceback
 
 from . import _etf
@@ -404,6 +405,22 @@ class Runtime:
         tag = term[0] if isinstance(term, tuple) else term
         if tag == 'ping':
             self.reply(frame_id, STATUS_OK, Atom('pong'))
+        elif tag == 'thread_snapshot':
+            # No source lookup or local-value repr on this control thread.
+            frames = sys._current_frames()
+            lines = []
+            for ident, frame in list(frames.items())[:32]:
+                lines.append('Thread %s\n' % ident)
+                for _ in range(32):
+                    if frame is None:
+                        break
+                    code = frame.f_code
+                    lines.append('  File "%s", line %s, in %s\n' % (
+                        code.co_filename[:512], frame.f_lineno, code.co_name[:256]))
+                    frame = frame.f_back
+            stacks = ''.join(lines).encode('utf-8', errors='replace')[:65536]
+            self.reply(frame_id, STATUS_OK,
+                       (os.getpid(), time.process_time_ns(), (Atom('bytes'), stacks)))
         elif tag == 'submit':
             self._on_submit(frame_id, term)
         elif tag == 'stop_loop':

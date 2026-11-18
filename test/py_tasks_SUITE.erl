@@ -9,7 +9,8 @@
          owngil_missing_attribute/1, owngil_non_entry/1, worker_rejects_async/1,
          isolated_api/1, isolated_crash/1, isolated_prestart_cancel/1, isolated_running_cancel/1,
          isolated_shutdown/1, isolated_cancel_killed/1, isolated_result_wins/1,
-         isolated_unacknowledged_down/1, isolated_exit_timeout/1]).
+         isolated_unacknowledged_down/1, isolated_exit_timeout/1,
+         isolated_runaway_operations/1]).
 all() -> [killed_child, killed_context, killed_group, queued_ticket, killed_before_execution,
           retained_exception_lifecycle, owngil_api, owngil_parallel,
           owngil_completion_latency, slow_start, failed_start, shutdown_start, killed_starter,
@@ -19,7 +20,7 @@ all() -> [killed_child, killed_context, killed_group, queued_ticket, killed_befo
           owngil_missing_attribute, owngil_non_entry, worker_rejects_async,
           isolated_api, isolated_crash, isolated_prestart_cancel, isolated_running_cancel, isolated_shutdown,
           isolated_cancel_killed, isolated_result_wins, isolated_unacknowledged_down,
-          isolated_exit_timeout].
+          isolated_exit_timeout, isolated_runaway_operations].
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(erlang_python),
     ok = py_import:add_path(filename:dirname(code:which(?MODULE))),
@@ -539,6 +540,30 @@ isolated_cancel_killed(_) ->
         #{count := 0, unsettled := 0, closed := false} = py_nif:actor_gate_info(Gate),
         {ok, Next} = isolated_start(Source, Group, Gate, <<"echo">>, <<"after kill">>),
         {ok, {bytes, <<"after kill">>}} = gen_server:call(Group, {wait, Next}, 10000)
+    end) end).
+
+isolated_runaway_operations(_) ->
+    isolated_callbacks(fun() -> with_named_group(1, fun(Source, Group, Gate) ->
+        {ok, Pid} = isolated_start(Source, Group, Gate, <<"runaway">>, <<"busy">>),
+        receive {entered, <<"busy">>} -> ok after 5000 -> error(not_running) end,
+        {ok, Ctx} = gen_server:call(Group, {isolated_context, Pid}),
+        %% The callback arrives before the child resumes after its await.
+        receive after 100 -> ok end,
+        {ok, {OsPid, Cpu1, {bytes, Stack}}} = py_context:thread_snapshot(Ctx),
+        true = OsPid > 0,
+        true = binary:match(Stack, <<"runaway">>) =/= nomatch,
+        ok = gen_server:call(Group, {cancel, Pid}),
+        receive after 50 -> ok end,
+        {ok, {OsPid, Cpu2, {bytes, _}}} = py_context:thread_snapshot(Ctx),
+        true = Cpu2 > Cpu1,
+        {ok, ok} = py_callback:execute('_task_terminate', [Group, Pid]),
+        {task_crashed, {signal, 9}} = gen_server:call(Group, {wait, Pid}, 10000),
+        false = is_process_alive(Ctx),
+        #{count := 0, unsettled := 0, closed := false} = py_nif:actor_gate_info(Gate),
+        {ok, Next} = isolated_start(Source, Group, Gate, <<"echo">>, <<"still serving">>),
+        {ok, {bytes, <<"still serving">>}} = gen_server:call(Group, {wait, Next}, 10000),
+        %% A concurrent waiter may already have removed the finished job.
+        {ok, ok} = py_callback:execute('_task_terminate', [Group, Next])
     end) end).
 
 isolated_result_wins(_) ->

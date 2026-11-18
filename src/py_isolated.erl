@@ -233,6 +233,8 @@ handle_event(info, {submit, From, MRef, TaskRef, Module, Func, Args, Kwargs}, St
             State, Data);
 handle_event(info, {pass_fd, From, MRef, Fd}, State, Data) ->
     pass_fd(From, MRef, Fd, State, Data);
+handle_event(info, {thread_snapshot, From, MRef}, State, Data) ->
+    request(From, MRef, thread_snapshot, thread_snapshot, State, Data);
 handle_event(info, {local_object, From, MRef, _Request, _Env}, _State, _Data) ->
     From ! {MRef, {error, local_objects_require_worker}},
     keep_state_and_data;
