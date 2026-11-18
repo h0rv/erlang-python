@@ -936,30 +936,9 @@ ERL_NIF_TERM nif_get_fd_callback_id(ErlNifEnv *env, int argc,
                                      const ERL_NIF_TERM argv[]);
 
 /**
- * @brief Re-register an fd for read monitoring
+ * @brief Queue a select event for Python consumption
  *
- * Called after an event is delivered since enif_select is one-shot.
- *
- * NIF: reselect_reader(LoopRef, FdRes) -> ok | {error, Reason}
- */
-ERL_NIF_TERM nif_reselect_reader(ErlNifEnv *env, int argc,
-                                  const ERL_NIF_TERM argv[]);
-
-/**
- * @brief Re-register an fd for write monitoring
- *
- * Called after an event is delivered since enif_select is one-shot.
- *
- * NIF: reselect_writer(LoopRef, FdRes) -> ok | {error, Reason}
- */
-ERL_NIF_TERM nif_reselect_writer(ErlNifEnv *env, int argc,
-                                  const ERL_NIF_TERM argv[]);
-
-/**
- * @brief Handle a select event (dispatch + auto-reselect)
- *
- * Combined function that gets callback ID, dispatches to pending queue,
- * and auto-reselects for persistent watcher behavior.
+ * The direction remains unarmed until Python acknowledges its callback.
  *
  * NIF: handle_fd_event(FdRef, Type) -> ok | {error, Reason}
  */
@@ -967,19 +946,9 @@ ERL_NIF_TERM nif_handle_fd_event(ErlNifEnv *env, int argc,
                                   const ERL_NIF_TERM argv[]);
 
 /**
- * @brief Handle FD event and immediately reselect for next event
- *
- * Combined operation that eliminates one roundtrip.
- *
- * NIF: handle_fd_event_and_reselect(FdRef, Type) -> ok | {error, Reason}
- */
-ERL_NIF_TERM nif_handle_fd_event_and_reselect(ErlNifEnv *env, int argc,
-                                               const ERL_NIF_TERM argv[]);
-
-/**
  * @brief Re-arm a read/write select from a scheduler thread
  *
- * NIF: fd_arm(FdRef, read | write) -> ok | {error, Reason}
+ * NIF: fd_arm(FdRef, read | write, CallbackId) -> ok | {error, Reason}
  */
 ERL_NIF_TERM nif_fd_arm(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
 

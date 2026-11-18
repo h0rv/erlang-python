@@ -3,12 +3,14 @@
          paused_reader/1, delivered_reader/1, paused_writer/1, delivered_writer/1,
          never_selected/1, owner_down/1, reactor_close/1, reactor_owner_down/1,
          close_reselect_race/1, borrowed_poll_lease/1,
-         socket_recv_completion/1, socket_connect_completion/1]).
+         socket_recv_completion/1, socket_connect_completion/1,
+         callback_rearm/1, callback_rearm_capacity/1, socket_callback_rearm/1]).
 
 all() -> [paused_reader, delivered_reader, paused_writer, delivered_writer,
           never_selected, owner_down, reactor_close, reactor_owner_down,
           close_reselect_race, borrowed_poll_lease,
-          socket_recv_completion, socket_connect_completion].
+          socket_recv_completion, socket_connect_completion,
+          callback_rearm, callback_rearm_capacity, socket_callback_rearm].
 init_per_suite(Config) ->
     application:load(erlang_python),
     application:set_env(erlang_python, num_contexts, 1),
@@ -74,11 +76,17 @@ borrowed_poll_lease(_) -> python_lease_case(borrowed).
 socket_recv_completion(_) -> python_lease_case(recv_completion).
 socket_connect_completion(_) -> python_lease_case(connect_completion).
 python_lease_case(Function) ->
-    {ok, C} = py_context:new(#{mode => worker}),
+    python_lease_case(Function, #{}).
+python_lease_case(Function, Options) ->
+    {ok, C} = py_context:new(maps:merge(#{mode => worker}, Options)),
     Dir = filename:dirname(code:which(?MODULE)),
     try
         ok = py_context:exec(C, iolist_to_binary(io_lib:format(
             "import sys; sys.path.insert(0, ~p)", [Dir]))),
+        case maps:is_key(managed_loop, Options) of
+            true -> ok = py_context:start_loop(C);
+            false -> ok
+        end,
         {ok, true} = py_context:submit_await(C, py_test_fd_poll_lease,
                                            Function, [], #{}, 5000)
     after py_context:stop(C) end.
@@ -161,3 +169,56 @@ close_reselect_race(_) ->
         retired(R), replacement(Fd, R, L),
         ok = py_nif:fd_close(Peer), ok = py_nif:event_loop_destroy(L)
     end, lists:seq(1, 8)).
+
+
+callback_rearm(_) ->
+    lists:foreach(fun(Type) ->
+        L = loop(), {ok, {Fd, Peer}} = py_nif:socketpair(),
+        {ok, R} = case Type of
+            read -> py_nif:add_reader(L, Fd, 100);
+            write -> py_nif:add_writer(L, Fd, 100)
+        end,
+        case Type of read -> {ok, 2} = py_nif:fd_write(Peer, <<"ab">>); write -> ok end,
+        receive {select, R, _, _} -> ok after 1000 -> error(no_initial_event) end,
+        ok = py_nif:handle_fd_event(R, Type),
+        [{100, Type}] = py_nif:get_pending(L),
+        receive {select, R, _, _} -> error(premature_rearm) after 20 -> ok end,
+        ok = py_nif:fd_arm(R, Type, 99),
+        receive {select, R, _, _} -> error(stale_generation_rearmed) after 20 -> ok end,
+        ok = py_nif:fd_arm(R, Type, 100),
+        receive {select, R, _, _} -> ok after 1000 -> error(no_rearm_event) end,
+        ok = case Type of read -> py_nif:stop_reader(R); write -> py_nif:stop_writer(R) end,
+        ok = py_nif:fd_arm(R, Type, 100),
+        receive {select, R, _, _} -> error(removed_watcher_rearmed) after 20 -> ok end,
+        ok = py_nif:close_fd(R), retired(R),
+        ok = py_nif:fd_arm(R, Type, 100),
+        ok = py_nif:fd_close(Peer), ok = py_nif:event_loop_destroy(L)
+    end, [read, write]).
+
+socket_callback_rearm(_) ->
+    python_lease_case(callback_rearm),
+    lists:foreach(fun(Kind) ->
+        python_lease_case(callback_rearm, #{managed_loop => Kind})
+    end, [shared, dedicated]),
+    Dir = filename:dirname(code:which(?MODULE)),
+    ok = py_event_loop_pool:exec(iolist_to_binary(io_lib:format(
+        "import sys; sys.path.insert(0, ~p)", [Dir]))),
+    Ref = py_event_loop_pool:create_task(py_test_fd_poll_lease, callback_rearm, []),
+    {ok, true} = py_event_loop_pool:await(Ref, 5000),
+    ok.
+
+callback_rearm_capacity(_) ->
+    L = loop(), {ok, {Fd, Peer}} = py_nif:socketpair(),
+    {ok, R} = py_nif:add_reader(L, Fd, 1000000),
+    lists:foreach(fun(N) ->
+        ok = py_nif:dispatch_callback(L, N, read)
+    end, lists:seq(1, 16384)),
+    {ok, 1} = py_nif:fd_write(Peer, <<"a">>),
+    receive {select, R, _, ready_input} -> ok after 1000 -> error(no_initial_event) end,
+    ok = py_nif:handle_fd_event(R, read),
+    16384 = length(py_nif:get_pending(L)),
+    receive {select, R, _, ready_input} -> ok after 1000 -> error(lost_full_queue_event) end,
+    ok = py_nif:handle_fd_event(R, read),
+    [{1000000, read}] = py_nif:get_pending(L),
+    ok = py_nif:close_fd(R), retired(R),
+    ok = py_nif:fd_close(Peer), ok = py_nif:event_loop_destroy(L).

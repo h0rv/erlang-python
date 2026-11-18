@@ -55,13 +55,13 @@ handle_call(_Request, _From, State) ->
 handle_cast(_Msg, State) -> {noreply, State}.
 
 handle_info({select, FdRes, _Ref, ready_input}, State) ->
-    py_nif:handle_fd_event_and_reselect(FdRes, read),
+    py_nif:handle_fd_event(FdRes, read),
     %% Trigger event processing after FD event dispatch
     maybe_send_task_ready(),
     {noreply, State};
 
 handle_info({select, FdRes, _Ref, ready_output}, State) ->
-    py_nif:handle_fd_event_and_reselect(FdRes, write),
+    py_nif:handle_fd_event(FdRes, write),
     %% Trigger event processing after FD event dispatch
     maybe_send_task_ready(),
     {noreply, State};
@@ -107,9 +107,9 @@ handle_info({timeout, TimerRef}, State) ->
 
 handle_info({select, _FdRes, _Ref, cancelled}, State) -> {noreply, State};
 
-%% Re-arm request from the Python loop (see py_nif:fd_arm/2)
-handle_info({fd_arm, FdRes, Mode}, State) ->
-    _ = py_nif:fd_arm(FdRes, Mode),
+%% Re-arm request from the Python loop (see py_nif:fd_arm/3)
+handle_info({fd_arm, FdRes, Mode, CallbackId}, State) ->
+    ok = py_nif:fd_arm(FdRes, Mode, CallbackId),
     {noreply, State};
 
 %% Handle task_ready wakeup from submit_task NIF.
