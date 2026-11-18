@@ -102,6 +102,58 @@ class TimerHeapTests(unittest.TestCase):
             self.assertEqual(self.loop._timer_ref, 42)
             self.assertFalse(self.loop._ready)
 
+    def test_long_idle_timer_wakeup_is_bounded(self):
+        with patch.object(self.mock, '_schedule_timer_for', return_value=42) as schedule:
+            self.loop.call_later(30 * 86400, self.fail)
+            self.assertLessEqual(schedule.call_args.args[1], 86400 * 1000)
+
+    def test_huge_deadline_native_wait_is_bounded(self):
+        with (
+            patch.object(self.loop, '_running', True),
+            patch.object(self.mock, '_run_once_native_for', return_value=[]) as poll,
+        ):
+            self.loop._run_once(30 * 86400 * 1000)
+            self.assertLessEqual(poll.call_args.args[1], 86400 * 1000)
+            for delay in (30 * 86400, 1e308):
+                with self.subTest(delay=delay):
+                    handle = self.loop.call_later(delay, self.fail)
+                    try:
+                        self.loop._run_once()
+                        self.assertEqual(poll.call_args.args[1], 1000)
+                        self.loop._run_once(30 * 86400 * 1000)
+                        self.assertLessEqual(poll.call_args.args[1], 86400 * 1000)
+                    finally:
+                        handle.cancel()
+                        self.loop._prepare_timers()
+
+    def test_huge_idle_timer_wakeup_is_bounded(self):
+        with patch.object(self.mock, '_schedule_timer_for', return_value=42) as schedule:
+            self.loop.call_later(1e308, self.fail)
+            self.assertEqual(schedule.call_args.args[1], 86400 * 1000)
+
+    def test_early_long_timer_wakeup_rearms_until_due(self):
+        fired = []
+        with (
+            patch.object(loop_impl.time, 'monotonic', return_value=1000) as clock,
+            patch.object(self.mock, '_schedule_timer_for', side_effect=[41, 42, 43]) as schedule,
+            patch.object(self.mock, '_run_once_native_for') as poll,
+        ):
+            handle = self.loop.call_later(30 * 86400, fired.append, 'due')
+            for days, remaining in ((1, 86400), (29.5, 43200)):
+                clock.return_value = 1000 + days * 86400
+                poll.return_value = [(self.loop._timer_callback_id, 3)]
+                self.loop._run_once(0)
+                self.assertEqual(fired, [])
+                self.assertIn(handle, self.loop._scheduled)
+                self.assertEqual(schedule.call_args.args[1], remaining * 1000)
+            clock.return_value = handle.when()
+            poll.return_value = [(self.loop._timer_callback_id, 3)]
+            self.loop._run_once(0)
+            poll.return_value = []
+            self.loop._run_once(0)
+            self.assertEqual(fired, ['due'])
+            self.assertEqual(schedule.call_count, 3)
+
     def test_shared_driver_keeps_one_wakeup_during_churn(self):
         with (
             patch.object(self.mock, '_schedule_timer_for', return_value=42) as schedule,

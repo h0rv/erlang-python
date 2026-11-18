@@ -62,6 +62,8 @@ EVENT_TYPE_READ = 1
 EVENT_TYPE_WRITE = 2
 EVENT_TYPE_TIMER = 3
 
+_MAX_TIMER_DELAY = 24 * 60 * 60
+
 
 class _PooledHandle(events.Handle):
     """Handle recycled through ErlangEventLoop._handle_pool.
@@ -1330,8 +1332,10 @@ class ErlangEventLoop(asyncio.AbstractEventLoop):
             timeout = 1000
 
         if self._scheduled:
-            delay = max(0, math.ceil((self._scheduled[0]._when - time.monotonic()) * 1000))
+            delay = max(0, math.ceil(min(
+                self._scheduled[0]._when - time.monotonic(), _MAX_TIMER_DELAY) * 1000))
             timeout = min(timeout, delay)
+        timeout = min(timeout, _MAX_TIMER_DELAY * 1000)
         # Poll for events
         try:
             pending = self._pel._run_once_native_for(self._loop_capsule, timeout)
@@ -1381,7 +1385,8 @@ class ErlangEventLoop(asyncio.AbstractEventLoop):
             self._timer_ref = None
             self._timer_deadline = None
         self._timer_callback_id = self._next_id()
-        delay = max(1, math.ceil((deadline - time.monotonic()) * 1000))
+        delay = max(1, math.ceil(min(
+            deadline - time.monotonic(), _MAX_TIMER_DELAY) * 1000))
         self._timer_ref = self._pel._schedule_timer_for(
             self._loop_capsule, delay, self._timer_callback_id)
         self._timer_deadline = deadline
