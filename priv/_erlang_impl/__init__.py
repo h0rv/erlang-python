@@ -68,7 +68,7 @@ from . import _byte_channel as byte_channel
 from . import _server as server
 from _erlang_impl import _supervision as supervision
 from . import _actors as actors
-from _erlang_impl import _tasks as tasks
+from . import _tasks as tasks
 from ._channel import Channel, reply, ChannelClosed
 from ._byte_channel import ByteChannel, ByteChannelClosed
 
@@ -95,6 +95,7 @@ __all__ = [
     'server',
     'supervision',
     'actors',
+    'tasks',
     'atom',
 ]
 
@@ -172,6 +173,18 @@ def new_event_loop() -> ErlangEventLoop:
     return ErlangEventLoop()
 
 
+def _get_or_create_driver(capsule: object | None = None) -> ErlangEventLoop:
+    # An Erlang scheduler thread may have created the driver. The native
+    # resource, not the current thread's asyncio policy, holds the owner.
+    loop = py_event_loop._get_loop_ref(capsule)
+    if loop is None:
+        native = py_event_loop._get_global_loop_capsule() if capsule is None else capsule
+        loop = ErlangEventLoop(native)
+    if not isinstance(loop, ErlangEventLoop) or loop.is_closed():
+        raise RuntimeError("Native resource has no usable ErlangEventLoop owner")
+    return loop
+
+
 def _run_loop_forever(notify_pid: object | None = None, capsule: object | None = None) -> str:
     """Run an ErlangEventLoop on this thread until it is stopped.
 
@@ -181,16 +194,7 @@ def _run_loop_forever(notify_pid: object | None = None, capsule: object | None =
     running. Returns 'stopped' when _stop_loop() ran, propagates
     KeyboardInterrupt when py_context:interrupt/1 was used.
     """
-    import py_event_loop
-
-    # submit_await may already have created the shared resource's driver on
-    # an Erlang scheduler thread. Thread-local asyncio policy state is not its
-    # identity. Resume that exact owner; never release a stopped wrapper here.
-    loop = py_event_loop._get_loop_ref(capsule)
-    if loop is None:
-        loop = ErlangEventLoop(capsule)
-    if not isinstance(loop, ErlangEventLoop) or loop.is_closed():
-        raise RuntimeError("Native resource has no usable ErlangEventLoop owner")
+    loop = _get_or_create_driver(capsule)
     # Claim before publishing a startup callback or changing thread policy.
     # A stopped wrapper is reusable, but its driver session is exclusive.
     with loop._driver_session():

@@ -3428,6 +3428,7 @@ ERL_NIF_TERM nif_process_ready_tasks(ErlNifEnv *env, int argc,
     int task_idx = 0;
     ERL_NIF_TERM result = ATOM_OK;
     bool python_more = false;
+    bool wake_driver = false;
 
     /* Lazy loop creation (uvloop-style): create Python loop on first use */
     pthread_mutex_lock(&loop->mutex);
@@ -3472,22 +3473,9 @@ ERL_NIF_TERM nif_process_ready_tasks(ErlNifEnv *env, int argc,
             return make_error(env, "loop_class_not_found");
         }
 
-        /* The interpreter's default loop keeps the global capsule path in
-         * ErlangEventLoop.__init__. Any other loop (the event loop pool)
-         * gets a capsule over its own resource, so its timers, fd events
-         * and pending queue stay on this loop instead of the global one. */
-        PyObject *new_loop;
-        if (loop == get_interpreter_event_loop()) {
-            new_loop = PyObject_CallNoArgs(loop_class);
-        } else {
-            PyObject *capsule = make_loop_capsule(loop);
-            if (capsule == NULL) {
-                new_loop = NULL;
-            } else {
-                new_loop = PyObject_CallOneArg(loop_class, capsule);
-                Py_DECREF(capsule);
-            }
-        }
+        PyObject *capsule = make_loop_capsule(loop);
+        PyObject *new_loop = capsule == NULL ? NULL : PyObject_CallOneArg(loop_class, capsule);
+        Py_XDECREF(capsule);
         Py_DECREF(loop_class);
         if (new_loop == NULL) {
             PyErr_Clear();
@@ -3835,22 +3823,8 @@ ERL_NIF_TERM nif_process_ready_tasks(ErlNifEnv *env, int argc,
              * start now instead of at the next poll timeout. Same broadcast
              * as _wakeup_for (call_soon_threadsafe).
              * Note: events_module is cached, so we don't DECREF it. */
-            Py_XDECREF(old_running_loop);
-            Py_DECREF(py_loop);
-            loop_gil_release(loop, &gil);
-            if (!loop->shutdown) {
-                pthread_mutex_lock(&loop->mutex);
-                pthread_cond_broadcast(&loop->event_cond);
-                pthread_mutex_unlock(&loop->mutex);
-            }
-            /* Same contract as the tail of this function: tasks beyond the
-             * batch limit are still queued, tell the worker to come back
-             * (submit_task will not send another wakeup while one is
-             * pending, so returning ok here would strand them). */
-            if (atomic_load(&loop->task_count) > 0) {
-                return ATOM_MORE;
-            }
-            return ATOM_OK;
+            wake_driver = true;
+            goto processing_done;
         }
     } else {
         PyErr_Clear();
@@ -3934,6 +3908,14 @@ processing_done:
     Py_XDECREF(py_loop);
 
     loop_gil_release(loop, &gil);
+
+    if (wake_driver) {
+        pthread_mutex_lock(&loop->mutex);
+        if (!loop->shutdown) {
+            pthread_cond_broadcast(&loop->event_cond);
+        }
+        pthread_mutex_unlock(&loop->mutex);
+    }
 
     /*
      * Continue native task batches and Python callbacks left by the iteration
@@ -7958,11 +7940,9 @@ static PyObject *py_get_loop_ref(PyObject *self, PyObject *args) {
 
 /* Python function: _get_global_loop_capsule() -> capsule
  *
- * Returns a capsule for the global interpreter event loop.
- * This is the loop created by Erlang that has has_worker=true.
- * Python's ErlangEventLoop should use this capsule instead of creating
- * a new one, so that timers and FD events are properly dispatched to
- * the worker which triggers process_ready_tasks.
+ * Returns a capsule for the interpreter loop driven by Erlang.
+ * Use it when a Python driver needs to resume that same resource,
+ * rather than creating an independent Python-owned loop.
  */
 static PyObject *py_get_global_loop_capsule(PyObject *self, PyObject *args) {
     (void)self;

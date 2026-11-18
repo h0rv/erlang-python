@@ -101,16 +101,18 @@ async_call_round_trip(_Config) ->
     {ok, 4.0} = py:async_await(Ref, 5000),
     ok.
 
-erlang_run_uses_erlang_loop(_Config) ->
+erlang_run_uses_erlang_loop(Config) ->
     %% Confirm erlang.run picks up ErlangEventLoop on every supported
     %% version, regardless of the global policy state.
     ok = py:exec(<<
         "import erlang, asyncio\n"
         "async def _probe():\n"
+        "    await asyncio.sleep(0.001)\n"
         "    return type(asyncio.get_running_loop()).__name__\n"
         "_loop_class = erlang.run(_probe())\n"
     >>),
     {ok, <<"ErlangEventLoop">>} = py:eval(<<"_loop_class">>),
+    async_call_round_trip(Config),
     ok.
 
 install_raises_on_3_14_plus(_Config) ->

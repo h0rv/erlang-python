@@ -17,6 +17,37 @@ class Probe:
 
 
 _probe: Probe | None = None
+_running_loop_tracking = ExitStack()
+_loop_restored = threading.Event()
+
+
+def track_running_loop(capsule: object) -> bool:
+    owner = py_event_loop._get_loop_ref(capsule)
+    assert owner is not None and owner.is_running()
+    old_loops: dict[int, asyncio.AbstractEventLoop | None] = {}
+    set_running_loop = asyncio.events._set_running_loop
+    _loop_restored.clear()
+
+    def record(loop: asyncio.AbstractEventLoop | None) -> None:
+        thread = threading.get_ident()
+        if loop is owner and thread not in old_loops:
+            old_loops[thread] = asyncio.events._get_running_loop()
+        elif thread in old_loops and loop is old_loops.pop(thread):
+            _loop_restored.set()
+        set_running_loop(loop)
+
+    _running_loop_tracking.enter_context(
+        patch.object(asyncio.events, "_set_running_loop", record)
+    )
+    return True
+
+
+def running_loop_restored() -> bool:
+    return _loop_restored.is_set()
+
+
+def stop_tracking_running_loop() -> None:
+    _running_loop_tracking.close()
 
 
 def install() -> bool:
