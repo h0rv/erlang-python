@@ -348,6 +348,12 @@ class Tracked:
     after py_context:exec(Ctx, <<"del builtins._tracked_actor">>, Env) end.
 
 interpreter_validation(Config) ->
+    case py_nif:owngil_supported() of
+        true -> validate_foreign_interpreter(Config);
+        false -> {skip, "own-GIL contexts require Python 3.14+"}
+    end.
+
+validate_foreign_interpreter(Config) ->
     Ctx = context(Config),
     {ok, Other} = py_context:new(#{mode => owngil}),
     try
