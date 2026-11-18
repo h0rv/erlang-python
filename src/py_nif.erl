@@ -622,10 +622,11 @@ event_loop_run_async(_LoopRef, _CallerPid, _Ref, _Module, _Func, _Args, _Kwargs)
 %% It serializes the task info, enqueues to the task queue, and sends
 %% a 'task_ready' wakeup to the worker via enif_send.
 %%
-%% The result will be sent to CallerPid as:
-%%   {async_result, Ref, {ok, Result}} - on success
-%%   {async_result, Ref, {error, Reason}} - on failure
--spec submit_task(reference(), pid(), reference(), binary(), binary(), list(), map()) ->
+%% With a reference, CallerPid receives `{async_result, Ref, {ok, Result}}'
+%% on success or `{async_result, Ref, {error, Reason}}' on failure.
+%% Pass `undefined' when the task delivers its own response: no success
+%% message is sent, and failures use `undefined' in the reference slot.
+-spec submit_task(reference(), pid(), reference() | undefined, binary(), binary(), list(), map()) ->
     ok | {error, term()}.
 submit_task(_LoopRef, _CallerPid, _Ref, _Module, _Func, _Args, _Kwargs) ->
     ?NIF_STUB.

@@ -7,6 +7,7 @@
 -export([
     %% Basic tests
     test_submit_task/1,
+    test_submit_task_with_errors_only/1,
     test_create_task_await/1,
     test_run_sync/1,
     test_spawn_task/1,
@@ -51,6 +52,7 @@ all() ->
     [
         %% Basic tests
         test_submit_task,
+        test_submit_task_with_errors_only,
         test_create_task_await,
         test_run_sync,
         test_spawn_task,
@@ -107,6 +109,47 @@ test_submit_task(_Config) ->
     Result = py_event_loop:await(Ref, 1000),
     ct:log("submit_task result: ~p", [Result]),
     {ok, 5.0} = Result.
+
+test_submit_task_with_errors_only(_Config) ->
+    ok = py_event_loop:exec(<<"
+import asyncio
+
+async def echo(value):
+    return value
+
+async def fail():
+    raise ValueError('reported failure')
+
+async def cancel():
+    asyncio.current_task().cancel()
+    await asyncio.sleep(0)
+">>),
+    {ok, Loop} = py_event_loop:get_loop(),
+    Me = self(),
+    Module = <<"__main__">>,
+    ok = py_nif:submit_task(Loop, Me, undefined, <<"math">>, <<"sqrt">>, [4.0], #{}),
+    ok = py_nif:submit_task(Loop, Me, undefined, Module, <<"echo">>, [1], #{}),
+    ok = py_nif:submit_task(Loop, Me, undefined, Module, <<"fail">>, [], #{}),
+    receive
+        {async_result, undefined, {error, <<"ValueError: reported failure", _/binary>>}} -> ok;
+        {async_result, undefined, Unexpected} -> ct:fail({unexpected_result, Unexpected})
+    after 5000 ->
+        ct:fail(missing_error)
+    end,
+    ok = py_nif:submit_task(Loop, Me, undefined, Module, <<"cancel">>, [], #{}),
+    receive
+        {async_result, undefined, {error, <<"cancelled">>}} -> ok;
+        {async_result, undefined, Unexpected2} -> ct:fail({unexpected_result, Unexpected2})
+    after 5000 ->
+        ct:fail(missing_cancellation)
+    end,
+    ok = py_nif:submit_task(Loop, Me, undefined, Module, <<"not_defined">>, [], #{}),
+    receive
+        {async_result, undefined, {error, function_not_found}} -> ok;
+        {async_result, undefined, Unexpected3} -> ct:fail({unexpected_result, Unexpected3})
+    after 5000 ->
+        ct:fail(missing_lookup_error)
+    end.
 
 test_create_task_await(_Config) ->
     %% Test high-level create_task/await API with stdlib function

@@ -1678,7 +1678,7 @@ class _MockNifModule:
 # Async coroutine wrapper for result delivery
 # =============================================================================
 
-async def _run_and_send(coro, caller_pid, ref):
+async def _run_and_send(coro, caller_pid, ref, reply_on_success=True):
     """Run a coroutine and send the result to an Erlang caller via erlang.send().
 
     This function wraps a coroutine and sends its result (or error) to the
@@ -1689,6 +1689,7 @@ async def _run_and_send(coro, caller_pid, ref):
         coro: The coroutine to run
         caller_pid: An erlang.Pid object for the caller process
         ref: A reference to include in the result message
+        reply_on_success: When false, report failures with an undefined reference
 
     The result message format is:
         (async_result, ref, (ok, result)) - on success
@@ -1708,18 +1709,17 @@ async def _run_and_send(coro, caller_pid, ref):
 
     # Create atoms for message keys (strings become binaries, await expects atoms)
     async_result = atom('async_result')
-    ok = atom('ok')
-    error = atom('error')
-
     try:
         result = await coro
-        try:
-            erlang.send(caller_pid, (async_result, ref, (ok, result)))
-        except erlang.ProcessError:
-            pass  # Caller gone, nothing to do
+        if reply_on_success:
+            try:
+                erlang.send(caller_pid, (async_result, ref, (atom('ok'), result)))
+            except erlang.ProcessError:
+                pass  # Caller gone, nothing to do
     except asyncio.CancelledError:
         try:
-            erlang.send(caller_pid, (async_result, ref, (error, 'cancelled')))
+            reply_ref = ref if reply_on_success else atom('undefined')
+            erlang.send(caller_pid, (async_result, reply_ref, (atom('error'), 'cancelled')))
         except erlang.ProcessError:
             pass  # Caller gone, nothing to do
     except Exception as e:
@@ -1729,6 +1729,8 @@ async def _run_and_send(coro, caller_pid, ref):
         import traceback
         tb = traceback.format_exc()
         try:
-            erlang.send(caller_pid, (async_result, ref, (error, f'{type(e).__name__}: {e}\n{tb}')))
+            reply_ref = ref if reply_on_success else atom('undefined')
+            erlang.send(caller_pid, (async_result, reply_ref,
+                                     (atom('error'), f'{type(e).__name__}: {e}\n{tb}')))
         except erlang.ProcessError:
             pass  # Caller gone, nothing to do

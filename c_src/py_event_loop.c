@@ -3697,15 +3697,20 @@ ERL_NIF_TERM nif_process_ready_tasks(ErlNifEnv *env, int argc,
             continue;
         }
 
+        bool errors_only = enif_is_identical(tuple_elems[1], ATOM_UNDEFINED);
         if (is_coro) {
             /* Allocate the completion owner BEFORE Python can start the task.
              * Ownership leaves work_batch only when a callback owns it. */
             bool admitted = work_batch.tickets[task_idx] != NULL;
             PyObject *completion = admitted
                 ? work_completion_new(&work_batch.tickets[task_idx], coro) : NULL;
-            PyObject *wrapped_coro = (!admitted || completion != NULL)
-                ? PyObject_CallFunction(run_and_send, "OOO", coro, (PyObject *)pid_obj, py_ref)
-                : NULL;
+            PyObject *wrapped_coro = NULL;
+            if (!admitted || completion != NULL) {
+                wrapped_coro = errors_only
+                    ? PyObject_CallFunctionObjArgs(run_and_send, coro, (PyObject *)pid_obj,
+                                                   py_ref, Py_False, NULL)
+                    : PyObject_CallFunction(run_and_send, "OOO", coro, (PyObject *)pid_obj, py_ref);
+            }
 
             if (wrapped_coro != NULL) {
                 bool construction_attempted = false;
@@ -3724,7 +3729,7 @@ ERL_NIF_TERM nif_process_ready_tasks(ErlNifEnv *env, int argc,
                 } else {
                     bool retired = processing_loop_stopped(loop, py_loop, owner_generation);
                     if (retired) PyErr_Clear();
-                    if (admitted || retired)
+                    if (admitted || retired || errors_only)
                         send_task_failure(term_env, &caller_pid, tuple_elems[1],
                                           retired ? "loop_stopped" : "task_creation_failed");
                     if (!construction_attempted) {
@@ -3738,7 +3743,7 @@ ERL_NIF_TERM nif_process_ready_tasks(ErlNifEnv *env, int argc,
                 Py_XDECREF(task);
                 Py_DECREF(wrapped_coro);
             } else {
-                if (admitted)
+                if (admitted || errors_only)
                     send_task_failure(term_env, &caller_pid, tuple_elems[1], "task_wrapper_failed");
                 if (completion != NULL) work_completion_not_started(completion);
                 PyObject *closed = PyObject_CallMethod(coro, "close", NULL);
@@ -3751,7 +3756,7 @@ ERL_NIF_TERM nif_process_ready_tasks(ErlNifEnv *env, int argc,
             /* Not a coroutine - send result immediately via enif_send */
             /* Use enif_send directly so we can use proper Erlang atoms */
             /* Use the original Erlang ref term (tuple_elems[1]), not the Python conversion */
-            ErlNifEnv *send_env = enif_alloc_env();
+            ErlNifEnv *send_env = errors_only ? NULL : enif_alloc_env();
             if (send_env != NULL) {
                 /* Convert Python result to Erlang term */
                 ERL_NIF_TERM result_term = py_to_term(send_env, coro);
