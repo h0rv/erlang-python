@@ -1038,7 +1038,25 @@ static PyObject *get_function_for_task(
  * Initialization
  * ============================================================================ */
 
+static pthread_key_t loop_thread_state_key;
+static pthread_once_t loop_thread_state_once = PTHREAD_ONCE_INIT;
+static int loop_thread_state_key_error;
+
+static void release_loop_thread_state(void *state) {
+    if (runtime_is_running()) {
+        PyEval_RestoreThread((PyThreadState *)state);
+        PyGILState_Release(PyGILState_UNLOCKED);
+    }
+}
+
+static void init_loop_thread_state_key(void) {
+    loop_thread_state_key_error = pthread_key_create(
+        &loop_thread_state_key, release_loop_thread_state);
+}
+
 int event_loop_init(ErlNifEnv *env) {
+    pthread_once(&loop_thread_state_once, init_loop_thread_state_key);
+    if (loop_thread_state_key_error != 0) return -1;
     if (work_admission_init(env) != 0) return -1;
 
     /* Create event loop resource type with down callback for process monitors */
@@ -3031,7 +3049,18 @@ static bool loop_gil_acquire(erlang_event_loop_t *loop, loop_gil_t *g) {
         return true;
     }
 #endif
+    bool new_thread_state = PyGILState_GetThisThreadState() == NULL;
     g->gstate = PyGILState_Ensure();
+    if (new_thread_state) {
+        /* Retain the thread state between batches: greenlet stores pointers
+         * into it in OS-thread-local storage, even after a switch completes. */
+        PyGILState_Ensure();
+        if (pthread_setspecific(loop_thread_state_key, PyThreadState_Get()) != 0) {
+            PyGILState_Release(PyGILState_LOCKED);
+            PyGILState_Release(g->gstate);
+            return false;
+        }
+    }
     return true;
 }
 
