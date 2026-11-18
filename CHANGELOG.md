@@ -12,6 +12,9 @@
 
 ### Fixed
 
+- TCP transports start with 64 KiB reads and grow on full reads up to the
+  existing 256 KiB limit, avoiding oversized receive allocations for small
+  messages while retaining large reads for bulk transfers.
 - FD readiness stays one-shot until the Python callback completes. Lease-checked
   acknowledgements re-arm active watchers without readiness message storms;
   socket transports make one read or write attempt per notification.
