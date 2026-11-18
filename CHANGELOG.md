@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Added
+
+- Actor snapshots support local exclusive ownership or replica sets of at least
+  three nodes. Event-driven claims transfer ownership after node failure;
+  majority-backed writes check the owner token and snapshot version together.
+  Claim holders survive actor-generation restarts and release explicitly or on
+  holder death. Durable queues share the Mnesia replica setup implementation.
+
 ### Fixed
 
 - Worker-local actor loops run between requests, waking for queued work through

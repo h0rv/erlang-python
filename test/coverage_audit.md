@@ -42,8 +42,9 @@ suite is visible. `scripts/check_code_map.sh` requires a row per module.
 | `py_import` | `py_import_SUITE` (including event-loop and supervisor module imports) |
 | `py_preload` | `py_preload_SUITE` |
 | `py_state` | `py_state_SUITE` |
-| `py_actor_state` | `py_actor_state_SUITE` (including pooled actor callbacks, ordered writes and restore after restart) |
-| `py_mnesia` | `py_actor_state_SUITE`, `py_durable_queue_SUITE` |
+| `py_actor_state` | `py_actor_state_SUITE` (pooled callbacks, version CAS, local ownership, cancellation and fencing), `py_actor_failover_SUITE` (three-node abrupt failover, saved version, single winner, replica validation) |
+| `py_actor_state_owner` | `py_actor_state_SUITE` (`single_owner`, `cancellation`, `fencing`, `holder_death`), `py_actor_failover_SUITE` (`node_failover`) |
+| `py_mnesia` | `py_actor_state_SUITE`, `py_actor_failover_SUITE`, `py_durable_queue_SUITE`, `py_durable_tasks_SUITE` |
 | `py_semaphore` | (through `py_SUITE`) |
 | `py_logger` | `py_logging_SUITE` |
 | `py_util` | (through every suite) |
