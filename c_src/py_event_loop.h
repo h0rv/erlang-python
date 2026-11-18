@@ -402,10 +402,13 @@ typedef struct erlang_event_loop {
     /**
      * @brief Hash set for O(1) duplicate pending event detection
      *
-     * Key: (callback_id, type) combined into a single uint64_t
+     * Key: full (callback_id, type) pair.
      * Uses open addressing with linear probing.
      */
-    uint64_t pending_hash_keys[PENDING_HASH_SIZE];
+    struct {
+        uint64_t callback_id;
+        event_type_t type;
+    } pending_hash_keys[PENDING_HASH_SIZE];
 
     /** @brief Occupancy flags for hash set slots */
     bool pending_hash_occupied[PENDING_HASH_SIZE];

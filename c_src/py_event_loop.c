@@ -4678,17 +4678,9 @@ static inline void return_pending_event(erlang_event_loop_t *loop,
 /* ============================================================================
  * Pending Event Hash Set (O(1) duplicate detection)
  *
- * Uses open addressing with linear probing. Key is (callback_id, type)
- * combined into a single uint64_t.
+ * Uses open addressing with linear probing. Key is the full (callback_id, type)
+ * pair.
  * ============================================================================ */
-
-/**
- * @brief Compute hash key from callback_id and event type
- */
-static inline uint64_t pending_hash_key(uint64_t callback_id, event_type_t type) {
-    /* Combine callback_id and type into a single key */
-    return (callback_id << 2) | (uint64_t)type;
-}
 
 /**
  * @brief Compute hash bucket index
@@ -4696,9 +4688,10 @@ static inline uint64_t pending_hash_key(uint64_t callback_id, event_type_t type)
  * Note: PENDING_HASH_SIZE must be a power of 2 for bitwise AND to work.
  * Using AND instead of modulo is faster (single instruction vs division).
  */
-static inline uint32_t pending_hash_index(uint64_t key) {
+static inline uint32_t pending_hash_index(uint64_t callback_id, event_type_t type) {
     /* Simple hash: XOR fold and bitwise AND (faster than modulo) */
-    return (uint32_t)((key ^ (key >> 32)) & (PENDING_HASH_SIZE - 1));
+    return (uint32_t)((callback_id ^ (callback_id >> 32) ^ (uint64_t)type) &
+                      (PENDING_HASH_SIZE - 1));
 }
 
 /**
@@ -4715,8 +4708,7 @@ static inline bool pending_hash_contains(erlang_event_loop_t *loop,
         return false;
     }
 
-    uint64_t key = pending_hash_key(callback_id, type);
-    uint32_t idx = pending_hash_index(key);
+    uint32_t idx = pending_hash_index(callback_id, type);
 
     /* Linear probing with bitwise AND for wrap-around */
     for (int i = 0; i < PENDING_HASH_SIZE; i++) {
@@ -4724,7 +4716,8 @@ static inline bool pending_hash_contains(erlang_event_loop_t *loop,
         if (!loop->pending_hash_occupied[probe]) {
             return false;  /* Empty slot means key not present */
         }
-        if (loop->pending_hash_keys[probe] == key) {
+        if (loop->pending_hash_keys[probe].callback_id == callback_id &&
+            loop->pending_hash_keys[probe].type == type) {
             return true;
         }
     }
@@ -4746,19 +4739,20 @@ static inline bool pending_hash_insert(erlang_event_loop_t *loop,
         return false;
     }
 
-    uint64_t key = pending_hash_key(callback_id, type);
-    uint32_t idx = pending_hash_index(key);
+    uint32_t idx = pending_hash_index(callback_id, type);
 
     /* Linear probing with bitwise AND for wrap-around */
     for (int i = 0; i < PENDING_HASH_SIZE; i++) {
         uint32_t probe = (idx + i) & (PENDING_HASH_SIZE - 1);
         if (!loop->pending_hash_occupied[probe]) {
-            loop->pending_hash_keys[probe] = key;
+            loop->pending_hash_keys[probe].callback_id = callback_id;
+            loop->pending_hash_keys[probe].type = type;
             loop->pending_hash_occupied[probe] = true;
             loop->pending_hash_count++;
             return true;
         }
-        if (loop->pending_hash_keys[probe] == key) {
+        if (loop->pending_hash_keys[probe].callback_id == callback_id &&
+            loop->pending_hash_keys[probe].type == type) {
             return false;  /* Already exists */
         }
     }
