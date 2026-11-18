@@ -232,92 +232,10 @@ transaction(Fun) ->
     catch Class:Reason -> {error, {store_failed, Class, Reason}} end.
 
 ensure_store(Dir, Nodes) ->
-    case persistent_term:get({?MODULE, replicas}, Nodes) of
-        Nodes -> ok;
-        _ -> error(replica_set_mismatch)
-    end,
-    Seed = hd(Nodes),
-    ok = py_mnesia:ensure_started(Dir, node() =:= Seed),
-    [net_kernel:connect_node(N) || N <- Nodes, N =/= node()],
-    {ok, _} = mnesia:change_config(extra_db_nodes, Nodes -- [node()]),
-    Deadline = erlang:monotonic_time(millisecond) + 30000,
-    case node() =:= Seed of
-        true ->
-            [begin
-                case mnesia:create_table(T, [{attributes, Attrs}, {type, ordered_set},
-                                            {disc_copies, [node()]}, {majority, false}]) of
-                    {atomic, ok} -> ok;
-                    {aborted, {already_exists, T}} -> ok;
-                    Error -> error({table, Error})
-                end
-             end || {T,Attrs} <- [{dq_item,record_info(fields,dq_item)},
-                                  {dq_meta,record_info(fields,dq_meta)}]],
-            ok = mnesia:wait_for_tables([dq_item,dq_meta],30000),
-            check_replicas(Nodes, true);
-        false ->
-            await_seed(Seed, Nodes, Deadline),
-            {ok, _} = mnesia:change_config(extra_db_nodes, Nodes -- [node()]),
-            case mnesia:change_table_copy_type(schema, node(), disc_copies) of
-                {atomic, ok} -> ok;
-                {aborted, {already_exists, schema, _, disc_copies}} -> ok;
-                SchemaError -> error({schema_copy, SchemaError})
-            end,
-            [case mnesia:add_table_copy(T, node(), disc_copies) of
-                {atomic, ok} -> ok;
-                {aborted, {already_exists, T, _}} -> ok;
-                CopyError -> error({table_copy, T, CopyError})
-             end || T <- [dq_meta, dq_item]],
-            ok = mnesia:wait_for_tables([dq_item,dq_meta],30000),
-            check_replicas(Nodes, false)
-    end,
-    await_layout(Nodes, Deadline),
-    persistent_term:put({?MODULE, replicas}, Nodes), ok.
+    py_mnesia:ensure_store(Dir, Nodes, tables(), dq_meta, ?MODULE, self()).
 
-check_replicas(Nodes, Create) ->
-    case mnesia:sync_transaction(fun() ->
-        case mnesia:read(dq_meta, replicas, write) of
-            [] when Create -> mnesia:write(#dq_meta{key = replicas, value = Nodes});
-            [#dq_meta{value = Nodes}] -> ok;
-            _ -> mnesia:abort(replica_set_mismatch)
-        end
-    end) of
-        {atomic, ok} -> ok;
-        Error -> error({replicas, Error})
-    end.
+tables() ->
+    [{dq_item, record_info(fields, dq_item), false},
+     {dq_meta, record_info(fields, dq_meta), false}].
 
-await_seed(Seed, Nodes, Deadline) ->
-    Ready = try erpc:call(Seed, mnesia, dirty_read, [dq_meta, replicas], 1000)
-            catch _:_ -> unavailable end,
-    case Ready of
-        [#dq_meta{value = Nodes}] -> ok;
-        [#dq_meta{}] -> error(replica_set_mismatch);
-        _ ->
-            case erlang:monotonic_time(millisecond) < Deadline of
-                true -> timer:sleep(50), net_kernel:connect_node(Seed),
-                        await_seed(Seed, Nodes, Deadline);
-                false -> error({seed_unavailable, Seed})
-            end
-    end.
-
-await_layout(Nodes, Deadline) ->
-    try symmetric_tables(Nodes)
-    catch error:Reason ->
-        case erlang:monotonic_time(millisecond) < Deadline of
-            true -> timer:sleep(50), await_layout(Nodes, Deadline);
-            false -> error({replica_layout_timeout, Reason})
-        end
-    end.
-
-symmetric_tables(Nodes) ->
-    [begin
-        Layout = {mnesia:table_info(T, disc_copies), mnesia:table_info(T, ram_copies),
-                  mnesia:table_info(T, disc_only_copies), mnesia:table_info(T, majority)},
-        case Layout of
-            {Disc, [], [], false} ->
-                case lists:sort(Disc) =:= Nodes of
-                    true -> ok;
-                    false -> error({replica_set_mismatch, T, Layout})
-                end;
-            _ -> error({unsupported_replica_layout, T, Layout})
-        end
-     end || T <- [dq_item,dq_meta]], ok.
+symmetric_tables(Nodes) -> py_mnesia:symmetric_tables(Nodes, tables()).
