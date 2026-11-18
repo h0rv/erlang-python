@@ -18,6 +18,7 @@
     test_async_with_args/1,
     test_async_sleep/1,
     test_timer_event_triggering/1,
+    test_idle_sync_timer/1,
     %% Error handling tests
     test_async_error/1,
     test_invalid_module/1,
@@ -60,6 +61,7 @@ all() ->
         test_async_with_args,
         test_async_sleep,
         test_timer_event_triggering,
+        test_idle_sync_timer,
         %% Error handling tests
         test_async_error,
         test_invalid_module,
@@ -185,6 +187,30 @@ test_async_sleep(_Config) ->
     lists:foreach(fun({N, {ok, R}}) ->
         true = abs(R - float(N)) < 0.0001
     end, Results).
+
+test_idle_sync_timer(_Config) ->
+    {ok, 2.0} = py_event_loop:run(math, sqrt, [4.0]),
+    Ctx = py:context(1),
+    ok = py:exec(Ctx, <<"
+import erlang
+import py_event_loop
+import time
+
+def arm_idle_timer(notify):
+    loop = py_event_loop._get_loop_ref(None)
+    assert loop is not None and not loop.is_running()
+    assert not loop._ready and not loop._scheduled
+    started = time.monotonic()
+    def fired():
+        erlang.send(notify, (erlang.atom('idle_timer'), time.monotonic() - started))
+    return loop.call_later(0.05, fired) is not None
+">>),
+    {ok, true} = py:call(Ctx, '__main__', arm_idle_timer, [self()]),
+    receive
+        {idle_timer, Elapsed} when Elapsed >= 0.05, Elapsed < 0.5 -> ok
+    after 1000 ->
+        ct:fail(idle_timer_did_not_fire)
+    end.
 
 test_timer_event_triggering(_Config) ->
     %% Test that timer events properly trigger event loop processing.

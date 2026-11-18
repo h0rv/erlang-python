@@ -538,6 +538,8 @@ class ErlangEventLoop(asyncio.AbstractEventLoop):
         handle = events.TimerHandle(when, callback, args, self, context)
         heapq.heappush(self._scheduled, handle)
         handle._scheduled = True
+        if not self._running:
+            self._arm_timer_wakeup()
         return handle
 
     def time(self):

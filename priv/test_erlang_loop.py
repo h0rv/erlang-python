@@ -73,6 +73,7 @@ class TimerHeapTests(unittest.TestCase):
 
     def test_cancel_churn_has_no_native_timer_calls(self):
         with (
+            patch.object(self.loop, '_running', True),
             patch.object(self.mock, '_schedule_timer_for') as schedule,
             patch.object(self.mock, '_cancel_timer_for') as cancel,
         ):
@@ -87,11 +88,19 @@ class TimerHeapTests(unittest.TestCase):
     def test_idle_timer_fires_without_native_timer(self):
         start = time.monotonic()
         with patch.object(self.mock, '_schedule_timer_for') as schedule:
-            self.loop.call_later(0.03, self.loop.stop)
+            self.loop.call_soon(self.loop.call_later, 0.03, self.loop.stop)
             self.loop.run_forever()
             schedule.assert_not_called()
         self.assertGreaterEqual(time.monotonic() - start, 0.03)
         self.assertLess(time.monotonic() - start, 0.5)
+
+    def test_idle_shared_timer_arms_without_driver_iteration(self):
+        with patch.object(self.mock, '_schedule_timer_for', return_value=42) as schedule:
+            self.loop.call_later(1, self.fail)
+            self.loop.call_later(5, self.fail)
+            schedule.assert_called_once()
+            self.assertEqual(self.loop._timer_ref, 42)
+            self.assertFalse(self.loop._ready)
 
     def test_shared_driver_keeps_one_wakeup_during_churn(self):
         with (
@@ -119,12 +128,11 @@ class TimerHeapTests(unittest.TestCase):
             self.loop.call_later(1, self.fail)
 
     def test_failed_wakeup_can_be_retried(self):
-        self.loop.call_later(1, self.fail)
         with (
             patch.object(self.mock, '_schedule_timer_for', side_effect=RuntimeError('unavailable')),
             self.assertRaisesRegex(RuntimeError, 'unavailable'),
         ):
-            self.loop._run_once(0)
+            self.loop.call_later(1, self.fail)
         self.assertIsNone(self.loop._timer_ref)
         self.assertIsNone(self.loop._timer_deadline)
         self.loop._run_once(0)
@@ -150,10 +158,8 @@ class TimerHeapTests(unittest.TestCase):
             patch.object(self.mock, '_cancel_timer_for') as cancel,
         ):
             self.loop.call_later(5, self.fail)
-            self.loop._run_once(0)
             old_id = self.loop._timer_callback_id
             self.loop.call_later(1, self.fail)
-            self.loop._run_once(0)
             self.loop._dispatch(old_id, 3)
             self.assertEqual(self.loop._timer_ref, 42)
             self.assertEqual(schedule.call_count, 2)
