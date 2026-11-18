@@ -1,35 +1,67 @@
-%%% @doc Versioned local-disk actor snapshots with explicit log-synced writes.
+%%% @doc Owned, versioned actor snapshots with explicit log-synced writes.
 -module(py_actor_state).
--export([register_callbacks/0, open/1, read/1, write/3]).
+-export([register_callbacks/0, open/1, open/2, read/1, write/4,
+         claim/2, cancel/1, release/1]).
 -record(py_actor_snapshot, {key, version, payload}).
+-record(py_actor_owner, {key, node, pid, token}).
+-record(py_actor_state_meta, {key, value}).
 
 register_callbacks() ->
-    py_callback:register('_actor_state_open', fun([Dir]) -> open(Dir) end),
+    py_callback:register('_actor_state_open', fun
+        ([Dir]) -> open(Dir);
+        ([Dir, Replicas]) -> open(Dir, Replicas)
+    end),
+    py_callback:register('_actor_state_claim', fun([Key, Ref]) ->
+        case claim(Key, Ref) of
+            {ok, Token} -> {ok, {bytes, Token}};
+            Other -> Other
+        end
+    end),
+    py_callback:register('_actor_state_cancel', fun([Ref]) -> cancel(Ref) end),
+    py_callback:register('_actor_state_release', fun([Token]) -> release(Token) end),
     py_callback:register('_actor_state_read', fun([Key]) ->
         case read(Key) of
             {ok, Version, Payload} -> {ok, Version, {bytes, Payload}};
             Other -> Other
         end
     end),
-    py_callback:register('_actor_state_write', fun([Key, Version, Payload]) ->
-        write(Key, Version, Payload)
+    py_callback:register('_actor_state_write', fun([Key, Version, Payload, Token]) ->
+        write(Key, Version, Payload, Token)
     end), ok.
 
-open(Dir) when is_binary(Dir), byte_size(Dir) > 0 ->
+open(Dir) -> open(Dir, []).
+open(Dir, Replicas) when is_binary(Dir), byte_size(Dir) > 0, is_list(Replicas) ->
+    case lists:all(fun(N) -> is_binary(N) andalso byte_size(N) > 0 end, Replicas) of
+        false -> {error, invalid_argument};
+        true ->
+            Nodes = lists:usort([binary_to_atom(N, utf8) || N <- Replicas]),
+            case {Nodes, length(Nodes), lists:member(node(), Nodes)} of
+                {[], _, _} -> open_nodes(Dir, [node()]);
+                {_, N, _} when N < 3 -> {error, at_least_three_replicas_required};
+                {_, _, false} -> {error, local_replica_required};
+                _ -> open_nodes(Dir, Nodes)
+            end
+    end;
+open(_, _) -> {error, invalid_argument}.
+
+open_nodes(Dir, Nodes) ->
     protect(fun() ->
-        ok = py_mnesia:ensure_started(filename:absname(unicode:characters_to_list(Dir)), true),
-        case mnesia:create_table(py_actor_snapshot,
-                [{attributes, record_info(fields, py_actor_snapshot)},
-                 {disc_copies, [node()]}, {majority, true}]) of
-            {atomic, ok} -> ok;
-            {aborted, {already_exists, py_actor_snapshot}} -> ok;
-            Error -> error({table, Error})
-        end,
-        ok = mnesia:wait_for_tables([py_actor_snapshot], 30000),
-        ok = local_disk(),
-        ok = mnesia:sync_log()
-    end);
-open(_) -> {error, invalid_argument}.
+        ok = py_mnesia:ensure_store(filename:absname(unicode:characters_to_list(Dir)),
+            Nodes, tables(), py_actor_state_meta, ?MODULE, whereis(py_actor_state_owner)),
+        ok = gen_server:call(py_actor_state_owner, opened, infinity),
+        mnesia:sync_log()
+    end).
+
+claim(Key, Ref) when is_binary(Key), byte_size(Key) > 0, byte_size(Key) =< 4096,
+                     is_binary(Ref), byte_size(Ref) > 0, byte_size(Ref) =< 4096 ->
+    gen_server:call(py_actor_state_owner, {claim, Key, Ref}, infinity);
+claim(_, _) -> {error, invalid_argument}.
+cancel(Ref) when is_binary(Ref), byte_size(Ref) > 0, byte_size(Ref) =< 4096 ->
+    gen_server:call(py_actor_state_owner, {cancel, Ref}, infinity);
+cancel(_) -> {error, invalid_argument}.
+release(Token) when is_binary(Token) ->
+    gen_server:call(py_actor_state_owner, {release, Token}, infinity);
+release(_) -> {error, invalid_argument}.
 
 read(Key) when is_binary(Key), byte_size(Key) > 0, byte_size(Key) =< 4096 ->
     protect(fun() ->
@@ -43,12 +75,17 @@ read(Key) when is_binary(Key), byte_size(Key) > 0, byte_size(Key) =< 4096 ->
     end);
 read(_) -> {error, invalid_argument}.
 
-write(Key, Expected, Payload)
+write(Key, Expected, Payload, Token)
   when is_binary(Key), byte_size(Key) > 0, byte_size(Key) =< 4096,
-       is_integer(Expected), Expected >= 0, is_binary(Payload), byte_size(Payload) =< 1048576 ->
+       is_integer(Expected), Expected >= 0, is_binary(Payload), byte_size(Payload) =< 1048576,
+       is_binary(Token) ->
     protect(fun() ->
-        ok = local_disk(),
+        ok = py_mnesia:symmetric_tables(persistent_term:get({?MODULE, replicas}), tables()),
         Result = transaction(fun() ->
+            case mnesia:read(py_actor_owner, Key, read) of
+                [#py_actor_owner{token = Token}] -> ok;
+                _ -> mnesia:abort(not_owner)
+            end,
             Current = case mnesia:read(py_actor_snapshot, Key, write) of
                 [] -> 0;
                 [#py_actor_snapshot{version = Version}] -> Version
@@ -66,15 +103,12 @@ write(Key, Expected, Payload)
             _ -> Result
         end
     end);
-write(_, _, _) -> {error, invalid_argument}.
+write(_, _, _, _) -> {error, invalid_argument}.
 
-local_disk() ->
-    case {mnesia:table_info(py_actor_snapshot, disc_copies),
-          mnesia:table_info(py_actor_snapshot, ram_copies),
-          mnesia:table_info(py_actor_snapshot, disc_only_copies)} of
-        {[Node], [], []} when Node =:= node() -> ok;
-        _ -> error(unsupported_snapshot_layout)
-    end.
+tables() ->
+    [{py_actor_snapshot, record_info(fields, py_actor_snapshot), true},
+     {py_actor_owner, record_info(fields, py_actor_owner), true},
+     {py_actor_state_meta, record_info(fields, py_actor_state_meta), true}].
 
 transaction(Fun) ->
     case mnesia:sync_transaction(Fun) of

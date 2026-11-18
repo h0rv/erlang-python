@@ -36,12 +36,37 @@ exercised by suites). Guides are in `docs/`, suites in `test/`. Start with
 | `py_import` | Registry of imports and `sys.path` entries applied to every interpreter | live | imports | `py_import_SUITE` |
 | `py_preload` | Code run once per interpreter at start | live | preload | `py_preload_SUITE` |
 | `py_state` | Shared key/value store visible from Python as `erlang.state_get/set/delete/keys` | live | README (shared state) | `py_state_SUITE` |
-| `py_actor_state` | Explicit versioned actor snapshots, local disk transactions and log sync | live | | `py_actor_state_SUITE` |
-| `py_mnesia` | Shared directory-checked Mnesia schema startup | live | | `py_actor_state_SUITE`, `py_durable_queue_SUITE` |
+| `py_actor_state` | Versioned actor snapshots, majority replication, owner-token fencing and log sync | live | | `py_actor_state_SUITE`, `py_actor_failover_SUITE` |
+| `py_actor_state_owner` | Event-driven exclusive claims and node-local holder monitoring | live | | `py_actor_state_SUITE`, `py_actor_failover_SUITE` |
+| `py_mnesia` | Shared directory-checked Mnesia startup, replica joins and layout checks | live | | `py_actor_state_SUITE`, `py_actor_failover_SUITE`, `py_durable_queue_SUITE`, `py_durable_tasks_SUITE` |
 | `py_semaphore` | ETS counting semaphore for rate limiting | live | scalability | (through `py_SUITE`) |
 | `py_logger`, `py_tracer` | Python `logging` into Erlang logger; tracing hooks | live | logging | `py_logging_SUITE` |
 | `erlang_python_app`, `erlang_python_sup` | Application start and the supervision tree | live | architecture | all |
 | `py_util` | Small helpers | live | | |
+
+Actor snapshot callbacks are internal runtime contracts. `_actor_state_open(Dir)`
+uses local disk; `_actor_state_open(Dir, Replicas)` accepts an empty list or at
+least three distinct node-name binaries including this node. Snapshot and owner
+tables require a majority of disk replicas for writes. The metadata table records
+the replica set before joining replicas, then enables majority writes before
+open returns. Joining reuses the durable queue's replica-set protocol and waits
+on OTP process-group notifications and Mnesia schema events, without polling.
+
+`_actor_state_claim(Key, Ref)` waits for exclusive ownership and returns
+`{ok, Token}` with a binary token. Use a unique binary `Ref` for each claim.
+`_actor_state_cancel(Ref)` cancels a pending claim or releases one that won the
+race; it also handles cancellation arriving before its claim.
+`_actor_state_release(Token)` releases an acquired claim. Each claim has its own
+BEAM holder process, independent of the actor generation. The caller must retain
+the token across actor restarts and release it when the actor or group stops.
+Holder death deletes its owner row; manager startup removes this node's stale
+rows. This runtime contract does not yet bind holders to Python actor groups.
+
+`_actor_state_write(Key, ExpectedVersion, Payload, Token)` atomically checks both
+ownership and the version. A stale token returns `{error, not_owner}`; a minority
+partition cannot commit a write. `_actor_state_read(Key)` keeps its existing
+versioned-read contract. Node failure transfers permission to restore state, not
+execution of arbitrary application effects or automatic Python actor placement.
 
 ## C (`c_src/`)
 

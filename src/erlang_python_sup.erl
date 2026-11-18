@@ -196,6 +196,8 @@ init([]) ->
                   shutdown => infinity},
                 WorkerRegistrySpec, WorkerSupSpec, EventLoopSpec,
                 EventLoopPoolSpec, ActorRegistrySpec, ActorRootSpec,
+                #{id => py_mnesia_pg, start => {py_mnesia, start_link, []}},
+                #{id => py_actor_state_owner, start => {py_actor_state_owner, start_link, []}},
                 #{id => py_durable_queue_sync, start => {py_durable_queue_sync, start_link, []}},
                 #{id => py_durable_queue, start => {py_durable_queue, start_link, []}},
                 #{id => py_durable_tasks, start => {py_durable_tasks, start_link, []},

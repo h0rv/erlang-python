@@ -132,8 +132,9 @@ def loop_identity() -> tuple[int, int]:
 
 
 class SnapshotCounter:
-    def __init__(self, directory: str) -> None:
+    def __init__(self, directory: str, token: bytes) -> None:
         self.directory = directory
+        self.token = token
         self.version = 0
         self.value = b"0"
         self.loaded = False
@@ -153,7 +154,7 @@ class SnapshotCounter:
         if payload == b"read":
             return self.value
         result = await erlang.async_call(
-            "_actor_state_write", b"pooled-counter", self.version, payload
+            "_actor_state_write", b"pooled-counter", self.version, payload, self.token
         )
         assert result == ("ok", self.version + 1)
         self.version += 1
@@ -162,8 +163,24 @@ class SnapshotCounter:
 
 
 async def persistent_round_trip(directory: str) -> bool:
+    assert await erlang.async_call("_actor_state_open", directory) == "ok"
+    result = await erlang.async_call(
+        "_actor_state_claim", b"pooled-counter", b"pooled-counter-claim"
+    )
+    match result:
+        case ("ok", bytes(token)):
+            pass
+        case _:
+            raise RuntimeError("Invalid ownership claim", result)
+    try:
+        return await owned_round_trip(directory, token)
+    finally:
+        assert await erlang.async_call("_actor_state_release", token) == "ok"
+
+
+async def owned_round_trip(directory: str, token: bytes) -> bool:
     async with DataActorGroup(max_children=1) as group:
-        actor = await group.spawn("counter", lambda: SnapshotCounter(directory))
+        actor = await group.spawn("counter", lambda: SnapshotCounter(directory, token))
         async with asyncio.TaskGroup() as calls:
             pending = [
                 calls.create_task(actor.call(value)) for value in (b"1", b"2", b"3")
@@ -175,10 +192,10 @@ async def persistent_round_trip(directory: str) -> bool:
         assert await actor.call(b"read") == saved
         assert await actor.call(b"4") == b"4"
         assert await erlang.async_call(
-            "_actor_state_write", b"pooled-counter", 0, b"stale"
+            "_actor_state_write", b"pooled-counter", 0, b"stale", token
         ) == ("error", ("version_conflict", 0, 4))
     async with DataActorGroup(max_children=1) as group:
-        actor = await group.spawn("counter", lambda: SnapshotCounter(directory))
+        actor = await group.spawn("counter", lambda: SnapshotCounter(directory, token))
         assert await actor.call(b"read") == b"4"
     return True
 
