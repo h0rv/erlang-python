@@ -379,6 +379,9 @@ static ERL_NIF_TERM py_to_term_d(ErlNifEnv *env, PyObject *obj, int depth) {
     /* Handle ErlangPid → Erlang PID */
     if (Py_IS_TYPE(obj, &ErlangPidType)) {
         ErlangPidObject *pid_obj = (ErlangPidObject *)obj;
+        if (pid_obj->env != NULL) {
+            return enif_make_copy(env, pid_obj->pid.pid);
+        }
         return enif_make_pid(env, &pid_obj->pid);
     }
 
@@ -725,10 +728,20 @@ static PyObject *term_to_py_d(ErlNifEnv *env, ERL_NIF_TERM term, int depth) {
     /* Check for PID */
     {
         ErlNifPid pid;
-        if (enif_get_local_pid(env, term, &pid)) {
+        if (enif_is_pid(env, term)) {
             ErlangPidObject *obj = PyObject_New(ErlangPidObject, &ErlangPidType);
             if (obj == NULL) return NULL;
-            obj->pid = pid;
+            obj->env = NULL;
+            if (enif_get_local_pid(env, term, &pid)) {
+                obj->pid = pid;
+            } else {
+                obj->env = enif_alloc_env();
+                if (obj->env == NULL) {
+                    Py_DECREF(obj);
+                    return PyErr_NoMemory();
+                }
+                obj->pid.pid = enif_make_copy(obj->env, term);
+            }
             return (PyObject *)obj;
         }
     }

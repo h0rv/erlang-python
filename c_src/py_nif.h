@@ -1368,7 +1368,11 @@ extern PyObject *SuspensionRequiredException;
 extern PyObject *ProcessErrorException;
 
 /** @brief Python type for opaque Erlang PIDs */
-typedef struct { PyObject_HEAD; ErlNifPid pid; } ErlangPidObject;
+typedef struct {
+    PyObject_HEAD;
+    ErlNifPid pid;
+    ErlNifEnv *env;
+} ErlangPidObject;
 extern PyTypeObject ErlangPidType;
 
 /** @brief Python type for opaque Erlang references (stored as serialized binary) */

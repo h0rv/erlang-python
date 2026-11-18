@@ -1054,7 +1054,17 @@ static PyObject *ErlangFunction_New(PyObject *name) {
  * ErlangPidObject is defined in py_nif.h for use by py_convert.c
  * ============================================================================ */
 
+static void ErlangPid_dealloc(ErlangPidObject *self) {
+    if (self->env != NULL) enif_free_env(self->env);
+    Py_TYPE(self)->tp_free((PyObject *)self);
+}
+
 static PyObject *ErlangPid_repr(ErlangPidObject *self) {
+    if (self->env != NULL) {
+        char buffer[256];
+        enif_snprintf(buffer, sizeof(buffer), "<erlang.Pid %T>", self->pid.pid);
+        return PyUnicode_FromString(buffer);
+    }
     /* Show the raw term value for debugging — not a stable external format,
        but distinguishes different PIDs in logs and repls. */
     return PyUnicode_FromFormat("<erlang.Pid 0x%lx>",
@@ -1086,6 +1096,7 @@ PyTypeObject ErlangPidType = {
     .tp_name = "erlang.Pid",
     .tp_basicsize = sizeof(ErlangPidObject),
     .tp_flags = Py_TPFLAGS_DEFAULT,
+    .tp_dealloc = (destructor)ErlangPid_dealloc,
     .tp_repr = (reprfunc)ErlangPid_repr,
     .tp_richcompare = ErlangPid_richcompare,
     .tp_hash = (hashfunc)ErlangPid_hash,
@@ -1972,19 +1983,23 @@ static PyObject *erlang_call_impl(PyObject *self, PyObject *args) {
 /* ============================================================================
  * erlang.send() - Fire-and-forget message passing
  *
- * Sends a message directly to an Erlang process mailbox via enif_send().
+ * Local PIDs use enif_send(); distributed destinations use the coordinator.
  * No suspension, no blocking, no reply needed.
  * ============================================================================ */
 
 /**
- * @brief Python: erlang.send(pid, term) -> None
+ * @brief Python: erlang.send(destination, term) -> None
  *
  * Fire-and-forget message send to an Erlang process.
  *
  * @param self Module reference (unused)
- * @param args Tuple: (pid:erlang.Pid, term:any)
+ * @param args Tuple: (destination:erlang.Pid or atom pair, term:any)
  * @return None on success, NULL with exception on failure
  */
+/* Defined in py_thread_worker.c, included after this file. */
+extern ErlNifPid g_thread_coordinator_pid;
+extern bool g_has_thread_coordinator;
+
 static PyObject *erlang_send_impl(PyObject *self, PyObject *args) {
     (void)self;
 
@@ -1997,13 +2012,22 @@ static PyObject *erlang_send_impl(PyObject *self, PyObject *args) {
     PyObject *pid_obj = PyTuple_GetItem(args, 0);
     PyObject *term_obj = PyTuple_GetItem(args, 1);
 
-    /* Validate PID type */
-    if (!Py_IS_TYPE(pid_obj, &ErlangPidType)) {
-        PyErr_SetString(PyExc_TypeError, "First argument must be an erlang.Pid");
+    bool is_pid = Py_IS_TYPE(pid_obj, &ErlangPidType);
+    bool is_named = PyTuple_Check(pid_obj) && PyTuple_GET_SIZE(pid_obj) == 2 &&
+        Py_IS_TYPE(PyTuple_GET_ITEM(pid_obj, 0), &ErlangAtomType) &&
+        Py_IS_TYPE(PyTuple_GET_ITEM(pid_obj, 1), &ErlangAtomType);
+    if (!is_pid && !is_named) {
+        PyErr_SetString(PyExc_TypeError,
+            "First argument must be an erlang.Pid or a (erlang.Atom, erlang.Atom) tuple");
         return NULL;
     }
 
-    ErlangPidObject *pid = (ErlangPidObject *)pid_obj;
+    ErlangPidObject *pid = is_pid ? (ErlangPidObject *)pid_obj : NULL;
+    bool route = is_named || pid->env != NULL;
+    if (route && !g_has_thread_coordinator) {
+        PyErr_SetString(get_current_process_error(), "Send coordinator is not available");
+        return NULL;
+    }
 
     /* Allocate a message environment and convert the term */
     ErlNifEnv *msg_env = enif_alloc_env();
@@ -2013,6 +2037,10 @@ static PyObject *erlang_send_impl(PyObject *self, PyObject *args) {
     }
 
     ERL_NIF_TERM msg = py_to_term(msg_env, term_obj);
+    if (route && !PyErr_Occurred()) {
+        ERL_NIF_TERM dest = py_to_term(msg_env, pid_obj);
+        msg = enif_make_tuple3(msg_env, enif_make_atom(msg_env, "$py_send"), dest, msg);
+    }
 
     if (PyErr_Occurred()) {
         enif_free_env(msg_env);
@@ -2020,7 +2048,8 @@ static PyObject *erlang_send_impl(PyObject *self, PyObject *args) {
     }
 
     /* Fire-and-forget send */
-    int send_result = enif_send(NULL, &pid->pid, msg_env, msg);
+    int send_result = enif_send(NULL, route ? &g_thread_coordinator_pid : &pid->pid,
+                                msg_env, msg);
 
     if (!send_result) {
         enif_free_env(msg_env);
@@ -2042,13 +2071,6 @@ static PyObject *erlang_send_impl(PyObject *self, PyObject *args) {
  * - Integrates with asyncio event loop
  * - Releases dirty NIF thread while waiting
  * ============================================================================ */
-
-/*
- * Forward declarations for thread worker variables (defined in py_thread_worker.c)
- * These are needed because py_callback.c is included before py_thread_worker.c.
- */
-extern ErlNifPid g_thread_coordinator_pid;
-extern bool g_has_thread_coordinator;
 
 /* Per-interpreter module state for async callbacks.
  *
@@ -3792,8 +3814,10 @@ static PyMethodDef ErlangModuleMethods[] = {
      "NOTE: Use erlang.atom() wrapper instead for safety limits."},
     {"send", erlang_send_impl, METH_VARARGS,
      "Send a message to an Erlang process (fire-and-forget).\n\n"
-     "Usage: erlang.send(pid, term)\n"
-     "The pid must be an erlang.Pid object."},
+     "Usage: erlang.send(destination, term)\n"
+     "Accepts an erlang.Pid or (erlang.atom(name), erlang.atom(node)).\n"
+     "Remote and named sends are queued, without connecting or waiting for\n"
+     "distribution capacity. Return does not acknowledge delivery."},
     {"whereis", erlang_whereis_impl, METH_VARARGS,
      "Look up a registered Erlang process by name.\n\n"
      "Usage: erlang.whereis(name)\n"
