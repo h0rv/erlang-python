@@ -155,7 +155,12 @@ serialized_awaits(Config) ->
         Parent ! {result, self(), Result}
     end) || _ <- lists:seq(1, 16)],
     lists:foreach(fun({Pid, Mon}) ->
-        receive {result, Pid, {ok, _}} -> ok after 10000 -> error(call_timeout) end,
+        receive
+            {result, Pid, {ok, _}} -> ok;
+            {result, Pid, Failure} -> error({call_failed, Failure});
+            {'DOWN', Mon, process, Pid, Reason} -> error({caller_died, Reason})
+        after 10000 -> error(call_timeout)
+        end,
         receive {'DOWN', Mon, process, Pid, normal} -> ok
         after 10000 -> error(caller_timeout) end
     end, Pids),
@@ -343,6 +348,12 @@ class Tracked:
     after py_context:exec(Ctx, <<"del builtins._tracked_actor">>, Env) end.
 
 interpreter_validation(Config) ->
+    case py_nif:owngil_supported() of
+        true -> validate_foreign_interpreter(Config);
+        false -> {skip, "own-GIL contexts require Python 3.14+"}
+    end.
+
+validate_foreign_interpreter(Config) ->
     Ctx = context(Config),
     {ok, Other} = py_context:new(#{mode => owngil}),
     try

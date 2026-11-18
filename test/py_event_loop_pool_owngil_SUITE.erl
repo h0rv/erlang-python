@@ -64,17 +64,22 @@ init_per_suite(Config) ->
             timer:sleep(100),
 
             %% Enable OWN_GIL mode
-            application:set_env(erlang_python, event_loop_pool_owngil, true),
-            application:set_env(erlang_python, event_loop_pool_size, 4),
+            Config1 = py_ct_env:override(Config, #{
+                event_loop_pool_owngil => true, event_loop_pool_size => 4
+            }),
 
             case application:ensure_all_started(erlang_python) of
                 {ok, _} ->
                     timer:sleep(500),
                     case wait_for_owngil_pool(5000) of
-                        ok -> Config;
-                        {error, Reason} -> {skip, {pool_not_ready, Reason}}
+                        ok -> Config1;
+                        {error, Reason} ->
+                            ok = application:stop(erlang_python),
+                            ok = py_ct_env:restore(Config1),
+                            {skip, {pool_not_ready, Reason}}
                     end;
                 {error, {App, Reason}} ->
+                    ok = py_ct_env:restore(Config1),
                     {skip, {failed_to_start, App, Reason}}
             end
     end.
@@ -90,10 +95,9 @@ wait_for_owngil_pool(Timeout) ->
             wait_for_owngil_pool(Timeout - 100)
     end.
 
-end_per_suite(_Config) ->
+end_per_suite(Config) ->
     ok = application:stop(erlang_python),
-    application:set_env(erlang_python, event_loop_pool_owngil, false),
-    ok.
+    py_ct_env:restore(Config).
 
 init_per_group(_GroupName, Config) ->
     Config.

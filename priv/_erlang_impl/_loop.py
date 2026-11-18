@@ -20,7 +20,7 @@ asyncio.AbstractEventLoop using Erlang's scheduler via enif_select
 for I/O multiplexing.
 
 Architecture:
-- Single event loop per interpreter (no multi-loop complexity)
+- Independent native resources for Python-created loops
 - Uses enif_select for fd monitoring
 - Uses a Python timer heap and deadline-based native waits
 - Full GIL release during waits
@@ -95,7 +95,7 @@ class ErlangEventLoop(asyncio.AbstractEventLoop):
 
     # Use __slots__ for faster attribute access and reduced memory
     __slots__ = (
-        '_pel', '_loop_capsule', '_uses_global_capsule', '_owns_capsule',
+        '_pel', '_loop_capsule', '_owns_capsule',
         '_readers', '_writers',
         '_callbacks_by_cid',  # callback_id -> (callback, args, event_type) for O(1) dispatch
         '_fd_resources',  # logical fd -> owned native poll lease key
@@ -122,10 +122,9 @@ class ErlangEventLoop(asyncio.AbstractEventLoop):
         C module. This provides direct access to the event loop without
         going through Erlang callbacks.
 
-        Without ``capsule`` the loop attaches to the interpreter's default
-        (global) loop. The event loop pool passes a capsule over one of its
-        own loops so timers, fd events and the pending queue stay on that
-        loop; such a capsule is owned by Erlang and never destroyed here.
+        Without a capsule, the loop owns its native resource. A supplied
+        capsule attaches to an Erlang-owned resource without destroying it
+        on close.
         """
         # Detect execution mode for proper behavior
         self._execution_mode = detect_mode()
@@ -144,37 +143,8 @@ class ErlangEventLoop(asyncio.AbstractEventLoop):
             # Fallback for testing without actual NIF
             self._pel = _MockNifModule()
 
-        # Use the global loop capsule instead of creating a new one.
-        # The global loop (created by Erlang) has has_worker=true, which ensures
-        # that timers and FD events are dispatched to the worker process.
-        # The worker triggers process_ready_tasks which calls _run_once.
-        # Without this, Python-created loops would have their own pending queues
-        # that never get processed because the worker doesn't know about them.
-        self._uses_global_capsule = False
-        self._owns_capsule = False
-        if capsule is not None:
-            self._loop_capsule = capsule
-        elif hasattr(self._pel, '_get_global_loop_capsule'):
-            try:
-                self._loop_capsule = self._pel._get_global_loop_capsule()
-                self._uses_global_capsule = True
-                # A shared resource stays owned between driver turns.
-                if hasattr(self._pel, '_has_loop_ref') and self._pel._has_loop_ref(self._loop_capsule):
-                    raise RuntimeError(
-                        "An ErlangEventLoop already exists for this native resource. "
-                        "Close its owner before constructing another wrapper."
-                    )
-            except RuntimeError as e:
-                # Re-raise our "already exists" error
-                if "already exists" in str(e):
-                    raise
-                # Fall back to creating a new loop if global not available
-                self._loop_capsule = self._pel._loop_new()
-                self._uses_global_capsule = False
-                self._owns_capsule = True
-        else:
-            self._loop_capsule = self._pel._loop_new()
-            self._owns_capsule = True
+        self._owns_capsule = capsule is None
+        self._loop_capsule = self._pel._loop_new() if capsule is None else capsule
 
         # Callback management
         self._readers = {}  # fd -> (callback, args, callback_id)
@@ -294,6 +264,7 @@ class ErlangEventLoop(asyncio.AbstractEventLoop):
 
     @contextmanager
     def _driver_session(self, *, allow_current: bool = False) -> Generator[None]:
+        self._check_closed()
         capsule = self._loop_capsule
         token, acquired = self._pel._claim_driver_session(capsule, self, allow_current)
         try:
@@ -1678,7 +1649,7 @@ class _MockNifModule:
 # Async coroutine wrapper for result delivery
 # =============================================================================
 
-async def _run_and_send(coro, caller_pid, ref):
+async def _run_and_send(coro, caller_pid, ref, reply_on_success=True):
     """Run a coroutine and send the result to an Erlang caller via erlang.send().
 
     This function wraps a coroutine and sends its result (or error) to the
@@ -1689,6 +1660,7 @@ async def _run_and_send(coro, caller_pid, ref):
         coro: The coroutine to run
         caller_pid: An erlang.Pid object for the caller process
         ref: A reference to include in the result message
+        reply_on_success: When false, report failures with an undefined reference
 
     The result message format is:
         (async_result, ref, (ok, result)) - on success
@@ -1708,18 +1680,17 @@ async def _run_and_send(coro, caller_pid, ref):
 
     # Create atoms for message keys (strings become binaries, await expects atoms)
     async_result = atom('async_result')
-    ok = atom('ok')
-    error = atom('error')
-
     try:
         result = await coro
-        try:
-            erlang.send(caller_pid, (async_result, ref, (ok, result)))
-        except erlang.ProcessError:
-            pass  # Caller gone, nothing to do
+        if reply_on_success:
+            try:
+                erlang.send(caller_pid, (async_result, ref, (atom('ok'), result)))
+            except erlang.ProcessError:
+                pass  # Caller gone, nothing to do
     except asyncio.CancelledError:
         try:
-            erlang.send(caller_pid, (async_result, ref, (error, 'cancelled')))
+            reply_ref = ref if reply_on_success else atom('undefined')
+            erlang.send(caller_pid, (async_result, reply_ref, (atom('error'), 'cancelled')))
         except erlang.ProcessError:
             pass  # Caller gone, nothing to do
     except Exception as e:
@@ -1729,6 +1700,8 @@ async def _run_and_send(coro, caller_pid, ref):
         import traceback
         tb = traceback.format_exc()
         try:
-            erlang.send(caller_pid, (async_result, ref, (error, f'{type(e).__name__}: {e}\n{tb}')))
+            reply_ref = ref if reply_on_success else atom('undefined')
+            erlang.send(caller_pid, (async_result, reply_ref,
+                                     (atom('error'), f'{type(e).__name__}: {e}\n{tb}')))
         except erlang.ProcessError:
             pass  # Caller gone, nothing to do

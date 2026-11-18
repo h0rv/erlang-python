@@ -55,7 +55,7 @@ def reject_active(capsule: object, shared: bool) -> str:
     rejects(lambda: native._clear_loop_ref(capsule, object()))
     rejects(lambda: native._clear_loop_ref(capsule, owner))
     if shared:
-        rejects(NativeLoop)
+        rejects(lambda: NativeLoop(native._get_global_loop_capsule()))
         rejects(lambda: native._set_global_loop_ref(object()))
         native._set_global_loop_ref(owner)
     partial = NativeLoop.__new__(NativeLoop)

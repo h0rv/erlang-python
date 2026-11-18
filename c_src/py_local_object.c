@@ -410,7 +410,7 @@ static PyObject *local_object_apply(py_context_t *ctx, const ERL_NIF_TERM *parts
         ? Py_NewRef(loop->py_loop) : NULL;
     if (driver == NULL) {
         PyObject *module = PyImport_ImportModule("_erlang_impl");
-        driver = module == NULL ? NULL : PyObject_CallMethod(module, "new_event_loop", NULL);
+        driver = module == NULL ? NULL : PyObject_CallMethod(module, "_get_or_create_driver", NULL);
         Py_XDECREF(module);
     }
     PyObject *result = NULL;

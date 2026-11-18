@@ -14,17 +14,17 @@
 
 """Unit tests for the transport close path of ErlangEventLoop.
 
-A transport must not close its socket while the fd may still be in the BEAM
-poll set: it detaches the fd and hands it to the loop (_close_socket), which
-releases the fd resource with ownership so the NIF closes it after the
-select stop. These tests drive the loop against a recording NIF stub, so
-they check the contract without a running BEAM.
+The loop retires the NIF's duplicated poll fd before closing the transport's
+original socket. These tests drive the loop against a recording NIF stub.
 """
 
 import asyncio
+import gc
 import os
 import socket
+import sys
 import unittest
+from unittest.mock import patch
 
 from _erlang_impl import _loop as loop_mod
 from _erlang_impl._transport import ErlangSocketTransport, ErlangDatagramTransport
@@ -57,43 +57,9 @@ class _RecordingNif(loop_mod._MockNifModule):
 
 
 def _make_loop():
-    """ErlangEventLoop over the recording stub (no py_event_loop C module)."""
-    loop = loop_mod.ErlangEventLoop.__new__(loop_mod.ErlangEventLoop)
     nif = _RecordingNif()
-    # Mirror the parts of __init__ the transports touch
-    loop._pel = nif
-    loop._loop_capsule = nif._loop_new()
-    loop._uses_global_capsule = False
-    loop._readers = {}
-    loop._writers = {}
-    loop._callbacks_by_cid = {}
-    loop._fd_resources = {}
-    loop._timers = {}
-    loop._scheduled = []
-    loop._timer_cancelled_count = 0
-    loop._timer_ref = None
-    loop._timer_deadline = None
-    loop._timer_callback_id = None
-    loop._ready = __import__('collections').deque()
-    loop._ready_append = loop._ready.append
-    loop._ready_popleft = loop._ready.popleft
-    loop._handle_pool = []
-    loop._handle_pool_max = 150
-    loop._cached_time = 0.0
-    loop._wake_pending = False
-    loop._running = False
-    loop._stopping = False
-    loop._closed = False
-    loop._thread_id = None
-    loop._clock_resolution = 1e-9
-    loop._exception_handler = None
-    loop._current_handle = None
-    loop._debug = False
-    loop._task_factory = None
-    loop._default_executor = None
-    loop._signal_handlers = {}
-    loop._execution_mode = None
-    loop._callback_id = 0
+    with patch.dict(sys.modules, {"py_event_loop": nif}):
+        loop = loop_mod.ErlangEventLoop()
     return loop, nif
 
 
@@ -112,6 +78,7 @@ class TestTransportClose(unittest.TestCase):
 
     def setUp(self):
         self.loop, self.nif = _make_loop()
+        self.addCleanup(self.loop.close)
         self.a, self.b = socket.socketpair()
         self.a.setblocking(False)
 
@@ -129,7 +96,7 @@ class TestTransportClose(unittest.TestCase):
         except OSError:
             return False
 
-    def test_close_hands_fd_to_nif(self):
+    def test_close_retires_poll_lease_and_closes_socket(self):
         fd = self.a.fileno()
         proto = _Proto()
         transport = ErlangSocketTransport(self.loop, self.a, proto)
@@ -137,11 +104,10 @@ class TestTransportClose(unittest.TestCase):
         self.assertEqual(self.nif.calls, [('add_reader', fd)])
 
         transport.close()
-        # No pending writes: connection_lost ran and the socket was detached,
-        # the fd itself is closed by the (mock) NIF with ownership
+        # The NIF retires its poll lease; the loop closes the original.
         self.assertEqual(proto.lost, [None])
         self.assertEqual(self.a.fileno(), -1)
-        self.assertIn(('release', fd, True), self.nif.calls)
+        self.assertIn(('release', fd, False), self.nif.calls)
         self.assertFalse(self._fd_is_open(fd))
         # nothing left registered for that fd
         self.assertNotIn(fd, self.loop._fd_resources)
@@ -169,7 +135,7 @@ class TestTransportClose(unittest.TestCase):
         transport.close()
         self.assertEqual(proto.lost, [None])
         releases = [c for c in self.nif.calls if c[0] == 'release']
-        self.assertEqual(releases, [('release', fd, True)])
+        self.assertEqual(releases, [('release', fd, False)])
 
     def test_pending_write_defers_close(self):
         fd = self.a.fileno()
@@ -187,7 +153,7 @@ class TestTransportClose(unittest.TestCase):
         # drain: the write callback finishes and closes
         transport._write_ready_cb()
         self.assertEqual(proto.lost, [None])
-        self.assertIn(('release', fd, True), self.nif.calls)
+        self.assertIn(('release', fd, False), self.nif.calls)
 
     def test_datagram_close(self):
         u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -199,7 +165,7 @@ class TestTransportClose(unittest.TestCase):
         self.loop.add_reader(fd, transport._read_ready)
         transport.close()
         self.assertEqual(proto.lost, [None])
-        self.assertIn(('release', fd, True), self.nif.calls)
+        self.assertIn(('release', fd, False), self.nif.calls)
         self.assertFalse(self._fd_is_open(fd))
 
     def test_close_socket_unregistered(self):
@@ -229,10 +195,9 @@ class TestTransportClose(unittest.TestCase):
         sock = self.a
         self.a = socket.socket()  # keep tearDown happy
         del transport
-        import gc
         gc.collect()
         self.assertEqual(sock.fileno(), -1)
-        self.assertIn(('release', fd, True), self.nif.calls)
+        self.assertIn(('release', fd, False), self.nif.calls)
 
 
 if __name__ == '__main__':

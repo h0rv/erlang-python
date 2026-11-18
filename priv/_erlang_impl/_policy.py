@@ -24,6 +24,8 @@ import asyncio
 import threading
 from typing import Optional
 
+from ._loop import ErlangEventLoop
+
 __all__ = ['ErlangEventLoopPolicy']
 
 
@@ -110,8 +112,6 @@ class ErlangEventLoopPolicy(asyncio.AbstractEventLoopPolicy):
             Always returns ErlangEventLoop when using this policy.
             The Erlang event loop handles thread safety internally.
         """
-        # Import here to avoid circular imports
-        from ._loop import ErlangEventLoop
         return ErlangEventLoop()
 
     # Child watcher methods (for subprocess support)

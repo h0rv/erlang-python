@@ -12,11 +12,12 @@ all() -> [paused_reader, delivered_reader, paused_writer, delivered_writer,
           socket_recv_completion, socket_connect_completion,
           callback_rearm, callback_rearm_capacity, socket_callback_rearm].
 init_per_suite(Config) ->
-    application:load(erlang_python),
-    application:set_env(erlang_python, num_contexts, 1),
-    application:set_env(erlang_python, event_loop_pool_size, 1),
-    {ok, _} = application:ensure_all_started(erlang_python), Config.
-end_per_suite(_) -> application:stop(erlang_python).
+    Config1 = py_ct_env:override(Config, #{num_contexts => 1, event_loop_pool_size => 1}),
+    {ok, _} = application:ensure_all_started(erlang_python),
+    Config1.
+end_per_suite(Config) ->
+    ok = application:stop(erlang_python),
+    py_ct_env:restore(Config).
 
 loop() ->
     {ok, L} = py_nif:event_loop_new(),

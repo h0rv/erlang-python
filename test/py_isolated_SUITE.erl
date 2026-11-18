@@ -789,7 +789,8 @@ test_not_supported_fail_loud(Config) ->
 
 test_bad_python_fails_at_start(_Config) ->
     {error, {python_not_found, _}} = py_context:new(#{mode => isolated, python => "/no/such/python"}),
-    {error, {child_exited_at_start, _, _}} = py_context:new(#{mode => isolated, python => "/bin/sh"}),
+    False = os:find_executable("false"),
+    {error, {child_exited_at_start, _, _}} = py_context:new(#{mode => isolated, python => False}),
     ok.
 
 test_startup_error_reported(_Config) ->

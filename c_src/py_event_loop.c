@@ -397,6 +397,8 @@ int create_default_event_loop(ErlNifEnv *env);
 void event_loop_destructor(ErlNifEnv *env, void *obj) {
     (void)env;
     erlang_event_loop_t *loop = (erlang_event_loop_t *)obj;
+    /* The allocator rolls back partial initialization before releasing. */
+    if (!loop->task_queue_initialized) return;
 
 #ifdef HAVE_SUBINTERPRETERS
     /* For subinterpreter event loops, skip Python API calls.
@@ -1214,6 +1216,68 @@ static bool ensure_priv_dir_in_sys_path(void) {
  * Event Loop NIF Implementations
  * ============================================================================ */
 
+static erlang_event_loop_t *alloc_event_loop(const char **error) {
+    erlang_event_loop_t *loop = enif_alloc_resource(
+        EVENT_LOOP_RESOURCE_TYPE, sizeof(erlang_event_loop_t));
+
+    if (loop == NULL) {
+        *error = "alloc_failed";
+        return NULL;
+    }
+
+    memset(loop, 0, sizeof(erlang_event_loop_t));
+    loop->pending_capacity = INITIAL_PENDING_CAPACITY;
+    atomic_init(&loop->next_callback_id, 1);
+    if (pthread_mutex_init(&loop->mutex, NULL) != 0) {
+        *error = "mutex_init_failed";
+        goto fail;
+    }
+    if (pthread_cond_init(&loop->event_cond, NULL) != 0) {
+        *error = "cond_init_failed";
+        goto destroy_mutex;
+    }
+    loop->msg_env = enif_alloc_env();
+    if (loop->msg_env == NULL) {
+        *error = "env_alloc_failed";
+        goto destroy_cond;
+    }
+    loop->task_queue = enif_ioq_create(ERL_NIF_IOQ_NORMAL);
+    if (loop->task_queue == NULL) {
+        *error = "task_queue_alloc_failed";
+        goto free_env;
+    }
+    if (pthread_mutex_init(&loop->task_queue_mutex, NULL) != 0) {
+        *error = "task_queue_mutex_init_failed";
+        goto destroy_queue;
+    }
+    if (pthread_mutex_init(&loop->env_pool_mutex, NULL) != 0) {
+        *error = "env_pool_mutex_init_failed";
+        goto destroy_queue_mutex;
+    }
+    if (pthread_mutex_init(&loop->namespaces_mutex, NULL) != 0) {
+        *error = "namespaces_mutex_init_failed";
+        goto destroy_env_pool_mutex;
+    }
+    loop->task_queue_initialized = true;
+    return loop;
+
+destroy_env_pool_mutex:
+    pthread_mutex_destroy(&loop->env_pool_mutex);
+destroy_queue_mutex:
+    pthread_mutex_destroy(&loop->task_queue_mutex);
+destroy_queue:
+    enif_ioq_destroy(loop->task_queue);
+free_env:
+    enif_free_env(loop->msg_env);
+destroy_cond:
+    pthread_cond_destroy(&loop->event_cond);
+destroy_mutex:
+    pthread_mutex_destroy(&loop->mutex);
+fail:
+    enif_release_resource(loop);
+    return NULL;
+}
+
 /**
  * event_loop_new() -> {ok, LoopRef}
  */
@@ -1222,113 +1286,9 @@ ERL_NIF_TERM nif_event_loop_new(ErlNifEnv *env, int argc,
     (void)argc;
     (void)argv;
 
-    /* Allocate event loop resource */
-    erlang_event_loop_t *loop = enif_alloc_resource(
-        EVENT_LOOP_RESOURCE_TYPE, sizeof(erlang_event_loop_t));
-
-    if (loop == NULL) {
-        return make_error(env, "alloc_failed");
-    }
-
-    /* Initialize fields */
-    memset(loop, 0, sizeof(erlang_event_loop_t));
-
-    /* Initialize pending_capacity (memset zeros it, but we need the initial value) */
-    loop->pending_capacity = INITIAL_PENDING_CAPACITY;
-
-    if (pthread_mutex_init(&loop->mutex, NULL) != 0) {
-        enif_release_resource(loop);
-        return make_error(env, "mutex_init_failed");
-    }
-
-    if (pthread_cond_init(&loop->event_cond, NULL) != 0) {
-        pthread_mutex_destroy(&loop->mutex);
-        enif_release_resource(loop);
-        return make_error(env, "cond_init_failed");
-    }
-
-    loop->msg_env = enif_alloc_env();
-    if (loop->msg_env == NULL) {
-        pthread_cond_destroy(&loop->event_cond);
-        pthread_mutex_destroy(&loop->mutex);
-        enif_release_resource(loop);
-        return make_error(env, "env_alloc_failed");
-    }
-
-    atomic_store(&loop->next_callback_id, 1);
-    atomic_store(&loop->pending_count, 0);
-    loop->unreserved_pending = 0;
-    loop->pending_head = NULL;
-    loop->pending_tail = NULL;
-    loop->pending_capacity = INITIAL_PENDING_CAPACITY;
-    loop->shutdown = false;
-    loop->has_router = false;
-    loop->has_self = false;
-    loop->interp_id = 0;  /* Main interpreter */
-
-    /* Initialize async task queue (uvloop-inspired) */
-    loop->task_queue = enif_ioq_create(ERL_NIF_IOQ_NORMAL);
-    if (loop->task_queue == NULL) {
-        pthread_cond_destroy(&loop->event_cond);
-        pthread_mutex_destroy(&loop->mutex);
-        enif_free_env(loop->msg_env);
-        enif_release_resource(loop);
-        return make_error(env, "task_queue_alloc_failed");
-    }
-
-    if (pthread_mutex_init(&loop->task_queue_mutex, NULL) != 0) {
-        enif_ioq_destroy(loop->task_queue);
-        pthread_cond_destroy(&loop->event_cond);
-        pthread_mutex_destroy(&loop->mutex);
-        enif_free_env(loop->msg_env);
-        enif_release_resource(loop);
-        return make_error(env, "task_queue_mutex_init_failed");
-    }
-
-    loop->task_queue_initialized = true;
-    atomic_store(&loop->task_count, 0);
-    atomic_store(&loop->task_wake_pending, false);
-    loop->py_loop = NULL;
-    loop->py_loop_valid = false;
-
-    /* Initialize Python cache (uvloop-style optimization) */
-    loop->cached_asyncio = NULL;
-    loop->cached_run_and_send = NULL;
-    loop->cached_events_module = NULL;
-    loop->py_cache_valid = false;
-
-    /* Initialize callable cache */
-    memset(loop->callable_cache, 0, sizeof(loop->callable_cache));
-    loop->callable_cache_count = 0;
-
-    /* Initialize ErlNifEnv pool (empty initially, populated on demand) */
-    memset(loop->env_pool, 0, sizeof(loop->env_pool));
-    loop->env_pool_count = 0;
-    if (pthread_mutex_init(&loop->env_pool_mutex, NULL) != 0) {
-        pthread_mutex_destroy(&loop->task_queue_mutex);
-        enif_ioq_destroy(loop->task_queue);
-        pthread_cond_destroy(&loop->event_cond);
-        pthread_mutex_destroy(&loop->mutex);
-        enif_free_env(loop->msg_env);
-        enif_release_resource(loop);
-        return make_error(env, "env_pool_mutex_init_failed");
-    }
-
-    /* Initialize per-process namespace registry */
-    loop->namespaces_head = NULL;
-    loop->pid_env_head = NULL;
-    if (pthread_mutex_init(&loop->namespaces_mutex, NULL) != 0) {
-        pthread_mutex_destroy(&loop->env_pool_mutex);
-        pthread_mutex_destroy(&loop->task_queue_mutex);
-        enif_ioq_destroy(loop->task_queue);
-        pthread_cond_destroy(&loop->event_cond);
-        pthread_mutex_destroy(&loop->mutex);
-        enif_free_env(loop->msg_env);
-        enif_release_resource(loop);
-        return make_error(env, "namespaces_mutex_init_failed");
-    }
-
-    /* Create result */
+    const char *error;
+    erlang_event_loop_t *loop = alloc_event_loop(&error);
+    if (loop == NULL) return make_error(env, error);
     ERL_NIF_TERM loop_term = enif_make_resource(env, loop);
     enif_release_resource(loop);
 
@@ -3428,6 +3388,7 @@ ERL_NIF_TERM nif_process_ready_tasks(ErlNifEnv *env, int argc,
     int task_idx = 0;
     ERL_NIF_TERM result = ATOM_OK;
     bool python_more = false;
+    bool wake_driver = false;
 
     /* Lazy loop creation (uvloop-style): create Python loop on first use */
     pthread_mutex_lock(&loop->mutex);
@@ -3472,22 +3433,9 @@ ERL_NIF_TERM nif_process_ready_tasks(ErlNifEnv *env, int argc,
             return make_error(env, "loop_class_not_found");
         }
 
-        /* The interpreter's default loop keeps the global capsule path in
-         * ErlangEventLoop.__init__. Any other loop (the event loop pool)
-         * gets a capsule over its own resource, so its timers, fd events
-         * and pending queue stay on this loop instead of the global one. */
-        PyObject *new_loop;
-        if (loop == get_interpreter_event_loop()) {
-            new_loop = PyObject_CallNoArgs(loop_class);
-        } else {
-            PyObject *capsule = make_loop_capsule(loop);
-            if (capsule == NULL) {
-                new_loop = NULL;
-            } else {
-                new_loop = PyObject_CallOneArg(loop_class, capsule);
-                Py_DECREF(capsule);
-            }
-        }
+        PyObject *capsule = make_loop_capsule(loop);
+        PyObject *new_loop = capsule == NULL ? NULL : PyObject_CallOneArg(loop_class, capsule);
+        Py_XDECREF(capsule);
         Py_DECREF(loop_class);
         if (new_loop == NULL) {
             PyErr_Clear();
@@ -3726,15 +3674,20 @@ ERL_NIF_TERM nif_process_ready_tasks(ErlNifEnv *env, int argc,
             continue;
         }
 
+        bool errors_only = enif_is_identical(tuple_elems[1], ATOM_UNDEFINED);
         if (is_coro) {
             /* Allocate the completion owner BEFORE Python can start the task.
              * Ownership leaves work_batch only when a callback owns it. */
             bool admitted = work_batch.tickets[task_idx] != NULL;
             PyObject *completion = admitted
                 ? work_completion_new(&work_batch.tickets[task_idx], coro) : NULL;
-            PyObject *wrapped_coro = (!admitted || completion != NULL)
-                ? PyObject_CallFunction(run_and_send, "OOO", coro, (PyObject *)pid_obj, py_ref)
-                : NULL;
+            PyObject *wrapped_coro = NULL;
+            if (!admitted || completion != NULL) {
+                wrapped_coro = errors_only
+                    ? PyObject_CallFunctionObjArgs(run_and_send, coro, (PyObject *)pid_obj,
+                                                   py_ref, Py_False, NULL)
+                    : PyObject_CallFunction(run_and_send, "OOO", coro, (PyObject *)pid_obj, py_ref);
+            }
 
             if (wrapped_coro != NULL) {
                 bool construction_attempted = false;
@@ -3753,7 +3706,7 @@ ERL_NIF_TERM nif_process_ready_tasks(ErlNifEnv *env, int argc,
                 } else {
                     bool retired = processing_loop_stopped(loop, py_loop, owner_generation);
                     if (retired) PyErr_Clear();
-                    if (admitted || retired)
+                    if (admitted || retired || errors_only)
                         send_task_failure(term_env, &caller_pid, tuple_elems[1],
                                           retired ? "loop_stopped" : "task_creation_failed");
                     if (!construction_attempted) {
@@ -3767,7 +3720,7 @@ ERL_NIF_TERM nif_process_ready_tasks(ErlNifEnv *env, int argc,
                 Py_XDECREF(task);
                 Py_DECREF(wrapped_coro);
             } else {
-                if (admitted)
+                if (admitted || errors_only)
                     send_task_failure(term_env, &caller_pid, tuple_elems[1], "task_wrapper_failed");
                 if (completion != NULL) work_completion_not_started(completion);
                 PyObject *closed = PyObject_CallMethod(coro, "close", NULL);
@@ -3780,7 +3733,7 @@ ERL_NIF_TERM nif_process_ready_tasks(ErlNifEnv *env, int argc,
             /* Not a coroutine - send result immediately via enif_send */
             /* Use enif_send directly so we can use proper Erlang atoms */
             /* Use the original Erlang ref term (tuple_elems[1]), not the Python conversion */
-            ErlNifEnv *send_env = enif_alloc_env();
+            ErlNifEnv *send_env = errors_only ? NULL : enif_alloc_env();
             if (send_env != NULL) {
                 /* Convert Python result to Erlang term */
                 ERL_NIF_TERM result_term = py_to_term(send_env, coro);
@@ -3830,22 +3783,8 @@ ERL_NIF_TERM nif_process_ready_tasks(ErlNifEnv *env, int argc,
              * start now instead of at the next poll timeout. Same broadcast
              * as _wakeup_for (call_soon_threadsafe).
              * Note: events_module is cached, so we don't DECREF it. */
-            Py_XDECREF(old_running_loop);
-            Py_DECREF(py_loop);
-            loop_gil_release(loop, &gil);
-            if (!loop->shutdown) {
-                pthread_mutex_lock(&loop->mutex);
-                pthread_cond_broadcast(&loop->event_cond);
-                pthread_mutex_unlock(&loop->mutex);
-            }
-            /* Same contract as the tail of this function: tasks beyond the
-             * batch limit are still queued, tell the worker to come back
-             * (submit_task will not send another wakeup while one is
-             * pending, so returning ok here would strand them). */
-            if (atomic_load(&loop->task_count) > 0) {
-                return ATOM_MORE;
-            }
-            return ATOM_OK;
+            wake_driver = true;
+            goto processing_done;
         }
     } else {
         PyErr_Clear();
@@ -3929,6 +3868,14 @@ processing_done:
     Py_XDECREF(py_loop);
 
     loop_gil_release(loop, &gil);
+
+    if (wake_driver) {
+        pthread_mutex_lock(&loop->mutex);
+        if (!loop->shutdown) {
+            pthread_cond_broadcast(&loop->event_cond);
+        }
+        pthread_mutex_unlock(&loop->mutex);
+    }
 
     /*
      * Continue native task batches and Python callbacks left by the iteration
@@ -7590,85 +7537,12 @@ static PyObject *py_loop_new(PyObject *self, PyObject *args) {
     (void)self;
     (void)args;
 
-    /* Allocate event loop resource */
-    erlang_event_loop_t *loop = enif_alloc_resource(
-        EVENT_LOOP_RESOURCE_TYPE, sizeof(erlang_event_loop_t));
-
+    const char *error;
+    erlang_event_loop_t *loop = alloc_event_loop(&error);
     if (loop == NULL) {
-        PyErr_SetString(PyExc_MemoryError, "Failed to allocate event loop");
+        PyErr_SetString(PyExc_RuntimeError, error);
         return NULL;
     }
-
-    /* Initialize fields */
-    memset(loop, 0, sizeof(erlang_event_loop_t));
-
-    /* Initialize pending_capacity (memset zeros it, but we need the initial value) */
-    loop->pending_capacity = INITIAL_PENDING_CAPACITY;
-
-    if (pthread_mutex_init(&loop->mutex, NULL) != 0) {
-        enif_release_resource(loop);
-        PyErr_SetString(PyExc_RuntimeError, "Failed to initialize mutex");
-        return NULL;
-    }
-
-    if (pthread_cond_init(&loop->event_cond, NULL) != 0) {
-        pthread_mutex_destroy(&loop->mutex);
-        enif_release_resource(loop);
-        PyErr_SetString(PyExc_RuntimeError, "Failed to initialize condition variable");
-        return NULL;
-    }
-
-    loop->msg_env = enif_alloc_env();
-    if (loop->msg_env == NULL) {
-        pthread_cond_destroy(&loop->event_cond);
-        pthread_mutex_destroy(&loop->mutex);
-        enif_release_resource(loop);
-        PyErr_SetString(PyExc_MemoryError, "Failed to allocate message environment");
-        return NULL;
-    }
-
-    atomic_store(&loop->next_callback_id, 1);
-    atomic_store(&loop->pending_count, 0);
-    loop->unreserved_pending = 0;
-    loop->pending_head = NULL;
-    loop->pending_tail = NULL;
-    loop->shutdown = false;
-    loop->has_router = false;
-    loop->has_self = false;
-    loop->event_freelist = NULL;
-    loop->freelist_count = 0;
-
-    /* Initialize async task queue (uvloop-inspired) */
-    loop->task_queue = enif_ioq_create(ERL_NIF_IOQ_NORMAL);
-    if (loop->task_queue == NULL) {
-        pthread_cond_destroy(&loop->event_cond);
-        pthread_mutex_destroy(&loop->mutex);
-        enif_free_env(loop->msg_env);
-        enif_release_resource(loop);
-        PyErr_SetString(PyExc_MemoryError, "Failed to allocate task queue");
-        return NULL;
-    }
-
-    if (pthread_mutex_init(&loop->task_queue_mutex, NULL) != 0) {
-        enif_ioq_destroy(loop->task_queue);
-        pthread_cond_destroy(&loop->event_cond);
-        pthread_mutex_destroy(&loop->mutex);
-        enif_free_env(loop->msg_env);
-        enif_release_resource(loop);
-        PyErr_SetString(PyExc_RuntimeError, "Failed to initialize task queue mutex");
-        return NULL;
-    }
-
-    loop->task_queue_initialized = true;
-    atomic_store(&loop->task_count, 0);
-    loop->py_loop = NULL;
-    loop->py_loop_valid = false;
-
-    /* Initialize Python cache (uvloop-style optimization) */
-    loop->cached_asyncio = NULL;
-    loop->cached_run_and_send = NULL;
-    loop->cached_events_module = NULL;
-    loop->py_cache_valid = false;
 
 #ifdef HAVE_SUBINTERPRETERS
     /* Detect if this is being called from a subinterpreter */
@@ -7684,19 +7558,9 @@ static PyObject *py_loop_new(PyObject *self, PyObject *args) {
     loop->interp_id = 0;  /* Main interpreter */
 #endif
 
-    /* Create a capsule wrapping the loop pointer */
+    /* Transfer the resource's allocation reference to the capsule. */
     PyObject *capsule = PyCapsule_New(loop, LOOP_CAPSULE_NAME, loop_capsule_destructor);
-    if (capsule == NULL) {
-        pthread_cond_destroy(&loop->event_cond);
-        pthread_mutex_destroy(&loop->mutex);
-        enif_free_env(loop->msg_env);
-        enif_release_resource(loop);
-        return NULL;
-    }
-
-    /* Keep a reference to the NIF resource (capsule destructor will release) */
-    enif_keep_resource(loop);
-
+    if (capsule == NULL) enif_release_resource(loop);
     return capsule;
 }
 
@@ -7953,11 +7817,9 @@ static PyObject *py_get_loop_ref(PyObject *self, PyObject *args) {
 
 /* Python function: _get_global_loop_capsule() -> capsule
  *
- * Returns a capsule for the global interpreter event loop.
- * This is the loop created by Erlang that has has_worker=true.
- * Python's ErlangEventLoop should use this capsule instead of creating
- * a new one, so that timers and FD events are properly dispatched to
- * the worker which triggers process_ready_tasks.
+ * Returns a capsule for the interpreter loop driven by Erlang.
+ * Use it when a Python driver needs to resume that same resource,
+ * rather than creating an independent Python-owned loop.
  */
 static PyObject *py_get_global_loop_capsule(PyObject *self, PyObject *args) {
     (void)self;
@@ -8734,86 +8596,9 @@ int create_default_event_loop(ErlNifEnv *env) {
         return 0;  /* Already have an event loop for this interpreter */
     }
 
-    /* Allocate event loop resource */
-    erlang_event_loop_t *loop = enif_alloc_resource(
-        EVENT_LOOP_RESOURCE_TYPE, sizeof(erlang_event_loop_t));
-
-    if (loop == NULL) {
-        return -1;
-    }
-
-    /* Initialize fields */
-    memset(loop, 0, sizeof(erlang_event_loop_t));
-
-    /* Initialize pending_capacity (memset zeros it, but we need the initial value) */
-    loop->pending_capacity = INITIAL_PENDING_CAPACITY;
-
-    if (pthread_mutex_init(&loop->mutex, NULL) != 0) {
-        enif_release_resource(loop);
-        return -1;
-    }
-
-    if (pthread_cond_init(&loop->event_cond, NULL) != 0) {
-        pthread_mutex_destroy(&loop->mutex);
-        enif_release_resource(loop);
-        return -1;
-    }
-
-    loop->msg_env = enif_alloc_env();
-    if (loop->msg_env == NULL) {
-        pthread_cond_destroy(&loop->event_cond);
-        pthread_mutex_destroy(&loop->mutex);
-        enif_release_resource(loop);
-        return -1;
-    }
-
-    atomic_store(&loop->next_callback_id, 1);
-    atomic_store(&loop->pending_count, 0);
-    loop->unreserved_pending = 0;
-    loop->pending_head = NULL;
-    loop->pending_tail = NULL;
-    loop->shutdown = false;
-    loop->has_router = false;
-    loop->has_self = false;
-
-    /* Async task queue, env pool and namespace registry, as in
-     * nif_event_loop_new: a default loop must accept submit_task too, since
-     * OWN_GIL contexts only ever have this loop. */
-    loop->task_queue = enif_ioq_create(ERL_NIF_IOQ_NORMAL);
-    if (loop->task_queue == NULL ||
-        pthread_mutex_init(&loop->task_queue_mutex, NULL) != 0) {
-        if (loop->task_queue != NULL) {
-            enif_ioq_destroy(loop->task_queue);
-            loop->task_queue = NULL;
-        }
-        enif_free_env(loop->msg_env);
-        pthread_cond_destroy(&loop->event_cond);
-        pthread_mutex_destroy(&loop->mutex);
-        enif_release_resource(loop);
-        return -1;
-    }
-    loop->task_queue_initialized = true;
-    atomic_store(&loop->task_count, 0);
-    atomic_store(&loop->task_wake_pending, false);
-    loop->py_loop = NULL;
-    loop->py_loop_valid = false;
-    loop->py_cache_valid = false;
-    loop->callable_cache_count = 0;
-    loop->env_pool_count = 0;
-    if (pthread_mutex_init(&loop->env_pool_mutex, NULL) != 0 ||
-        pthread_mutex_init(&loop->namespaces_mutex, NULL) != 0) {
-        pthread_mutex_destroy(&loop->task_queue_mutex);
-        loop->task_queue_initialized = false;
-        enif_ioq_destroy(loop->task_queue);
-        loop->task_queue = NULL;
-        enif_free_env(loop->msg_env);
-        pthread_cond_destroy(&loop->event_cond);
-        pthread_mutex_destroy(&loop->mutex);
-        enif_release_resource(loop);
-        return -1;
-    }
-    loop->namespaces_head = NULL;
-    loop->pid_env_head = NULL;
+    const char *error;
+    erlang_event_loop_t *loop = alloc_event_loop(&error);
+    if (loop == NULL) return -1;
 
 #ifdef HAVE_SUBINTERPRETERS
     /* Check if this is a subinterpreter by comparing to main interpreter */
