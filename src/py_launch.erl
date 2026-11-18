@@ -3,6 +3,11 @@
 -export([start/0]).
 -export([init/1, handle_event/2, handle_call/2, handle_info/2, terminate/2, code_change/3]).
 
+%% These calls are reachable only when the embedding release includes Hornbeam.
+-ignore_xref([{hornbeam_sup, start_link, 0}, {hornbeam_listener, is_running, 0}]).
+-dialyzer({no_unknown, [start_services/0, stop_services/2]}).
+
+-spec start() -> no_return().
 start() ->
     try
         application:load(erlang_python),
@@ -101,6 +106,7 @@ stop_services(Sup, Deadline) ->
     undefined = whereis(hornbeam_services),
     ok = py:unregister_function(hornbeam_services).
 
+-spec finish(pid(), pid() | none, non_neg_integer(), integer()) -> no_return().
 finish(Ctx, Services, Status, Deadline) ->
     try
         ok = marker("PYBEAM_COMPLETION", integer_to_binary(Status)),
