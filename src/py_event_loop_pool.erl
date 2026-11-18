@@ -65,7 +65,8 @@
     num_loops :: non_neg_integer(),
     supported :: boolean(),
     owngil_enabled :: boolean(),
-    sessions :: ets:tid() | undefined
+    sessions :: ets:tid() | undefined,
+    drivers = [] :: [pid()]
 }).
 
 %% OWN_GIL session record - maps {PID, LoopIdx} to worker/handle
@@ -418,8 +419,8 @@ init([NumLoops]) ->
 
     persistent_term:put(?PT_OWNGIL_ENABLED, OwnGilReady),
 
-    case create_loops(NumLoops, []) of
-        {ok, LoopList} ->
+    case create_loops(NumLoops, [], []) of
+        {ok, LoopList, Drivers} ->
             Loops = list_to_tuple(LoopList),
             persistent_term:put(?PT_LOOPS, Loops),
             persistent_term:put(?PT_NUM_LOOPS, NumLoops),
@@ -427,7 +428,8 @@ init([NumLoops]) ->
                 num_loops = NumLoops,
                 supported = true,
                 owngil_enabled = OwnGilReady,
-                sessions = Sessions
+                sessions = Sessions,
+                drivers = Drivers
             }};
         {error, Reason} ->
             error_logger:warning_msg("py_event_loop_pool: failed to create loops: ~p~n", [Reason]),
@@ -442,9 +444,9 @@ init([NumLoops]) ->
     end.
 
 %% @private Create NumLoops independent event loops with workers
-create_loops(0, Acc) ->
-    {ok, lists:reverse(Acc)};
-create_loops(N, Acc) ->
+create_loops(0, Acc, Drivers) ->
+    {ok, lists:reverse(Acc), Drivers};
+create_loops(N, Acc, Drivers) ->
     case py_nif:event_loop_new() of
         {ok, LoopRef} ->
             WorkerId = iolist_to_binary([<<"pool_">>, integer_to_binary(N)]),
@@ -452,13 +454,47 @@ create_loops(N, Acc) ->
                 {ok, WorkerPid} ->
                     ok = py_nif:event_loop_set_worker(LoopRef, WorkerPid),
                     ok = py_nif:event_loop_set_id(LoopRef, WorkerId),
-                    create_loops(N - 1, [{LoopRef, WorkerPid} | Acc]);
+                    case start_driver(LoopRef, WorkerPid) of
+                        {ok, Driver} ->
+                            create_loops(N - 1, [{LoopRef, WorkerPid} | Acc], [Driver | Drivers]);
+                        {error, Reason} ->
+                            cleanup_loops([{LoopRef, WorkerPid} | Acc], Drivers),
+                            {error, {driver_start_failed, Reason}}
+                    end;
                 {error, Reason} ->
+                    py_nif:event_loop_destroy(LoopRef),
+                    cleanup_loops(Acc, Drivers),
                     {error, {worker_start_failed, Reason}}
             end;
         {error, Reason} ->
+            cleanup_loops(Acc, Drivers),
             {error, {loop_create_failed, Reason}}
     end.
+
+start_driver(LoopRef, WorkerPid) ->
+    Id = erlang:unique_integer([positive]),
+    case py_context:start_link(Id, worker,
+            #{managed_loop => {dedicated, LoopRef, WorkerPid}, context_owner => self()}) of
+        {ok, Driver} ->
+            case py_context:start_loop(Driver) of
+                ok -> {ok, Driver};
+                {error, Reason} ->
+                    py_context:stop(Driver),
+                    {error, Reason}
+            end;
+        {error, Reason} -> {error, Reason}
+    end.
+
+cleanup_loops(Loops, Drivers) ->
+    lists:foreach(fun(Driver) ->
+        try py_context:stop_loop(Driver) catch _:_ -> ok end,
+        try py_context:stop(Driver) catch _:_ -> ok end
+    end, Drivers),
+    lists:foreach(fun({LoopRef, WorkerPid}) ->
+        try py_event_worker:stop(WorkerPid) catch _:_ -> ok end,
+        try py_nif:event_loop_release_python_loop(LoopRef) catch _:_ -> ok end,
+        try py_nif:event_loop_destroy(LoopRef) catch _:_ -> ok end
+    end, Loops).
 
 handle_call(get_stats, _From, State) ->
     %% Build base stats
@@ -492,6 +528,14 @@ handle_call(_Request, _From, State) ->
 
 handle_cast(_Msg, State) ->
     {noreply, State}.
+
+handle_info({py_loop_exit, Driver, Result}, State) ->
+    case lists:member(Driver, State#state.drivers) of
+        true ->
+            error_logger:error_msg("py_event_loop_pool: driver ~p exited: ~p~n", [Driver, Result]),
+            {noreply, State#state{supported = false}};
+        false -> {noreply, State}
+    end;
 
 handle_info({'EXIT', _Pid, _Reason}, State) ->
     {noreply, State#state{supported = false}};
@@ -547,11 +591,7 @@ terminate(_Reason, State) ->
     case persistent_term:get(?PT_LOOPS, {}) of
         {} -> ok;
         Loops ->
-            lists:foreach(fun({LoopRef, WorkerPid}) ->
-                try py_event_worker:stop(WorkerPid) catch _:_ -> ok end,
-                try py_nif:event_loop_release_python_loop(LoopRef) catch _:_ -> ok end,
-                try py_nif:event_loop_destroy(LoopRef) catch _:_ -> ok end
-            end, tuple_to_list(Loops))
+            cleanup_loops(tuple_to_list(Loops), State#state.drivers)
     end,
 
     try persistent_term:erase(?PT_LOOPS) catch _:_ -> ok end,

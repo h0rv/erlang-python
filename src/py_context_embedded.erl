@@ -153,6 +153,8 @@ setup_event_worker(Ref, InterpId, Opts) ->
         {error, not_subinterp} ->
             case maps:get(managed_loop, Opts, shared) of
                 shared -> #{};
+                {dedicated, LoopRef, WorkerPid} ->
+                    #{loop_ref => LoopRef, worker_pid => WorkerPid, dedicated => true};
                 dedicated ->
                     {ok, LoopRef} = py_nif:event_loop_new(),
                     WorkerId = iolist_to_binary(["ctx_loop_", pid_to_list(self())]),
