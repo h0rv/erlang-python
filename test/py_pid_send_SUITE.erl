@@ -45,7 +45,10 @@
     test_whereis_with_atom/1,
     test_whereis_with_bytes/1,
     test_whereis_invalid_type/1,
-    test_whereis_and_send/1
+    test_whereis_and_send/1,
+    test_remote_pid/1,
+    test_named_send/1,
+    relay/1
 ]).
 
 all() ->
@@ -77,7 +80,9 @@ all() ->
         test_whereis_with_atom,
         test_whereis_with_bytes,
         test_whereis_invalid_type,
-        test_whereis_and_send
+        test_whereis_and_send,
+        test_remote_pid,
+        test_named_send
     ].
 
 init_per_suite(Config) ->
@@ -104,6 +109,66 @@ init_per_testcase(_TestCase, Config) ->
 end_per_testcase(_TestCase, _Config) ->
     try py:unregister_function(test_pid_echo) catch _:_ -> ok end,
     ok.
+
+test_remote_pid(_Config) ->
+    with_peer(fun(Node, Remote) ->
+        {ok, <<"Pid">>} = py:call(py_test_pid_send, get_pid_type, [Remote]),
+        {ok, true} = py:call(py_test_pid_send, is_erlang_pid, [Remote]),
+        Ctx = py_context_router:get_context(1),
+        {ok, none} = py_context:call(Ctx, py_test_remote_pid, remember, [Remote]),
+        %% Reuse the request environment before reading the retained PID.
+        [begin {ok, _} = py_context:call(Ctx, builtins, list, [lists:seq(1, 1000)]) end
+         || _ <- lists:seq(1, 20)],
+        {ok, Remote} = py_context:call(Ctx, py_test_remote_pid, recall, [Remote, self()]),
+        {ok, none} = py_context:call(Ctx, py_test_remote_pid, send_retained, [<<"remote-pid">>]),
+        receive {remote, <<"remote-pid">>} -> ok after 5000 -> ct:fail(remote_send_timeout) end,
+        {ok, true} = py:call(py_test_pid_send, send_message, [Remote, <<"direct">>]),
+        receive {remote, <<"direct">>} -> ok after 5000 -> ct:fail(direct_send_timeout) end,
+        Node = node(Remote),
+        {ok, none} = py_context:call(Ctx, py_test_remote_pid, remember, [none])
+    end).
+
+test_named_send(_Config) ->
+    with_peer(fun(Node, _Remote) ->
+        {ok, none} = py:call(py_test_remote_pid, send_named,
+                            [<<"py_pid_receiver">>, atom_to_binary(Node), <<"named">>]),
+        receive {remote, <<"named">>} -> ok after 5000 -> ct:fail(named_send_timeout) end,
+        true = register(py_pid_receiver, self()),
+        try
+            {ok, none} = py:call(py_test_remote_pid, send_named,
+                                [<<"py_pid_receiver">>, atom_to_binary(node()), <<"local-named">>]),
+            receive <<"local-named">> -> ok after 5000 -> ct:fail(local_named_timeout) end,
+            {ok, true} = py:call(py_test_remote_pid, invalid_destinations, [])
+        after unregister(py_pid_receiver) end
+    end).
+
+with_peer(Fun) ->
+    case node() of
+        nonode@nohost ->
+            os:cmd("epmd -daemon"),
+            {ok, _} = net_kernel:start(['pid_send_ct@127.0.0.1', longnames]);
+        _ -> ok
+    end,
+    Longnames = net_kernel:longnames(),
+    Host = case Longnames of true -> "127.0.0.1"; false -> "localhost" end,
+    {ok, Peer, Node} = peer:start(#{name => peer:random_name(), host => Host,
+        longnames => Longnames, connection => standard_io,
+        args => ["+S", "2:2", "+SDcpu", "2", "+SDio", "2", "-setcookie",
+                 atom_to_list(erlang:get_cookie()), "-kernel", "inet_dist_use_interface",
+                 "{127,0,0,1}", "-pa", filename:dirname(code:which(?MODULE))]}),
+    try
+        Remote = erpc:call(Node, erlang, spawn, [?MODULE, relay, [self()]]),
+        receive {ready, Remote} -> ok after 5000 -> ct:fail(remote_not_ready) end,
+        Fun(Node, Remote)
+    after peer:stop(Peer) end.
+
+relay(Parent) ->
+    true = register(py_pid_receiver, self()),
+    Parent ! {ready, self()},
+    relay_messages(Parent).
+
+relay_messages(Parent) ->
+    receive Message -> Parent ! {remote, Message}, relay_messages(Parent) end.
 
 %%% ============================================================================
 %%% PID Serialization Tests

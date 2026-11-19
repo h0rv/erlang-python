@@ -2235,6 +2235,7 @@ ERL_NIF_TERM nif_event_loop_run_async(ErlNifEnv *env, int argc,
             goto cleanup;
         }
         pid_obj->pid = caller_pid;
+        pid_obj->env = NULL;
 
         /* Convert ref and result to Python */
         PyObject *py_ref = term_to_py(env, ref_term);
@@ -2335,6 +2336,7 @@ ERL_NIF_TERM nif_event_loop_run_async(ErlNifEnv *env, int argc,
         goto cleanup;
     }
     pid_obj->pid = caller_pid;
+    pid_obj->env = NULL;
 
     /* Convert ref to Python */
     PyObject *py_ref = term_to_py(env, ref_term);
@@ -3663,6 +3665,7 @@ ERL_NIF_TERM nif_process_ready_tasks(ErlNifEnv *env, int argc,
         }
         /* Copy PID */
         pid_obj->pid = caller_pid;
+        pid_obj->env = NULL;
 
         /* Convert ref to Python */
         PyObject *py_ref = term_to_py(term_env, tuple_elems[1]);
