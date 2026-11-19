@@ -2,10 +2,12 @@
 -export([all/0, init_per_suite/1, end_per_suite/1,
          basic/1, cancelled/1, restart/1, ticket_orders/1, busy_kill/1,
          abandoned_commit/1, queued_abort/1, concurrent_children/1, group_kill/1,
-         callback_overflow/1, state_graphs/1, resource_release/1, resource_busy_kill/1]).
+         callback_overflow/1, state_graphs/1, resource_release/1, resource_busy_kill/1,
+         diagnostic_crash_keeps_siblings_live/1]).
 all() -> [basic, cancelled, restart, ticket_orders, busy_kill,
           abandoned_commit, queued_abort, concurrent_children, group_kill, callback_overflow,
-          state_graphs, resource_release, resource_busy_kill].
+          state_graphs, resource_release, resource_busy_kill,
+          diagnostic_crash_keeps_siblings_live].
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(erlang_python), Config.
 end_per_suite(_) -> application:stop(erlang_python).
@@ -200,6 +202,50 @@ concurrent_children(_) -> with_context(fun(Ctx) ->
                Result =:= {error, max_children} -> ok
         after 5000 -> error(close_race_orphan) end || _ <- lists:seq(1, 16)],
     false = is_process_alive(New)
+end).
+
+diagnostic_crash_keeps_siblings_live(_) -> with_context(fun(Ctx) ->
+    {ok, Factory} = py_context:eval(Ctx,
+        <<"__import__('erlang')._actor_retain(__import__('py_test_actor_data').Counter)">>),
+    {ok, Group} = py_actor_group:start_link(2),
+    unlink(Group),
+    try
+        {ok, {Victim, Old, Gate}} = gen_server:call(Group,
+            {spawn, <<"victim">>, Factory, 1, 4, <<"permanent">>}),
+        {ok, Healthy} = gen_server:call(Group,
+            {spawn, <<"healthy">>, Factory, 1, 4, <<"permanent">>}),
+        Ticket = reserve(Ctx, Gate, 1),
+        ok = py_nif:actor_ticket_commit(Ticket, Gate, 1),
+        Mon = monitor(process, Victim),
+        Crash = gen_server:send_request(Group, {crash, <<"victim">>, Old}),
+        %% Hold the completion acknowledgement past the actor's DOWN.
+        %% The healthy actor must answer before the test releases the gate.
+        StaleCrash = try
+            receive {'DOWN', Mon, process, Victim, killed} -> ok
+            after 5000 -> error(victim_survived) end,
+            {ok, Healthy} = gen_server:call(Group, {resolve, <<"healthy">>}),
+            {HealthyPid, HealthyGeneration, HealthyGate} = Healthy,
+            {ok, {{bytes, _}, HealthyGeneration, 0, 0}} = gen_server:call(Group,
+                {info, <<"healthy">>, HealthyGeneration}),
+            HealthyTicket = reserve(Ctx, HealthyGate, 1),
+            {ok, {ok, {bytes, <<"1">>}}} = py_callback:execute(<<"_actor_data_call">>,
+                [HealthyPid, HealthyGate, HealthyTicket, <<"1">>]),
+            {error, restarting} = gen_server:call(Group, {resolve, <<"victim">>}),
+            timeout = gen_server:wait_response(Crash, 0),
+            gen_server:send_request(Group, {crash, <<"victim">>, Old})
+        after
+            {ok, _} = py_context:call(Ctx, erlang, '_actor_complete', [Ticket], #{})
+        end,
+        {reply, {ok, killed}} = gen_server:receive_response(Crash, 5000),
+        {ok, {Replacement, New, NewGate}} = gen_server:call(Group, {resolve, <<"victim">>}),
+        true = New > Old,
+        false = Replacement =:= Victim,
+        {reply, {error, {generation_changed, Old, New}}} =
+            gen_server:receive_response(StaleCrash, 5000),
+        FreshTicket = reserve(Ctx, NewGate, 1),
+        {ok, {ok, {bytes, <<"1">>}}} = py_callback:execute(<<"_actor_data_call">>,
+            [Replacement, NewGate, FreshTicket, <<"1">>])
+    after gen_server:stop(Group, normal, infinity) end
 end).
 
 group_kill(_) -> with_context(fun(Ctx) ->
