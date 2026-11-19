@@ -1,9 +1,10 @@
 -module(py_actor_failover_SUITE).
 -export([all/0, suite/0, init_per_suite/1, end_per_suite/1,
-         replica_options/1, node_failover/1, boot/0, start_claim/3]).
+         replica_options/1, node_failover/1, reopen_after_seed_loss/1,
+         bootstrap_requires_seed/1, boot/0, start_claim/3]).
 
 suite() -> [{timetrap, {seconds, 180}}].
-all() -> [replica_options, node_failover].
+all() -> [replica_options, node_failover, reopen_after_seed_loss, bootstrap_requires_seed].
 init_per_suite(C) ->
     case node() of
         nonode@nohost ->
@@ -59,6 +60,38 @@ node_failover(C) -> cluster(C, fun([A, B, Z], _, _) ->
     after 5000 -> error(loser_not_woken) end
 end).
 
+reopen_after_seed_loss(C) -> cluster(C, fun([A, B, Z], Nodes, [_, BDir, ZDir]) ->
+    Seed = element(2, A),
+    Seed = binary_to_atom(hd(lists:sort(Nodes))),
+    kill_peer(A),
+    ok = call(B, application, stop, [mnesia]),
+    ok = call(B, py_actor_state, open, [BDir, Nodes]),
+    ok = call(Z, py_actor_state, open, [ZDir, Nodes]),
+    Key = <<"after-seed-loss">>,
+    {ok, Token} = call(B, py_actor_state, claim, [Key, <<"new-owner">>]),
+    {ok, 1} = call(B, py_actor_state, write, [Key, 0, <<"surviving-majority">>, Token]),
+    {ok, 1, <<"surviving-majority">>} = call(Z, py_actor_state, read, [Key]),
+    {error, not_owner} = call(Z, py_actor_state, write, [Key, 1, <<"unfenced">>, <<"wrong-token">>]),
+    kill_peer(Z),
+    {error, {no_majority, py_actor_snapshot}} =
+        call(B, py_actor_state, write, [Key, 1, <<"minority">>, Token])
+end).
+
+bootstrap_requires_seed(C) -> peers(C, fun([A, B, Z], Nodes, [_, BDir, ZDir]) ->
+    Seed = element(2, A),
+    kill_peer(A),
+    Parent = self(),
+    Refs = [begin
+        Ref = make_ref(),
+        spawn(fun() -> Parent ! {Ref, call(P, py_actor_state, open, [D, Nodes])} end),
+        Ref
+    end || {P, D} <- [{B, BDir}, {Z, ZDir}]],
+    [receive
+        {Ref, {error, {store_failed, error, {seed_unavailable, Seed}}}} -> ok
+     after 35000 -> error(unsafe_bootstrap) end || Ref <- Refs],
+    [[schema] = call(P, mnesia, system_info, [local_tables]) || P <- [B, Z]]
+end).
+
 start_claim(Parent, Key, Ref) ->
     spawn(fun() ->
         py_actor_state_owner ! {'$gen_call', {self(), Ref}, {claim, Key, Ref}},
@@ -78,13 +111,7 @@ waiting_state(Peer, Ref) ->
     #{status := waiting} = maps:get(Ref, Claims), ok.
 
 cluster(C, Fun) ->
-    Suffix = integer_to_list(erlang:unique_integer([positive])),
-    Names = [list_to_atom("as" ++ integer_to_list(I) ++ "_" ++ Suffix) || I <- lists:seq(1, 3)],
-    Peers = [start_peer(N) || N <- Names],
-    Nodes = [atom_to_binary(N) || {_, N} <- Peers],
-    Root = proplists:get_value(priv_dir, C),
-    Dirs = [unicode:characters_to_binary(filename:join(Root, atom_to_list(N))) || N <- Names],
-    try
+    peers(C, fun(Peers, Nodes, Dirs) ->
         Parent = self(),
         Refs = [begin
             Ref = make_ref(),
@@ -94,6 +121,16 @@ cluster(C, Fun) ->
         [receive {Ref, ok} -> ok; {Ref, Error} -> error({open_failed, Error})
          after 65000 -> error(open_timeout) end || Ref <- Refs],
         Fun(Peers, Nodes, Dirs)
+    end).
+
+peers(C, Fun) ->
+    Suffix = integer_to_list(erlang:unique_integer([positive])),
+    Names = [list_to_atom("as" ++ integer_to_list(I) ++ "_" ++ Suffix) || I <- lists:seq(1, 3)],
+    Peers = [start_peer(N) || N <- Names],
+    Nodes = [atom_to_binary(N) || {_, N} <- Peers],
+    Root = proplists:get_value(priv_dir, C),
+    Dirs = [unicode:characters_to_binary(filename:join(Root, atom_to_list(N))) || N <- Names],
+    try Fun(Peers, Nodes, Dirs)
     after [stop_peer(P) || P <- Peers] end.
 
 start_peer(Name) ->
