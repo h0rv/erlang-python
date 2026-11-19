@@ -32,8 +32,11 @@ ensure_store(Dir, Nodes, Tables, Meta, Namespace, Holder) ->
         {ok, _} = mnesia:change_config(extra_db_nodes, Nodes -- [node()]),
         Deadline = erlang:monotonic_time(millisecond) + 30000,
         Names = [T || {T, _, _} <- Tables],
-        case node() =:= Seed of
-            true ->
+        case {Names -- mnesia:system_info(local_tables), node() =:= Seed} of
+            {[], false} ->
+                ok = mnesia:wait_for_tables(Names, 30000),
+                check_replicas(Meta, Nodes, false);
+            {_, true} ->
                 [case mnesia:create_table(T, [{attributes, Attrs}, {type, ordered_set},
                         {disc_copies, [node()]}, {majority, Majority andalso T =/= Meta}]) of
                     {atomic, ok} -> ok;
@@ -51,7 +54,7 @@ ensure_store(Dir, Nodes, Tables, Meta, Namespace, Holder) ->
                             false -> ok = pg:join(py_mnesia_pg, Group, Holder)
                         end
                 end;
-            false ->
+            {_, false} ->
                 await_seed(Seed, Meta, Nodes, Deadline),
                 {ok, _} = mnesia:change_config(extra_db_nodes, Nodes -- [node()]),
                 case mnesia:change_table_copy_type(schema, node(), disc_copies) of
