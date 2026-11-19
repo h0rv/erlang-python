@@ -3,7 +3,7 @@
 -behaviour(gen_server).
 -export([start_link/1, register_callbacks/0,
          start_data_link/5, init/1, handle_call/3, handle_cast/2,
-         handle_info/2, terminate/2]).
+         handle_info/2, handle_continue/2, terminate/2]).
 
 start_link(Max) -> gen_server:start_link(?MODULE, Max, []).
 
@@ -56,8 +56,15 @@ init(Max) when is_integer(Max), Max > 0 ->
     ok = py_actor_registry:watch(self()),
     {ok, Sup} = py_supervision:start_link(#{strategy => one_for_one,
         intensity => 5, period => 10, mailbox => bounded, max_children => Max}),
-    {ok, #{sup => Sup, max => Max, ids => [], temporary => #{}}}.
+    {ok, #{sup => Sup, max => Max, ids => [], temporary => #{},
+           diagnostic => none, deferred => queue:new()}}.
 
+handle_call({resolve, _} = Request, From, State) ->
+    handle_request(Request, From, State);
+handle_call({info, _, _} = Request, From, State) ->
+    handle_request(Request, From, State);
+handle_call(Request, From, #{diagnostic := {_, _, _}} = State) ->
+    defer({call, Request, From}, State);
 handle_call(Request, From, State) ->
     handle_request(Request, From, reap_finished(State)).
 
@@ -103,20 +110,26 @@ handle_request({info, Id, Generation}, _From, State) ->
         Error -> Error
     end,
     {reply, Reply, State};
-handle_request({crash, Id, Generation}, _From, #{temporary := Temporary} = State) ->
-    Reply = case guarded(Id, Generation) of
+handle_request({crash, Id, Generation}, From, #{temporary := Temporary} = State) ->
+    case guarded(Id, Generation) of
         {ok, {Pid, Gate}} ->
-            Mon = monitor(process, Pid),
-            exit(Pid, kill),
-            receive {'DOWN', Mon, process, Pid, _} -> ok end,
-            wait_completion(Gate),
-            case maps:is_key(Id, Temporary) of
-                true -> {ok, killed};
-                false -> await_replacement(Id, Generation, erlang:monotonic_time(millisecond) + 5000)
-            end;
-        Error -> Error
-    end,
-    {reply, Reply, State};
+            Group = self(),
+            IsTemporary = maps:is_key(Id, Temporary),
+            Worker = spawn_link(fun() ->
+                Mon = monitor(process, Pid),
+                exit(Pid, kill),
+                receive {'DOWN', Mon, process, Pid, _} -> ok end,
+                wait_completion(Gate),
+                Reply = case IsTemporary of
+                    true -> {ok, killed};
+                    false -> await_replacement(Group, Id, Generation,
+                        erlang:monotonic_time(millisecond) + 5000)
+                end,
+                Group ! {diagnostic_done, self(), Reply}
+            end),
+            {noreply, State#{diagnostic := {Worker, Id, From}}};
+        Error -> {reply, Error, State}
+    end;
 handle_request(_, _From, State) -> {reply, {error, invalid_request}, State}.
 
 track_temporary(Id, Pid, temporary, #{temporary := Temporary} = State) ->
@@ -182,13 +195,13 @@ reap_later(Id, Generation, #{temporary := Temporary} = State) ->
         _ -> {noreply, State}
     end.
 
-await_replacement(Id, Old, Deadline) ->
-    case resolve(self(), Id) of
+await_replacement(Group, Id, Old, Deadline) ->
+    case resolve(Group, Id) of
         {ok, {_, New, _}} when New =/= Old -> {ok, killed};
         _ ->
             Timeout = max(0, Deadline - erlang:monotonic_time(millisecond)),
             receive
-                {actor_started, Id} -> await_replacement(Id, Old, Deadline)
+                {actor_started, Id} -> await_replacement(Group, Id, Old, Deadline)
             after Timeout -> {error, restart_timeout}
             end
     end.
@@ -251,12 +264,57 @@ settle_abandoned(Pid, _Gate, Ticket) ->
 
 handle_cast(_, State) -> {noreply, State}.
 handle_info({'EXIT', Sup, Reason}, #{sup := Sup} = State) -> {stop, Reason, State};
+handle_info({actor_started, Id} = Started, #{diagnostic := {Worker, Id, _}} = State) ->
+    Worker ! Started,
+    {noreply, State};
+handle_info({diagnostic_done, Worker, Reply}, #{diagnostic := {Worker, _, From}} = State) ->
+    finish_diagnostic(From, Reply, State);
+handle_info({'EXIT', Worker, Reason}, #{diagnostic := {Worker, _, From}} = State) ->
+    finish_diagnostic(From, {error, {diagnostic_failed, Reason}}, State);
 handle_info({{temporary, Id, Generation}, _Mon, process, _Pid, _Reason}, State) ->
-    reap_later(Id, Generation, State);
+    handle_info({reap_temporary, Id, Generation}, State);
+handle_info({reap_temporary, Id, Generation}, #{diagnostic := {_, _, _}} = State) ->
+    defer({reap, Id, Generation}, State);
 handle_info({reap_temporary, Id, Generation}, State) ->
     reap_later(Id, Generation, State);
 handle_info(_, State) -> {noreply, State}.
-terminate(_, #{sup := Sup, ids := Ids}) ->
+
+%% The supervisor may itself be starting a replacement. Keep lifecycle
+%% changes ordered without calling it from the group during the diagnostic.
+defer(Request, #{deferred := Deferred} = State) ->
+    {noreply, State#{deferred := queue:in(Request, Deferred)}}.
+
+finish_diagnostic(From, Reply, State) ->
+    gen_server:reply(From, Reply),
+    {noreply, State#{diagnostic := none}, {continue, deferred}}.
+
+handle_continue(deferred, #{deferred := Deferred} = State) ->
+    case queue:out(Deferred) of
+        {{value, Request}, Rest} ->
+            Next = State#{deferred := Rest},
+            Result = case Request of
+                {call, Call, From} ->
+                    case handle_call(Call, From, Next) of
+                        {reply, Reply, Updated} ->
+                            gen_server:reply(From, Reply),
+                            {noreply, Updated};
+                        Pending -> Pending
+                    end;
+                {reap, Id, Generation} -> reap_later(Id, Generation, Next)
+            end,
+            case Result of
+                {noreply, #{diagnostic := none} = UpdatedState} ->
+                    {noreply, UpdatedState, {continue, deferred}};
+                _ -> Result
+            end;
+        {empty, _} -> {noreply, State}
+    end.
+
+terminate(_, #{sup := Sup, ids := Ids, diagnostic := Diagnostic}) ->
+    case Diagnostic of
+        {Worker, _, _} -> exit(Worker, shutdown);
+        none -> ok
+    end,
     unlink(Sup),
     case is_process_alive(Sup) of true -> gen_server:stop(Sup, shutdown, infinity); false -> ok end,
     lists:foreach(fun(Id) ->

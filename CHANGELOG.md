@@ -12,6 +12,9 @@
 
 ### Fixed
 
+- Diagnostic actor crashes no longer block healthy siblings' calls in the same
+  group while the crashed generation drains and its replacement starts.
+
 - TCP transports start with 64 KiB reads and grow on full reads up to the
   existing 256 KiB limit, avoiding oversized receive allocations for small
   messages while retaining large reads for bulk transfers.

@@ -19,7 +19,7 @@ exercised by suites). Guides are in `docs/`, suites in `test/`. Start with
 | `py_context_router` | Pools and scheduler-affinity routing | live | pools, context-affinity | `py_context_router_SUITE`, `py_pool_SUITE` |
 | `py_worker_pool` | Node-wide worker leases, preferred-worker affinity, FIFO checkout and holder-death barriers | live | workers | `py_worker_pool_SUITE`, `py_actor_data_SUITE`, `py_actor_temporary_SUITE` |
 | `py_data_actor` | Serial data actor dispatch on leased workers | live | | `py_actor_data_SUITE`, `py_actor_temporary_SUITE` |
-| `py_actor_group` | Actor generations, admission and completion-based restart boundaries | live | | `py_actor_data_SUITE`, `py_actor_temporary_SUITE` |
+| `py_actor_group` | Actor generations, admission and diagnostic drain without blocking sibling calls | live | | `py_actor_data_SUITE`, `py_actor_temporary_SUITE`, `py_actor_controls_SUITE` |
 | `py_actor_registry` | Generation table and explicit actor-object release after native drain | live | | `py_actor_data_SUITE` |
 | `py_context_sup`, `py_context_init` | Supervisor of contexts; starts the default pool at boot | live | pools | (through the above) |
 | `py_nif` | Erlang stubs and docs for every NIF | live | api-reference | all |
